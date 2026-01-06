@@ -1,7 +1,7 @@
 import { app, BrowserWindow, Menu, Tray, nativeImage, dialog } from 'electron';
 import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
+import { spawn, exec } from 'child_process';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import pkg from 'electron-updater';
@@ -46,51 +46,64 @@ const BACKEND_PORT = 5001;
 
 // Kill any process using the backend port
 async function killProcessOnPort(port) {
-  return new Promise((resolve) => {
-    const { exec } = require('child_process');
+  log(`killProcessOnPort: Starting for port ${port}`);
 
-    if (process.platform === 'win32') {
-      // Windows command to find and kill process on port
-      exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
-        if (err || !stdout) {
-          resolve(); // No process found
-          return;
-        }
-        // Extract PID from netstat output
-        const lines = stdout.trim().split('\n');
-        const pids = new Set();
-        lines.forEach(line => {
-          const parts = line.trim().split(/\s+/);
-          const pid = parts[parts.length - 1];
-          if (pid && !isNaN(pid)) {
-            pids.add(pid);
+  return new Promise((resolve) => {
+    try {
+      if (process.platform === 'win32') {
+        // Windows command to find and kill process on port
+        exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
+          if (err || !stdout) {
+            log(`killProcessOnPort: No process on port ${port} (Windows)`);
+            resolve();
+            return;
           }
-        });
-        // Kill each PID
-        pids.forEach(pid => {
-          try {
-            exec(`taskkill /PID ${pid} /F`, () => { });
-          } catch (e) { }
-        });
-        setTimeout(resolve, 500); // Wait for processes to die
-      });
-    } else {
-      // Mac/Linux command to find and kill process on port
-      exec(`lsof -i :${port} -t`, (err, stdout) => {
-        if (err || !stdout) {
-          resolve();
-          return;
-        }
-        const pids = stdout.trim().split('\n');
-        pids.forEach(pid => {
-          if (pid) {
+          // Extract PID from netstat output
+          const lines = stdout.trim().split('\n');
+          const pids = new Set();
+          lines.forEach(line => {
+            const parts = line.trim().split(/\s+/);
+            const pid = parts[parts.length - 1];
+            if (pid && !isNaN(pid)) {
+              pids.add(pid);
+            }
+          });
+          log(`killProcessOnPort: Found ${pids.size} processes to kill`);
+          // Kill each PID
+          pids.forEach(pid => {
             try {
-              exec(`kill -9 ${pid}`, () => { });
-            } catch (e) { }
-          }
+              exec(`taskkill /PID ${pid} /F`, () => { });
+            } catch (e) {
+              log(`killProcessOnPort: Error killing PID ${pid}: ${e.message}`);
+            }
+          });
+          setTimeout(resolve, 500);
         });
-        setTimeout(resolve, 500);
-      });
+      } else {
+        // Mac/Linux command to find and kill process on port
+        exec(`lsof -i :${port} -t`, (err, stdout) => {
+          if (err || !stdout) {
+            log(`killProcessOnPort: No process on port ${port} (Mac/Linux)`);
+            resolve();
+            return;
+          }
+          const pids = stdout.trim().split('\n');
+          log(`killProcessOnPort: Found ${pids.length} processes to kill: ${pids.join(', ')}`);
+          pids.forEach(pid => {
+            if (pid) {
+              try {
+                exec(`kill -9 ${pid}`, () => { });
+              } catch (e) {
+                log(`killProcessOnPort: Error killing PID ${pid}: ${e.message}`);
+              }
+            }
+          });
+          setTimeout(resolve, 500);
+        });
+      }
+    } catch (e) {
+      log(`killProcessOnPort: Exception caught: ${e.message}`);
+      resolve(); // Resolve anyway to not block
     }
   });
 }
