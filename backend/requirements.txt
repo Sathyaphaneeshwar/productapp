@@ -11,6 +11,4 @@ flask
 flask-cors
 pdfplumber
 beautifulsoup4
-psycopg2-binary
-gunicorn
 xhtml2pdf

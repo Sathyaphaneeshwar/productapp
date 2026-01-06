@@ -1,9 +1,10 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage } from 'electron';
+import { app, BrowserWindow, Menu, Tray, nativeImage, dialog } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import http from 'http';
+import { autoUpdater } from 'electron-updater';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,15 +14,77 @@ let mainWindow;
 let backendProcess;
 let isQuitting = false;
 
+// Configure auto-updater
+autoUpdater.autoDownload = true;
+autoUpdater.autoInstallOnAppQuit = true;
+
+autoUpdater.on('update-available', () => {
+  console.log('Update available, downloading...');
+});
+
+autoUpdater.on('update-downloaded', () => {
+  dialog.showMessageBox({
+    type: 'info',
+    title: 'Update Ready',
+    message: 'A new version has been downloaded. Restart the app to apply the update.',
+    buttons: ['Restart Now', 'Later']
+  }).then((result) => {
+    if (result.response === 0) {
+      isQuitting = true;
+      autoUpdater.quitAndInstall();
+    }
+  });
+});
+
+autoUpdater.on('error', (err) => {
+  console.log('Auto-updater error:', err);
+});
+
 const BACKEND_EXE = app.isPackaged
   ? path.join(process.resourcesPath, 'python', 'backend-app', 'backend-app.exe')
   : path.join(__dirname, '..', 'backend', 'dist', 'backend-app', 'backend-app.exe');
 
-function startBackend() {
+const BACKEND_PORT = 5001;
+
+// Kill any process using the backend port
+async function killProcessOnPort(port) {
+  return new Promise((resolve) => {
+    const { exec } = require('child_process');
+    // Windows command to find and kill process on port
+    exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
+      if (err || !stdout) {
+        resolve(); // No process found
+        return;
+      }
+      // Extract PID from netstat output
+      const lines = stdout.trim().split('\n');
+      const pids = new Set();
+      lines.forEach(line => {
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && !isNaN(pid)) {
+          pids.add(pid);
+        }
+      });
+      // Kill each PID
+      pids.forEach(pid => {
+        try {
+          exec(`taskkill /PID ${pid} /F`, () => { });
+        } catch (e) { }
+      });
+      setTimeout(resolve, 500); // Wait for processes to die
+    });
+  });
+}
+
+async function startBackend() {
   if (!fs.existsSync(BACKEND_EXE)) {
     console.error('Backend executable not found at', BACKEND_EXE);
     return;
   }
+
+  // Kill any process blocking our port first
+  await killProcessOnPort(BACKEND_PORT);
 
   backendProcess = spawn(BACKEND_EXE, [], {
     detached: true,
@@ -77,7 +140,7 @@ function setupTray() {
 }
 
 async function waitForBackend(retries = 20) {
-  const url = 'http://127.0.0.1:5000/api/watchlist';
+  const url = `http://127.0.0.1:${BACKEND_PORT}/api/watchlist`;
 
   return new Promise((resolve) => {
     const attempt = (remaining) => {
@@ -96,7 +159,7 @@ async function waitForBackend(retries = 20) {
 
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
-  startBackend();
+  await startBackend();
   setupTray();
   createWindow();
   app.setLoginItemSettings({ openAtLogin: true, enabled: true });
@@ -105,6 +168,11 @@ app.whenReady().then(async () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.reloadIgnoringCache();
     mainWindow.show();
+  }
+
+  // Check for updates (only in production)
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdates();
   }
 });
 

@@ -1,12 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
+# Use os.path.join for cross-platform compatibility
+BASE_DIR = os.path.dirname(os.path.abspath(SPEC))
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('templates', 'templates'), ('..\\database', 'database'), ('..\\data', 'data'), ('..\\logs', 'logs'), ('..\\scripts', 'scripts'), ('..\\.encryption_key', '.')],
-    hiddenimports=[],
+    datas=[
+        ('templates', 'templates'),
+        (os.path.join('..', 'database'), 'database'),
+        (os.path.join('..', 'data'), 'data'),
+    ],
+    hiddenimports=[
+        'xhtml2pdf',
+        'xhtml2pdf.files',
+        'xhtml2pdf.w3c',
+        'reportlab',
+        'html5lib',
+        'pypdf',
+        'pdfplumber',
+        'PIL',
+        'flask_cors',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

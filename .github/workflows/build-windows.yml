@@ -1,0 +1,190 @@
+name: Build Windows and Mac Apps
+
+on:
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+  
+  # Or trigger on release tags
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Setup Python for backend
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+      
+      # Setup Node.js for frontend
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      # Install backend dependencies
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      # Build backend with PyInstaller
+      - name: Build backend
+        run: |
+          cd backend
+          pyinstaller backend-app.spec --noconfirm
+        
+      # Verify backend build
+      - name: Verify backend build
+        run: |
+          if (Test-Path "backend/dist/backend-app/backend-app.exe") {
+            Write-Host "✓ Backend built successfully"
+          } else {
+            Write-Error "✗ Backend build failed"
+            exit 1
+          }
+        shell: pwsh
+      
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+      
+      # Build frontend (React)
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+      
+      # Build Electron app
+      - name: Build Electron app
+        run: |
+          cd frontend
+          npm run electron:build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Upload artifact
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: frontend/release/*.exe
+          if-no-files-found: error
+
+  build-mac:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Setup Python for backend
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+      
+      # Setup Node.js for frontend
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      # Install backend dependencies
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      # Build backend with PyInstaller (Mac version)
+      - name: Build backend
+        run: |
+          cd backend
+          pyinstaller backend-app.spec --noconfirm
+        
+      # Verify backend build
+      - name: Verify backend build
+        run: |
+          if [ -f "backend/dist/backend-app/backend-app" ]; then
+            echo "✓ Backend built successfully"
+          else
+            echo "✗ Backend build failed"
+            exit 1
+          fi
+      
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+      
+      # Build frontend (React)
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+      
+      # Build Electron app for Mac
+      - name: Build Electron app
+        run: |
+          cd frontend
+          npm run electron:build -- --mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Upload artifact
+      - name: Upload Mac installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-installer
+          path: |
+            frontend/release/*.dmg
+            frontend/release/*.zip
+          if-no-files-found: error
+
+  # Create release with both artifacts
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: release/
+      
+      - name: Download Mac artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-installer
+          path: release/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
