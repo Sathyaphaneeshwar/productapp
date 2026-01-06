@@ -7,8 +7,7 @@ from datetime import datetime
 import sqlite3
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 from backend.services.key_service import KeyService
 
 @dataclass

@@ -16,8 +16,7 @@ if VENDOR_PATH not in sys.path:
 import markdown
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 
 class EmailService:
     def __init__(self):

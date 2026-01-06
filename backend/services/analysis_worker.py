@@ -6,8 +6,7 @@ import sys
 from datetime import datetime
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 from services.prompt_service import PromptService
 from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService

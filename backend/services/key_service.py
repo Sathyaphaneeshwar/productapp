@@ -4,8 +4,7 @@ import sys
 from typing import Optional
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 
 class KeyService:
     def __init__(self, db_path: str = None):

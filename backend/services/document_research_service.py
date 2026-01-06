@@ -18,8 +18,7 @@ from bs4 import BeautifulSoup
 from io import BytesIO
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 from backend.services.llm.llm_service import LLMService
 
 # PDF generation

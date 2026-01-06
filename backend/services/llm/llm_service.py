@@ -6,8 +6,7 @@ from typing import List, Optional
 import sys
 import os
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 from backend.services.llm.base_provider import BaseLLMProvider, LLMResponse, ModelInfo
 from backend.services.llm.google_ai_provider import GoogleAIProvider
 from backend.services.llm.openai_provider import OpenAIProvider

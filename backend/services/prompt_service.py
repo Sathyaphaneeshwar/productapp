@@ -6,8 +6,7 @@ import os
 # Ideally we'd inject the connection, but for now we'll create a new one or pass it in.
 # Importing DB_PATH from config would be better.
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 
 DEFAULT_PROMPT_TEXT = """
 You are an expert financial analyst. 

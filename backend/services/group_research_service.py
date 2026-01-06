@@ -9,8 +9,7 @@ import markdown
 import re
 
 # Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.config import DATABASE_PATH
+from config import DATABASE_PATH
 from backend.services.transcript_service import TranscriptService
 from backend.services.llm.llm_service import LLMService
 from backend.services.email_service import EmailService
