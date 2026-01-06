@@ -6,9 +6,9 @@ import sys
 from datetime import datetime
 
 from config import DATABASE_PATH
-from backend.services.transcript_service import TranscriptService
-from backend.services.analysis_worker import AnalysisWorker
-from backend.services.group_research_service import GroupResearchService
+from services.transcript_service import TranscriptService
+from services.analysis_worker import AnalysisWorker
+from services.group_research_service import GroupResearchService
 
 class SchedulerService:
     def __init__(self, poll_interval_seconds=3600):  # Default: 1 hour

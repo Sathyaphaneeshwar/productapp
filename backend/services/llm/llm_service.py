@@ -7,11 +7,11 @@ import sys
 import os
 
 from config import DATABASE_PATH
-from backend.services.llm.base_provider import BaseLLMProvider, LLMResponse, ModelInfo
-from backend.services.llm.google_ai_provider import GoogleAIProvider
-from backend.services.llm.openai_provider import OpenAIProvider
-from backend.services.llm.anthropic_provider import AnthropicProvider
-from backend.services.llm.openrouter_provider import OpenRouterProvider
+from services.llm.base_provider import BaseLLMProvider, LLMResponse, ModelInfo
+from services.llm.google_ai_provider import GoogleAIProvider
+from services.llm.openai_provider import OpenAIProvider
+from services.llm.anthropic_provider import AnthropicProvider
+from services.llm.openrouter_provider import OpenRouterProvider
 
 class LLMService:
     """Main service for LLM operations."""

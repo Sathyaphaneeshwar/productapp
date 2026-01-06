@@ -10,9 +10,9 @@ import re
 
 # Add parent directory to path
 from config import DATABASE_PATH
-from backend.services.transcript_service import TranscriptService
-from backend.services.llm.llm_service import LLMService
-from backend.services.email_service import EmailService
+from services.transcript_service import TranscriptService
+from services.llm.llm_service import LLMService
+from services.email_service import EmailService
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'templates')
 
 

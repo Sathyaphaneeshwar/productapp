@@ -19,7 +19,7 @@ from io import BytesIO
 
 # Add parent directory to path
 from config import DATABASE_PATH
-from backend.services.llm.llm_service import LLMService
+from services.llm.llm_service import LLMService
 
 # PDF generation
 try:

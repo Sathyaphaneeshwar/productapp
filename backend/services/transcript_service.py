@@ -8,7 +8,7 @@ import sqlite3
 
 # Add parent directory to path
 from config import DATABASE_PATH
-from backend.services.key_service import KeyService
+from services.key_service import KeyService
 
 @dataclass
 class TranscriptMetadata:
