@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+venv/
+*_venv/
+.venv/
+*.env/
+backend_venv/
+.pack-venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Database files (user data - don't commit)
+database/*.db
+database/*.db-journal
+*.db
+*.db-journal
+
+# Security (never commit)
+.encryption_key
+.env
+.env.*
+.env.local
+.env.production
+
+# Logs
+*.log
+logs/
+
+# Build outputs
+frontend/dist/
+frontend/build/
+frontend/release/
+backend/dist/
+backend/build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Update packages (temporary)
+update_package_*.zip
+
+# PID files
+.pids/
+stocklib-app/

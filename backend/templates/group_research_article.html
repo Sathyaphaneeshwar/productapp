@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{GROUP_NAME}} &mdash; {{QUARTER}} {{YEAR}}</title>
+</head>
+<body style="margin:0;padding:28px 16px;font-family:'Segoe UI',Arial,sans-serif;background:#f4f4f4;color:#1a1a1a;">
+    <table role="presentation" style="width:100%;border-collapse:collapse;">
+        <tr>
+            <td align="center">
+                <table role="presentation" style="width:760px;max-width:95%;background:#ffffff;border:1px solid #b5b5b5;padding:26px 30px 30px 30px;">
+                    <tr>
+                        <td style="font-size:12px;color:#666666;font-weight:700;padding-bottom:8px;">
+                            {{MODEL_PROVIDER}} {{MODEL_ID}}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="text-align:center;padding:6px 0 18px 0;">
+                            <div style="font-size:18px;font-weight:700;color:#1f4b99;line-height:1.45;">
+                                {{GROUP_NAME}} &mdash; Group Deep Research
+                            </div>
+                            <div style="font-size:16px;font-weight:700;color:#1f4b99;margin-top:4px;">
+                                {{QUARTER}} {{YEAR}}
+                            </div>
+                            <div style="font-size:13px;color:#444;margin-top:6px;">
+                                Stocks: {{STOCK_LIST}}
+                            </div>
+                            <div style="font-size:12px;color:#777;margin-top:6px;">
+                                Generated: {{GENERATED_DATE}}
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="border-top:1px solid #d6d6d6;padding-top:18px;">
+                            <div style="font-size:14px;line-height:1.7;">
+                                {{CONTENT}}
+                            </div>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
