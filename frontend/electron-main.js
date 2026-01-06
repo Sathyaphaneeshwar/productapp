@@ -137,6 +137,9 @@ async function startBackend() {
       windowsHide: true
     });
 
+    log(`Spawn called, process object created: ${!!backendProcess}`);
+    log(`Backend PID: ${backendProcess?.pid || 'undefined'}`);
+
     backendProcess.stdout.on('data', (data) => {
       log(`[Backend]: ${data}`);
     });
@@ -147,17 +150,25 @@ async function startBackend() {
 
     backendProcess.on('error', (err) => {
       log(`Failed to spawn backend: ${err.message}`);
+      log(`Error stack: ${err.stack}`);
     });
 
-    backendProcess.on('close', (code) => {
-      log(`Backend process exited with code ${code}`);
+    backendProcess.on('close', (code, signal) => {
+      log(`Backend process exited with code ${code}, signal ${signal}`);
+    });
+
+    backendProcess.on('exit', (code, signal) => {
+      log(`Backend process exit event: code ${code}, signal ${signal}`);
     });
 
     if (backendProcess.pid) {
-      log(`Backend started with PID: ${backendProcess.pid}`);
+      log(`Backend started successfully with PID: ${backendProcess.pid}`);
+    } else {
+      log(`WARNING: Backend process created but no PID assigned`);
     }
   } catch (e) {
     log(`Exception starting backend: ${e.message}`);
+    log(`Exception stack: ${e.stack}`);
   }
 }
 
