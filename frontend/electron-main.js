@@ -130,11 +130,20 @@ async function startBackend() {
   await killProcessOnPort(BACKEND_PORT);
 
   try {
+    // Ensure proper environment for macOS
+    const spawnEnv = {
+      ...process.env,
+      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+    };
+
+    log(`Starting spawn with env PATH: ${spawnEnv.PATH?.substring(0, 100)}...`);
+
     backendProcess = spawn(BACKEND_EXE, [], {
       cwd: BACKEND_DIR, // IMPORTANT: Run in the directory of the executable
       detached: false,
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      env: spawnEnv
     });
 
     log(`Spawn called, process object created: ${!!backendProcess}`);
