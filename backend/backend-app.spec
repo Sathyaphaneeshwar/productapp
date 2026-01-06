@@ -14,10 +14,24 @@ a = Analysis(
         (os.path.join('..', 'data'), 'data'),
     ],
     hiddenimports=[
+        # Flask & Web
+        'flask',
+        'flask_cors',
+        
+        # xhtml2pdf and dependencies
         'xhtml2pdf',
         'xhtml2pdf.files',
         'xhtml2pdf.w3c',
+        'xhtml2pdf.context',
+        'xhtml2pdf.parser',
+        'xhtml2pdf.tables',
+        'xhtml2pdf.tags',
+        'xhtml2pdf.document',
+        'xhtml2pdf.default',
+        
+        # reportlab - comprehensive
         'reportlab',
+        'reportlab.graphics',
         'reportlab.graphics.barcode',
         'reportlab.graphics.barcode.code128',
         'reportlab.graphics.barcode.code39',
@@ -32,12 +46,68 @@ a = Analysis(
         'reportlab.graphics.barcode.usps',
         'reportlab.graphics.barcode.usps4s',
         'reportlab.graphics.barcode.widgets',
+        'reportlab.lib',
+        'reportlab.lib.colors',
+        'reportlab.lib.pagesizes',
+        'reportlab.lib.units',
+        'reportlab.pdfgen',
+        'reportlab.platypus',
+        
+        # PDF processing
         'html5lib',
         'pypdf',
         'pdfplumber',
         'PIL',
-        'flask_cors',
+        'PIL.Image',
+        
+        # Markdown
         'markdown',
+        'markdown.extensions',
+        'markdown.extensions.tables',
+        'markdown.extensions.fenced_code',
+        
+        # LLM providers
+        'anthropic',
+        'openai',
+        'google.generativeai',
+        'google.ai.generativelanguage',
+        
+        # Tokenization
+        'tiktoken',
+        'tiktoken_ext',
+        'tiktoken_ext.openai_public',
+        
+        # Web scraping & networking
+        'requests',
+        'bs4',
+        'beautifulsoup4',
+        
+        # Cryptography
+        'cryptography',
+        'cryptography.fernet',
+        
+        # Email
+        'email',
+        'email.mime',
+        'email.mime.text',
+        'email.mime.multipart',
+        'smtplib',
+        
+        # Standard library that might be missed
+        'sqlite3',
+        'json',
+        'threading',
+        'io',
+        'html',
+        're',
+        'random',
+        'time',
+        'sys',
+        'os',
+        'datetime',
+        'dataclasses',
+        'abc',
+        'typing',
     ],
     hookspath=[],
     hooksconfig={},
