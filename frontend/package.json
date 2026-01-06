@@ -62,8 +62,8 @@
     ],
     "publish": {
       "provider": "github",
-      "owner": "${GH_OWNER}",
-      "repo": "${GH_REPO}"
+      "owner": "Sathyaphaneeshwar",
+      "repo": "productapp"
     },
     "win": {
       "target": [
