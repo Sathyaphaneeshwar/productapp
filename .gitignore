@@ -1,6 +1,7 @@
 # Secrets and local data
 .encryption_key
 *.db
+!database/stocks.db
 .env
 .env.*
 
