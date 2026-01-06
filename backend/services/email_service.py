@@ -4,8 +4,17 @@ from email.mime.multipart import MIMEMultipart
 import sqlite3
 import os
 import sys
+import ssl
 import html
 from typing import Optional, Dict, Any
+from datetime import datetime
+
+# Import certifi for SSL certificates in bundled apps
+try:
+    import certifi
+    SSL_CERT_FILE = certifi.where()
+except ImportError:
+    SSL_CERT_FILE = None
 from datetime import datetime
 
 # Prefer vendored dependencies (installed via pip --target) before falling back to system
@@ -51,9 +60,10 @@ class EmailService:
             server = smtplib.SMTP(smtp_config['smtp_server'], int(smtp_config['smtp_port']), timeout=30)
             server.ehlo()
             
-            # Use starttls with SSL context for better compatibility
-            import ssl
+            # Use starttls with SSL context - use certifi for CA certs in bundled apps
             context = ssl.create_default_context()
+            if SSL_CERT_FILE:
+                context.load_verify_locations(SSL_CERT_FILE)
             server.starttls(context=context)
             server.ehlo()
             
@@ -91,11 +101,12 @@ class EmailService:
             # Add body
             msg.attach(MIMEText(body, 'html' if is_html else 'plain'))
             
-            # Send email with timeout and SSL context
-            import ssl
+            # Send email with timeout and SSL context - use certifi for CA certs
             server = smtplib.SMTP(smtp_config['smtp_server'], int(smtp_config['smtp_port']), timeout=30)
             server.ehlo()
             context = ssl.create_default_context()
+            if SSL_CERT_FILE:
+                context.load_verify_locations(SSL_CERT_FILE)
             server.starttls(context=context)
             server.ehlo()
             server.login(smtp_config['email'], smtp_config['app_password'])
