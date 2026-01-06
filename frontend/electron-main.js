@@ -41,44 +41,67 @@ autoUpdater.on('error', (err) => {
   console.log('Auto-updater error:', err);
 });
 
-const BACKEND_EXE = app.isPackaged
-  ? path.join(process.resourcesPath, 'python', 'backend-app', 'backend-app.exe')
-  : path.join(__dirname, '..', 'backend', 'dist', 'backend-app', 'backend-app.exe');
-
+// Backend port
 const BACKEND_PORT = 5001;
 
 // Kill any process using the backend port
 async function killProcessOnPort(port) {
   return new Promise((resolve) => {
     const { exec } = require('child_process');
-    // Windows command to find and kill process on port
-    exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
-      if (err || !stdout) {
-        resolve(); // No process found
-        return;
-      }
-      // Extract PID from netstat output
-      const lines = stdout.trim().split('\n');
-      const pids = new Set();
-      lines.forEach(line => {
-        const parts = line.trim().split(/\s+/);
-        const pid = parts[parts.length - 1];
-        if (pid && !isNaN(pid)) {
-          pids.add(pid);
+
+    if (process.platform === 'win32') {
+      // Windows command to find and kill process on port
+      exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
+        if (err || !stdout) {
+          resolve(); // No process found
+          return;
         }
+        // Extract PID from netstat output
+        const lines = stdout.trim().split('\n');
+        const pids = new Set();
+        lines.forEach(line => {
+          const parts = line.trim().split(/\s+/);
+          const pid = parts[parts.length - 1];
+          if (pid && !isNaN(pid)) {
+            pids.add(pid);
+          }
+        });
+        // Kill each PID
+        pids.forEach(pid => {
+          try {
+            exec(`taskkill /PID ${pid} /F`, () => { });
+          } catch (e) { }
+        });
+        setTimeout(resolve, 500); // Wait for processes to die
       });
-      // Kill each PID
-      pids.forEach(pid => {
-        try {
-          exec(`taskkill /PID ${pid} /F`, () => { });
-        } catch (e) { }
+    } else {
+      // Mac/Linux command to find and kill process on port
+      exec(`lsof -i :${port} -t`, (err, stdout) => {
+        if (err || !stdout) {
+          resolve();
+          return;
+        }
+        const pids = stdout.trim().split('\n');
+        pids.forEach(pid => {
+          if (pid) {
+            try {
+              exec(`kill -9 ${pid}`, () => { });
+            } catch (e) { }
+          }
+        });
+        setTimeout(resolve, 500);
       });
-      setTimeout(resolve, 500); // Wait for processes to die
-    });
+    }
   });
 }
 
 async function startBackend() {
+  const executableName = process.platform === 'win32' ? 'backend-app.exe' : 'backend-app';
+
+  const BACKEND_EXE = app.isPackaged
+    ? path.join(process.resourcesPath, 'python', 'backend-app', executableName)
+    : path.join(__dirname, '..', 'backend', 'dist', 'backend-app', executableName);
+
   if (!fs.existsSync(BACKEND_EXE)) {
     console.error('Backend executable not found at', BACKEND_EXE);
     return;
@@ -93,7 +116,12 @@ async function startBackend() {
     windowsHide: true
   });
 
-  backendProcess.unref();
+  if (backendProcess.pid) {
+    console.log(`Backend started with PID: ${backendProcess.pid}`);
+    backendProcess.unref();
+  } else {
+    console.error('Failed to spawn backend process');
+  }
 }
 
 function createWindow() {
@@ -109,6 +137,9 @@ function createWindow() {
 
   const indexPath = path.join(__dirname, 'dist', 'index.html');
   mainWindow.loadFile(indexPath).then(() => mainWindow?.show());
+
+  // Open DevTools in development or if requested (optional for debugging)
+  // mainWindow.webContents.openDevTools(); 
 
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
