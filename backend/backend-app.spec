@@ -2,7 +2,9 @@
 import os
 
 # Use os.path.join for cross-platform compatibility
+# SPEC is the path to this spec file
 BASE_DIR = os.path.dirname(os.path.abspath(SPEC))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)  # Parent of backend folder
 
 a = Analysis(
     ['app.py'],
@@ -10,8 +12,8 @@ a = Analysis(
     binaries=[],
     datas=[
         ('templates', 'templates'),
-        (os.path.join('..', 'database'), 'database'),
-        (os.path.join('..', 'data'), 'data'),
+        (os.path.join(PROJECT_ROOT, 'database'), 'database'),
+        (os.path.join(PROJECT_ROOT, 'data'), 'data'),
     ],
     hiddenimports=[
         # Flask & Web
