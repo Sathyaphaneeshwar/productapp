@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import sqlite3  # Still needed for IntegrityError handling
+import sqlite3
 import os
+import sys
 import smtplib
 import html
 import markdown
@@ -9,18 +10,14 @@ from io import BytesIO
 from xhtml2pdf import pisa
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from config import DATABASE_PATH
 from services.scheduler_service import SchedulerService
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
-from database_config import get_db_connection, init_database, IS_PRODUCTION
 
 app = Flask(__name__)
 CORS(app)
-
-# Initialize database on startup (for production PostgreSQL)
-if IS_PRODUCTION:
-    init_database()
 
 # Initialize and start the background scheduler
 scheduler = SchedulerService(poll_interval_seconds=3600)  # Poll every hour
@@ -29,8 +26,12 @@ prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
 
-# get_db_connection is now imported from database_config
+DB_PATH = str(DATABASE_PATH)
 
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def get_current_fy_quarter():
     """
@@ -1583,4 +1584,6 @@ def download_research_pdf(run_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    # Disable debug mode in production (PyInstaller) to prevent reloader
+    is_frozen = getattr(sys, 'frozen', False)
+    app.run(debug=not is_frozen, port=5001, use_reloader=not is_frozen)
