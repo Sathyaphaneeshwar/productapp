@@ -191,10 +191,28 @@ async function waitForBackend(retries = 20) {
 
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
-  await startBackend();
-  setupTray();
+
+  // Create window FIRST so user sees something
   createWindow();
+  setupTray();
   app.setLoginItemSettings({ openAtLogin: true, enabled: true });
+
+  // Add execute permissions for Mac/Linux
+  if (app.isPackaged && process.platform !== 'win32') {
+    const executableName = 'backend-app';
+    const backendPath = path.join(process.resourcesPath, 'python', 'backend-app', executableName);
+    if (fs.existsSync(backendPath)) {
+      try {
+        fs.chmodSync(backendPath, '755');
+        console.log('Set permissions for backend executable');
+      } catch (err) {
+        console.error('Failed to set permissions:', err);
+      }
+    }
+  }
+
+  // Start backend
+  await startBackend();
 
   await waitForBackend();
   if (mainWindow && !mainWindow.isDestroyed()) {
