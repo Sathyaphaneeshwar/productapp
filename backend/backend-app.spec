@@ -23,6 +23,7 @@ a = Analysis(
         'pdfplumber',
         'PIL',
         'flask_cors',
+        'markdown',
     ],
     hookspath=[],
     hooksconfig={},
