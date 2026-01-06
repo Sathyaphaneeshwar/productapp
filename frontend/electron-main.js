@@ -95,6 +95,20 @@ async function killProcessOnPort(port) {
   });
 }
 
+const logPath = path.join(app.getPath('userData'), 'app.log');
+const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+
+function log(message) {
+  const timestamp = new Date().toISOString();
+  const msg = `${timestamp}: ${message}\n`;
+  console.log(msg); // Console still works in dev
+  try {
+    logStream.write(msg);
+  } catch (e) {
+    // ignore logging errors
+  }
+}
+
 async function startBackend() {
   const executableName = process.platform === 'win32' ? 'backend-app.exe' : 'backend-app';
 
@@ -102,25 +116,48 @@ async function startBackend() {
     ? path.join(process.resourcesPath, 'python', 'backend-app', executableName)
     : path.join(__dirname, '..', 'backend', 'dist', 'backend-app', executableName);
 
+  const BACKEND_DIR = path.dirname(BACKEND_EXE);
+
+  log(`Starting backend from: ${BACKEND_EXE}`);
+  log(`Backend working directory: ${BACKEND_DIR}`);
+
   if (!fs.existsSync(BACKEND_EXE)) {
-    console.error('Backend executable not found at', BACKEND_EXE);
+    log(`ERROR: Backend executable not found at ${BACKEND_EXE}`);
     return;
   }
 
   // Kill any process blocking our port first
   await killProcessOnPort(BACKEND_PORT);
 
-  backendProcess = spawn(BACKEND_EXE, [], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true
-  });
+  try {
+    backendProcess = spawn(BACKEND_EXE, [], {
+      cwd: BACKEND_DIR, // IMPORTANT: Run in the directory of the executable
+      detached: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
 
-  if (backendProcess.pid) {
-    console.log(`Backend started with PID: ${backendProcess.pid}`);
-    backendProcess.unref();
-  } else {
-    console.error('Failed to spawn backend process');
+    backendProcess.stdout.on('data', (data) => {
+      log(`[Backend]: ${data}`);
+    });
+
+    backendProcess.stderr.on('data', (data) => {
+      log(`[Backend ERROR]: ${data}`);
+    });
+
+    backendProcess.on('error', (err) => {
+      log(`Failed to spawn backend: ${err.message}`);
+    });
+
+    backendProcess.on('close', (code) => {
+      log(`Backend process exited with code ${code}`);
+    });
+
+    if (backendProcess.pid) {
+      log(`Backend started with PID: ${backendProcess.pid}`);
+    }
+  } catch (e) {
+    log(`Exception starting backend: ${e.message}`);
   }
 }
 
