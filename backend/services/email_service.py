@@ -132,12 +132,15 @@ class EmailService:
     
     def render_template(self, template_name: str, variables: Dict[str, str]) -> str:
         """Render email template with variables"""
-        template_path = os.path.join(
-            os.path.dirname(__file__),
-            '..',
-            'templates',
-            template_name
-        )
+        # Handle PyInstaller frozen app vs development
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller bundle - templates are in _MEIPASS/templates
+            base_path = sys._MEIPASS
+        else:
+            # Running in development - templates are in ../templates relative to this file
+            base_path = os.path.join(os.path.dirname(__file__), '..')
+        
+        template_path = os.path.join(base_path, 'templates', template_name)
         
         try:
             with open(template_path, 'r') as f:
@@ -149,7 +152,7 @@ class EmailService:
             
             return template
         except FileNotFoundError:
-            raise FileNotFoundError(f"Email template not found: {template_name}")
+            raise FileNotFoundError(f"Email template not found: {template_name} (looked at: {template_path})")
     
     def send_analysis_email(self, to_email: str, stock_symbol: str, stock_name: str, 
                            quarter: str, year: int, analysis_content: str, 
