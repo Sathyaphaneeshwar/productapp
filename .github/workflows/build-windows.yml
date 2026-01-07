@@ -47,7 +47,7 @@ jobs:
       - name: Build backend
         run: |
           cd backend
-          pyinstaller backend-app.spec --noconfirm
+          pyinstaller backend-app.spec --noconfirm --clean
         
       # Verify backend build
       - name: Verify backend build
@@ -122,7 +122,7 @@ jobs:
       - name: Build backend
         run: |
           cd backend
-          pyinstaller backend-app.spec --noconfirm
+          pyinstaller backend-app.spec --noconfirm --clean
         
       # Verify backend build
       - name: Verify backend build
