@@ -35,7 +35,12 @@ class GoogleAIProvider(BaseLLMProvider):
         try:
             if NEW_SDK:
                 # Determine if model supports thinking
-                is_thinking_model = 'thinking' in model_id.lower() or 'gemini-3' in model_id.lower()
+                # Gemini 2.5, 2.0 thinking variants, and 3.x models all support thinking
+                is_thinking_model = (
+                    'thinking' in model_id.lower() or 
+                    'gemini-3' in model_id.lower() or
+                    'gemini-2.5' in model_id.lower()
+                )
                 
                 config_args = {
                     "max_output_tokens": max_tokens,
@@ -43,8 +48,17 @@ class GoogleAIProvider(BaseLLMProvider):
                 }
 
                 if thinking_mode and is_thinking_model:
+                    # Gemini 2.5 models use thinking_budget (cannot be disabled for Pro)
+                    if 'gemini-2.5' in model_id.lower():
+                        # Default to dynamic thinking (-1) if no budget specified
+                        # Gemini 2.5 Pro: min 128, max 32768 tokens
+                        budget = thinking_budget if thinking_budget > 0 else -1  # -1 = dynamic
+                        config_args["thinking_config"] = types.ThinkingConfig(
+                            thinking_budget=budget,
+                            include_thoughts=True
+                        )
                     # Gemini 2.0 Flash Thinking uses thinking_config with include_thoughts
-                    if 'gemini-2.0-flash-thinking' in model_id.lower():
+                    elif 'gemini-2.0-flash-thinking' in model_id.lower():
                         config_args["thinking_config"] = types.ThinkingConfig(
                             include_thoughts=True
                         )
