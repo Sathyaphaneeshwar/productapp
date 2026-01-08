@@ -341,10 +341,15 @@ def create_group():
     cursor = conn.cursor()
     
     try:
+        # Check for duplicate name (case-insensitive)
+        cursor.execute("SELECT id FROM groups WHERE LOWER(name) = LOWER(?)", (name.strip(),))
+        if cursor.fetchone():
+            return jsonify({'error': 'A group with this name already exists'}), 409
+            
         cursor.execute("""
             INSERT INTO groups (name, deep_research_prompt, stock_summary_prompt, is_active)
             VALUES (?, ?, ?, ?)
-        """, (name, data.get('deep_research_prompt'), data.get('stock_summary_prompt'), data.get('is_active', True)))
+        """, (name.strip(), data.get('deep_research_prompt'), data.get('stock_summary_prompt'), data.get('is_active', True)))
         conn.commit()
         return jsonify({'message': 'Group created', 'id': cursor.lastrowid}), 201
     except Exception as e:
@@ -369,8 +374,16 @@ def update_group(group_id):
         values = []
         
         if 'name' in data:
+            # Check for duplicate name (case-insensitive), excluding current group
+            new_name = data['name'].strip()
+            cursor.execute(
+                "SELECT id FROM groups WHERE LOWER(name) = LOWER(?) AND id != ?", 
+                (new_name, group_id)
+            )
+            if cursor.fetchone():
+                return jsonify({'error': 'A group with this name already exists'}), 409
             fields.append("name = ?")
-            values.append(data['name'])
+            values.append(new_name)
             
         if 'deep_research_prompt' in data:
             fields.append("deep_research_prompt = ?")
@@ -992,6 +1005,7 @@ Management maintains positive outlook with guided revenue growth of 15-18% for F
         
         # Send to all active recipients
         sent_count = 0
+        errors = []
         for email in email_list:
             try:
                 email_service.send_analysis_email(
@@ -1007,13 +1021,19 @@ Management maintains positive outlook with guided revenue growth of 15-18% for F
                 )
                 sent_count += 1
             except Exception as e:
-                print(f"Failed to send to {email}: {e}")
+                error_msg = f"Failed to send to {email}: {str(e)}"
+                print(error_msg)
+                errors.append(error_msg)
         
-        return jsonify({
+        response = {
             'message': f'Test analysis email sent to {sent_count} recipient(s)',
             'recipients': email_list,
             'sent_count': sent_count
-        }), 200
+        }
+        if errors:
+            response['errors'] = errors
+        
+        return jsonify(response), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500

@@ -223,9 +223,9 @@ class GroupResearchService:
         try:
             update_status("in_progress")
 
-            # Fetch group prompt
+            # Fetch group prompts (both deep research and stock summary)
             cursor.execute(
-                "SELECT deep_research_prompt FROM groups WHERE id = ? AND is_active = 1",
+                "SELECT deep_research_prompt, stock_summary_prompt FROM groups WHERE id = ? AND is_active = 1",
                 (group_id,),
             )
             row = cursor.fetchone()
@@ -234,6 +234,7 @@ class GroupResearchService:
                 return
 
             system_prompt = row["deep_research_prompt"]
+            stock_summary_prompt = row["stock_summary_prompt"] or ""
 
             # Get stocks in the group
             cursor.execute(
@@ -311,6 +312,10 @@ class GroupResearchService:
                 "Use the context below (all group stock transcripts) to deliver a comparative deep research summary. "
                 "Highlight cross-company themes, divergences, risks, and opportunities."
             )
+            
+            # Append stock summary prompt if configured
+            if stock_summary_prompt:
+                user_prompt += f"\n\nAdditional instructions for summarizing each stock:\n{stock_summary_prompt}"
 
             try:
                 llm_response = self.llm_service.generate(

@@ -8,7 +8,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { cn } from '@/lib/utils'
 
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
+const API_URL = 'http://localhost:5000/api'
 
 type Group = {
     id: number
@@ -74,7 +74,9 @@ export default function Groups() {
     const [forcingRun, setForcingRun] = useState(false)
     const [quarters, setQuarters] = useState<Quarter[]>([])
     const [selectedQuarter, setSelectedQuarter] = useState<Quarter | null>(null)
+    const [settingsSaveStatus, setSettingsSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
     const stockSearchContainerRef = useRef<HTMLDivElement>(null)
+    const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
     // Fetch groups and quarters on mount
     useEffect(() => {
@@ -237,10 +239,14 @@ export default function Groups() {
             if (response.ok) {
                 if (selectedGroupId === id) setSelectedGroupId(null)
                 fetchGroups()
-                setDeletingGroupId(null)
+            } else {
+                alert('Failed to delete group. Please try again.')
             }
         } catch (error) {
             console.error('Error deleting group:', error)
+            alert('Failed to delete group. Please try again.')
+        } finally {
+            setDeletingGroupId(null)
         }
     }
 
@@ -269,8 +275,8 @@ export default function Groups() {
                 setRenamingGroupId(null)
                 setRenameValue('')
                 fetchGroups()
-                if (selectedGroupId === id) {
-                    fetchGroupDetails(id)
+                if (selectedGroupId === id && selectedQuarter) {
+                    fetchGroupDetails(id, selectedQuarter.quarter, selectedQuarter.year)
                 }
             }
         } catch (error) {
@@ -284,18 +290,10 @@ export default function Groups() {
         setRenameValue('')
     }
 
-    const latestTranscriptMeta = () => {
-        if (!selectedGroup?.stocks) return null
-        const withTranscript = selectedGroup.stocks.find(s => s.quarter && s.year)
-        if (!withTranscript) return null
-        return { quarter: withTranscript.quarter, year: withTranscript.year }
-    }
-
     const forceGenerate = async () => {
         if (!selectedGroupId) return
-        const meta = latestTranscriptMeta()
-        if (!meta) {
-            alert('No transcripts available to force generate.')
+        if (!selectedQuarter) {
+            alert('Please select a quarter first.')
             return
         }
         setForcingRun(true)
@@ -303,23 +301,67 @@ export default function Groups() {
             const response = await fetch(`${API_URL}/groups/${selectedGroupId}/articles`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ quarter: meta.quarter, year: meta.year })
+                body: JSON.stringify({ quarter: selectedQuarter.quarter, year: selectedQuarter.year })
             })
             if (response.ok) {
-                // Refresh articles list
+                // Refresh articles list and start polling
                 fetchArticles(selectedGroupId)
+                startArticlePolling(selectedGroupId)
             } else {
-                console.error('Force generate failed', await response.text())
+                const errorText = await response.text()
+                console.error('Force generate failed', errorText)
+                alert(`Failed to generate article: ${errorText || 'Unknown error'}`)
             }
-        } catch (e) {
+        } catch (e: any) {
             console.error('Force generate failed', e)
+            alert(`Failed to generate article: ${e.message || 'Network error'}`)
         } finally {
             setForcingRun(false)
         }
     }
 
-    const updateGroup = async (updates: Partial<Group>) => {
+    // Issue #6: Polling for article status updates
+    const startArticlePolling = (groupId: number) => {
+        // Clear any existing polling
+        if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current)
+        }
+
+        pollingIntervalRef.current = setInterval(async () => {
+            try {
+                const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
+                if (response.ok) {
+                    const data = await response.json()
+                    setArticles(data)
+
+                    // Stop polling if no articles are in progress
+                    const hasInProgress = data.some((a: GroupArticle) =>
+                        a.status === 'pending' || a.status === 'in_progress'
+                    )
+                    if (!hasInProgress && pollingIntervalRef.current) {
+                        clearInterval(pollingIntervalRef.current)
+                        pollingIntervalRef.current = null
+                    }
+                }
+            } catch (error) {
+                console.error('Error polling articles:', error)
+            }
+        }, 5000) // Poll every 5 seconds
+    }
+
+    // Cleanup polling on unmount or group change
+    useEffect(() => {
+        return () => {
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current)
+            }
+        }
+    }, [selectedGroupId])
+
+    const updateGroup = async (updates: Partial<Group>, showFeedback = false) => {
         if (!selectedGroupId) return
+
+        if (showFeedback) setSettingsSaveStatus('saving')
 
         try {
             const response = await fetch(`${API_URL}/groups/${selectedGroupId}`, {
@@ -331,9 +373,22 @@ export default function Groups() {
             if (response.ok) {
                 fetchGroups() // Update list for active status etc
                 fetchGroupDetails(selectedGroupId)
+                if (showFeedback) {
+                    setSettingsSaveStatus('saved')
+                    setTimeout(() => setSettingsSaveStatus('idle'), 2000)
+                }
+            } else {
+                if (showFeedback) {
+                    setSettingsSaveStatus('error')
+                    setTimeout(() => setSettingsSaveStatus('idle'), 3000)
+                }
             }
         } catch (error) {
             console.error('Error updating group:', error)
+            if (showFeedback) {
+                setSettingsSaveStatus('error')
+                setTimeout(() => setSettingsSaveStatus('idle'), 3000)
+            }
         }
     }
 
@@ -750,12 +805,23 @@ export default function Groups() {
                                             placeholder="Enter prompt for stock summaries..."
                                         />
                                     </div>
-                                    <Button onClick={() => updateGroup({
-                                        deep_research_prompt: selectedGroup.deep_research_prompt,
-                                        stock_summary_prompt: selectedGroup.stock_summary_prompt
-                                    })}>
-                                        Save Changes
-                                    </Button>
+                                    <div className="flex items-center gap-3">
+                                        <Button
+                                            onClick={() => updateGroup({
+                                                deep_research_prompt: selectedGroup.deep_research_prompt,
+                                                stock_summary_prompt: selectedGroup.stock_summary_prompt
+                                            }, true)}
+                                            disabled={settingsSaveStatus === 'saving'}
+                                        >
+                                            {settingsSaveStatus === 'saving' ? 'Saving...' : 'Save Changes'}
+                                        </Button>
+                                        {settingsSaveStatus === 'saved' && (
+                                            <span className="text-sm text-green-500">✓ Saved successfully</span>
+                                        )}
+                                        {settingsSaveStatus === 'error' && (
+                                            <span className="text-sm text-red-500">✗ Failed to save</span>
+                                        )}
+                                    </div>
                                 </div>
                             )}
                         </div>
