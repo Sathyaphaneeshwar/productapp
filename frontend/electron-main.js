@@ -19,10 +19,6 @@ let isQuitting = false;
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
 
-// GitHub token for private repo access (read-only, contents:read permission)
-const GH_UPDATE_TOKEN = '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';
-autoUpdater.requestHeaders = { 'Authorization': `token ${GH_UPDATE_TOKEN}` };
-
 autoUpdater.on('update-available', () => {
   console.log('Update available, downloading...');
 });
