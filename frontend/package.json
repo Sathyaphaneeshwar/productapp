@@ -1,7 +1,7 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "Product Gemini Stock Analysis App",
   "author": "Sathyaphaneeshwar",
   "type": "module",
