@@ -323,6 +323,7 @@ class GroupResearchService:
                     system_prompt=system_prompt,
                     thinking_mode=True,
                     max_tokens=12000,
+                    task_type='group_research',
                 )
                 llm_output = llm_response.content
                 provider_name = llm_response.provider_name

@@ -68,7 +68,8 @@ class LLMService:
         model_id: Optional[int] = None,
         thinking_mode: bool = False,
         thinking_budget: int = 0,
-        max_tokens: int = 12000
+        max_tokens: int = 12000,
+        task_type: Optional[str] = None  # 'watchlist' or 'group_research'
     ) -> LLMResponse:
         """
         Generate a response using the specified or default model.
@@ -79,6 +80,8 @@ class LLMService:
             model_id: Database ID of model to use (None = use default)
             thinking_mode: Enable thinking mode
             max_tokens: Maximum tokens to generate
+            task_type: Optional task type for task-specific model selection
+                       ('watchlist' or 'group_research')
             
         Returns:
             LLMResponse with content and metadata
@@ -88,12 +91,28 @@ class LLMService:
         
         # Get model info
         if model_id is None:
-            # Use default model
+            # Determine which setting key to use based on task_type
+            setting_key = 'default_model_id'  # fallback
+            if task_type == 'watchlist':
+                setting_key = 'watchlist_model_id'
+            elif task_type == 'group_research':
+                setting_key = 'group_research_model_id'
+            
+            # Try task-specific setting first, fallback to default
             cursor.execute("""
                 SELECT setting_value FROM llm_settings 
-                WHERE setting_key = 'default_model_id'
-            """)
+                WHERE setting_key = ?
+            """, (setting_key,))
             result = cursor.fetchone()
+            
+            # If task-specific setting not found, fallback to default
+            if not result and setting_key != 'default_model_id':
+                cursor.execute("""
+                    SELECT setting_value FROM llm_settings 
+                    WHERE setting_key = 'default_model_id'
+                """)
+                result = cursor.fetchone()
+            
             if not result:
                 raise Exception("No default model configured")
             model_id = int(result['setting_value'])

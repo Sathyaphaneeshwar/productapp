@@ -46,6 +46,15 @@ class SchedulerService:
             
             existing = cursor.fetchone()
             
+            # Fallback: also check for upcoming by quarter/year if not found by URL
+            # This handles cases where the transcript URL changed when it became available
+            if not existing:
+                cursor.execute("""
+                    SELECT id, status, quarter, year FROM transcripts 
+                    WHERE stock_id = ? AND quarter = ? AND year = ? AND status = 'upcoming'
+                """, (stock_id, transcript.quarter, transcript.year))
+                existing = cursor.fetchone()
+            
             if not existing:
                 print(f"[Scheduler] New transcript found for {symbol}: {transcript.title}")
                 cursor.execute("""

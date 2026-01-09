@@ -298,7 +298,8 @@ Years included: {', '.join(str(y) for y in sorted(document_years, reverse=True))
                     prompt=user_prompt,
                     system_prompt=prompt,
                     thinking_mode=True,
-                    max_tokens=12000
+                    max_tokens=12000,
+                    task_type='watchlist',
                 )
                 llm_output = llm_response.content
                 provider_name = llm_response.provider_name

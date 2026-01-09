@@ -102,7 +102,7 @@ class TranscriptService:
             'isin': isin,
             'mcap': 'all',
             'upcoming': 'false',
-            'page_size': 1 # We only want the latest one for now
+            'page_size': 5  # Fetch last 5 quarters of transcripts
         }
 
         try:

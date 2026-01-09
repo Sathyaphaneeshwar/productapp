@@ -124,7 +124,8 @@ class AnalysisWorker:
                     prompt=f"Here is the transcript text:\n\n{transcript_text}",
                     system_prompt=system_prompt,
                     thinking_mode=True,  # Default to thinking mode for analysis
-                    max_tokens=12000     # Request longer analyses by default
+                    max_tokens=12000,    # Request longer analyses by default
+                    task_type='watchlist',
                 )
                 llm_output = llm_response.content
                 provider_name = llm_response.provider_name
