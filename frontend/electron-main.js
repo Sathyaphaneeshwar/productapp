@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage, dialog } from 'electron';
+import { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { spawn, exec } from 'child_process';
@@ -15,30 +15,51 @@ let mainWindow;
 let backendProcess;
 let isQuitting = false;
 
+// Update status tracking
+let updateStatus = 'idle'; // 'idle', 'checking', 'available', 'downloading', 'ready', 'error'
+let updateInfo = null;
+
 // Configure auto-updater
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
 
-autoUpdater.on('update-available', () => {
-  console.log('Update available, downloading...');
+// Helper to send update status to renderer
+function sendUpdateStatus(status, info = null) {
+  updateStatus = status;
+  updateInfo = info;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update-status', { status, info });
+  }
+}
+
+autoUpdater.on('checking-for-update', () => {
+  log('Checking for update...');
+  sendUpdateStatus('checking');
 });
 
-autoUpdater.on('update-downloaded', () => {
-  dialog.showMessageBox({
-    type: 'info',
-    title: 'Update Ready',
-    message: 'A new version has been downloaded. Restart the app to apply the update.',
-    buttons: ['Restart Now', 'Later']
-  }).then((result) => {
-    if (result.response === 0) {
-      isQuitting = true;
-      autoUpdater.quitAndInstall();
-    }
-  });
+autoUpdater.on('update-available', (info) => {
+  log('Update available: ' + JSON.stringify(info));
+  sendUpdateStatus('downloading', info);
+});
+
+autoUpdater.on('update-not-available', (info) => {
+  log('Update not available');
+  sendUpdateStatus('idle', info);
+});
+
+autoUpdater.on('download-progress', (progress) => {
+  log(`Download progress: ${progress.percent}%`);
+  sendUpdateStatus('downloading', { percent: progress.percent });
+});
+
+autoUpdater.on('update-downloaded', (info) => {
+  log('Update downloaded');
+  sendUpdateStatus('ready', info);
 });
 
 autoUpdater.on('error', (err) => {
-  console.log('Auto-updater error:', err);
+  log('Auto-updater error: ' + err.message);
+  sendUpdateStatus('error', { message: err.message });
 });
 
 // Backend port
@@ -201,7 +222,8 @@ function createWindow() {
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
-      contextIsolation: true
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
     }
   });
 
@@ -294,6 +316,34 @@ app.whenReady().then(async () => {
   if (app.isPackaged) {
     autoUpdater.checkForUpdates();
   }
+
+  // IPC handlers for update button
+  ipcMain.handle('check-for-updates', async () => {
+    if (!app.isPackaged) {
+      sendUpdateStatus('idle', { message: 'Updates only work in packaged app' });
+      return { status: 'dev-mode' };
+    }
+    try {
+      const result = await autoUpdater.checkForUpdates();
+      return { status: 'checking', result };
+    } catch (err) {
+      sendUpdateStatus('error', { message: err.message });
+      return { status: 'error', message: err.message };
+    }
+  });
+
+  ipcMain.handle('install-update', () => {
+    if (updateStatus === 'ready') {
+      isQuitting = true;
+      autoUpdater.quitAndInstall();
+      return { status: 'installing' };
+    }
+    return { status: 'not-ready' };
+  });
+
+  ipcMain.handle('get-app-version', () => {
+    return app.getVersion();
+  });
 });
 
 app.on('window-all-closed', (event) => {

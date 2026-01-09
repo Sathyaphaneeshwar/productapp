@@ -5,6 +5,7 @@ import Watchlist from './pages/Watchlist'
 import Groups from './pages/Groups'
 import Research from './pages/Research'
 import Settings from './pages/Settings'
+import UpdateButton from './components/UpdateButton'
 
 type Theme = 'light' | 'dark' | 'system'
 type Page = 'watchlist' | 'groups' | 'research' | 'settings'
@@ -101,7 +102,8 @@ function App() {
           <div className="flex items-center justify-between mb-6">
             <div className="flex-1"></div>
             <h1 className="text-4xl font-bold text-foreground text-center">Earning Calls Analyzer</h1>
-            <div className="flex-1 flex justify-end">
+            <div className="flex-1 flex justify-end gap-2">
+              <UpdateButton />
               <Button
                 variant="ghost"
                 size="icon"
