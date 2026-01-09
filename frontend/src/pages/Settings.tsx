@@ -3,9 +3,9 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Loader2, CheckCircle2, XCircle, Mail, Settings as SettingsIcon } from 'lucide-react'
 
-type SettingsTab = 'email' | 'llm' | 'api'
+type SettingsTab = 'email' | 'analysis' | 'deep_research' | 'api'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
+const API_URL = 'http://localhost:5001/api'
 
 export default function Settings() {
     const [activeTab, setActiveTab] = useState<SettingsTab>('email')
@@ -460,7 +460,7 @@ export default function Settings() {
         }
     }
 
-    const handleSaveDefaultModel = async (modelId: string) => {
+    const handleSaveDefaultModel = async (modelId: string, settingKey: string = 'default_model_id') => {
         setIsSavingDefaultModel(true)
         setSaveResult(null)
 
@@ -468,15 +468,17 @@ export default function Settings() {
             const response = await fetch(`${API_URL}/llm/settings`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ default_model_id: modelId })
+                body: JSON.stringify({ [settingKey]: modelId })
             })
 
             if (response.ok) {
-                setSaveResult({ status: 'success', message: 'Default model updated!' })
-                setLlmSettings((prev: any) => ({ ...prev, default_model_id: modelId }))
+                const taskLabel = settingKey === 'watchlist_model_id' ? 'Analysis' :
+                    settingKey === 'group_research_model_id' ? 'Deep Research' : 'Default'
+                setSaveResult({ status: 'success', message: `${taskLabel} model updated!` })
+                setLlmSettings((prev: any) => ({ ...prev, [settingKey]: modelId }))
             } else {
                 const data = await response.json()
-                setSaveResult({ status: 'error', message: data.error || 'Failed to update default model' })
+                setSaveResult({ status: 'error', message: data.error || 'Failed to update model' })
             }
         } catch (error) {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
@@ -539,13 +541,22 @@ export default function Settings() {
                             Email Settings
                         </button>
                         <button
-                            onClick={() => setActiveTab('llm')}
-                            className={`text-lg font-semibold pb-4 border-b-2 transition-colors ${activeTab === 'llm'
+                            onClick={() => setActiveTab('analysis')}
+                            className={`text-lg font-semibold pb-4 border-b-2 transition-colors ${activeTab === 'analysis'
                                 ? 'border-primary text-foreground'
                                 : 'border-transparent text-muted-foreground hover:text-foreground'
                                 }`}
                         >
-                            LLM Settings
+                            Analysis Settings
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('deep_research')}
+                            className={`text-lg font-semibold pb-4 border-b-2 transition-colors ${activeTab === 'deep_research'
+                                ? 'border-primary text-foreground'
+                                : 'border-transparent text-muted-foreground hover:text-foreground'
+                                }`}
+                        >
+                            Deep Research Settings
                         </button>
                         <button
                             onClick={() => setActiveTab('api')}
@@ -748,27 +759,34 @@ export default function Settings() {
                         </div>
                     </div>
                 )}
-                {activeTab === 'llm' && (
+                {(activeTab === 'analysis' || activeTab === 'deep_research') && (
                     <div className="space-y-6">
                         <div className="flex justify-between items-center">
-                            <h3 className="text-2xl font-semibold">LLM Settings</h3>
+                            <h3 className="text-2xl font-semibold">
+                                {activeTab === 'analysis' ? 'Analysis Settings' : 'Deep Research Settings'}
+                            </h3>
+                            <span className="text-sm text-muted-foreground">
+                                {activeTab === 'analysis'
+                                    ? 'Used for individual stock analysis (Watchlist)'
+                                    : 'Used for group research articles'}
+                            </span>
                         </div>
-
-
 
                         <div className="grid gap-6">
                             {llmProviders.filter(p => p.provider_name !== 'anthropic').map((provider) => {
                                 const providerModels = llmModels.filter(m => m.provider_name === provider.provider_name)
-                                const currentDefaultModelId = llmSettings.default_model_id
-                                // Check if any model from this provider is the current default
-                                const isProviderActive = providerModels.some(m => m.id == currentDefaultModelId)
+                                // Use task-specific model ID
+                                const settingKey = activeTab === 'analysis' ? 'watchlist_model_id' : 'group_research_model_id'
+                                const currentModelId = llmSettings[settingKey] || llmSettings.default_model_id
+                                // Check if any model from this provider is selected for this task
+                                const isProviderActive = providerModels.some(m => m.id == currentModelId)
 
                                 const handleToggleProvider = () => {
                                     if (isProviderActive) return // Already active
 
                                     if (providerModels.length > 0) {
-                                        // Select the first model as default
-                                        handleSaveDefaultModel(providerModels[0].id)
+                                        // Select the first model as default for this task
+                                        handleSaveDefaultModel(providerModels[0].id, settingKey)
                                     } else {
                                         setSaveResult({ status: 'error', message: `Please sync models for ${provider.display_name} first` })
                                     }
@@ -828,8 +846,8 @@ export default function Settings() {
                                                     <label className="text-sm font-medium mb-2 block text-muted-foreground">Select Model</label>
                                                     <select
                                                         className={`w-full h-10 px-3 rounded-md border bg-background text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50 ${isProviderActive ? 'border-green-500/50 focus-visible:ring-green-500' : 'border-input'}`}
-                                                        value={isProviderActive ? currentDefaultModelId : ''}
-                                                        onChange={(e) => handleSaveDefaultModel(e.target.value)}
+                                                        value={isProviderActive ? currentModelId : ''}
+                                                        onChange={(e) => handleSaveDefaultModel(e.target.value, settingKey)}
                                                         disabled={isSavingDefaultModel || providerModels.length === 0}
                                                     >
                                                         <option value="" disabled>Select a model...</option>
@@ -852,7 +870,7 @@ export default function Settings() {
                                                         </h5>
                                                     </div>
 
-                                                    {providerModels.filter(m => m.id == currentDefaultModelId).map(model => (
+                                                    {providerModels.filter(m => m.id == currentModelId).map(model => (
                                                         <div key={model.id} className="space-y-4">
                                                             <div className="grid grid-cols-2 gap-4">
                                                                 <div>
@@ -997,12 +1015,10 @@ export default function Settings() {
                                 )
                             })}
                         </div>
-                    </div>
-                )}
-                {activeTab === 'api' && (
-                    <div>
-                        <div className="space-y-6">
-                            <div className="p-4 bg-card border border-border rounded-lg flex flex-col gap-3">
+
+                        {/* Default Analysis Prompt - only in Analysis tab */}
+                        {activeTab === 'analysis' && (
+                            <div className="p-4 bg-card border border-border rounded-lg flex flex-col gap-3 mt-6">
                                 <div className="flex items-center justify-between">
                                     <div>
                                         <h4 className="font-medium mb-1">Default Analysis Prompt</h4>
@@ -1035,6 +1051,12 @@ export default function Settings() {
                                     </Button>
                                 </div>
                             </div>
+                        )}
+                    </div>
+                )}
+                {activeTab === 'api' && (
+                    <div>
+                        <div className="space-y-6">
                             <div className="flex items-center gap-4 p-4 bg-card border border-border rounded-lg">
                                 <div className="flex-1">
                                     <h4 className="font-medium mb-1">Tijori API Key</h4>

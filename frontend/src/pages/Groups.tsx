@@ -8,7 +8,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { cn } from '@/lib/utils'
 
 
-const API_URL = 'http://localhost:5000/api'
+const API_URL = 'http://localhost:5001/api'
 
 type Group = {
     id: number
