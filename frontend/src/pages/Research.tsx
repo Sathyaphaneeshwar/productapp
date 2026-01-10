@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
+import DOMPurify from 'dompurify'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Plus, Search, Download, FileText, Loader2, X, Eye } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-const API_URL = 'http://localhost:5001/api'
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
 
 type AvailableDocument = {
     year: number
@@ -55,6 +56,7 @@ export default function Research() {
     const [runsLoading, setRunsLoading] = useState(true)
     const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
     const [selectedRunContent, setSelectedRunContent] = useState<string | null>(null)
+    const [contentError, setContentError] = useState<string | null>(null)
     const [contentLoading, setContentLoading] = useState(false)
 
     // Right panel - new research
@@ -70,6 +72,7 @@ export default function Research() {
     const [downloadingId, setDownloadingId] = useState<number | null>(null)
 
     const searchContainerRef = useRef<HTMLDivElement>(null)
+    const searchRequestId = useRef(0)
 
     // Fetch runs on mount and periodically
     useEffect(() => {
@@ -84,6 +87,7 @@ export default function Research() {
             if (stockSearchQuery) {
                 searchStocks(stockSearchQuery)
             } else {
+                searchRequestId.current++
                 setSearchResults([])
             }
         }, 300)
@@ -117,9 +121,11 @@ export default function Research() {
     }
 
     const searchStocks = async (query: string) => {
+        const currentRequestId = ++searchRequestId.current
         setIsSearching(true)
         try {
             const response = await fetch(`${API_URL}/stocks?q=${encodeURIComponent(query)}`)
+            if (currentRequestId !== searchRequestId.current) return
             if (response.ok) {
                 const data = await response.json()
                 setSearchResults(data)
@@ -202,19 +208,24 @@ export default function Research() {
         if (selectedRunId === runId) {
             setSelectedRunId(null)
             setSelectedRunContent(null)
+            setContentError(null)
             return
         }
 
         setSelectedRunId(runId)
+        setSelectedRunContent(null)
+        setContentError(null)
         setContentLoading(true)
         try {
             const response = await fetch(`${API_URL}/research/runs/${runId}`)
-            if (response.ok) {
-                const data = await response.json()
-                setSelectedRunContent(data.rendered_html || data.llm_output || '')
+            if (!response.ok) {
+                throw new Error(`Failed to fetch run (${response.status})`)
             }
+            const data = await response.json()
+            setSelectedRunContent(data.rendered_html || data.llm_output || '')
         } catch (error) {
             console.error('Error fetching run content:', error)
+            setContentError('Unable to load this research report right now. Please try again.')
         } finally {
             setContentLoading(false)
         }
@@ -319,7 +330,7 @@ export default function Research() {
                                                 {run.stock_name}
                                             </div>
                                             <div className="text-xs text-muted-foreground mt-1">
-                                                Years: {run.document_years.sort((a, b) => b - a).join(', ')}
+                                                Years: {[...run.document_years].sort((a, b) => b - a).join(', ')}
                                             </div>
                                             <div className="text-xs text-muted-foreground">
                                                 {new Date(run.created_at).toLocaleDateString('en-IN', {
@@ -368,18 +379,22 @@ export default function Research() {
                                 </div>
 
                                 {/* Expanded content */}
-                                {selectedRunId === run.id && selectedRunContent && (
+                                {selectedRunId === run.id && (contentLoading || contentError !== null || selectedRunContent !== null) && (
                                     <div className="mt-2 p-3 rounded-md bg-background border border-border max-h-96 overflow-auto">
                                         {contentLoading ? (
                                             <div className="flex items-center justify-center p-4">
                                                 <Loader2 className="animate-spin h-4 w-4 mr-2" />
                                                 Loading...
                                             </div>
-                                        ) : (
+                                        ) : contentError ? (
+                                            <div className="text-sm text-red-400">{contentError}</div>
+                                        ) : selectedRunContent ? (
                                             <div
                                                 className="prose prose-sm dark:prose-invert max-w-none"
-                                                dangerouslySetInnerHTML={{ __html: selectedRunContent }}
+                                                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(selectedRunContent) }}
                                             />
+                                        ) : (
+                                            <div className="text-sm text-muted-foreground">No content available for this run.</div>
                                         )}
                                     </div>
                                 )}

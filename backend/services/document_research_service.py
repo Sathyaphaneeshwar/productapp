@@ -20,6 +20,7 @@ from io import BytesIO
 # Add parent directory to path
 from config import DATABASE_PATH
 from services.llm.llm_service import LLMService
+from services.email_service import EmailService
 
 # PDF generation
 try:
@@ -65,6 +66,7 @@ class DocumentResearchService:
     def __init__(self):
         self.db_path = str(DATABASE_PATH)
         self.llm_service = LLMService()
+        self.email_service = EmailService()
         self.ensure_table()
 
     def get_db_connection(self):
@@ -320,6 +322,24 @@ Years included: {', '.join(str(y) for y in sorted(document_years, reverse=True))
                 WHERE id = ?
             """, (llm_output, provider_name, model_id, run_id))
             conn.commit()
+
+            # Send research email to active recipients
+            emails = self.email_service.get_active_email_list()
+            if emails:
+                years = sorted(document_years, reverse=True)
+                for email in emails:
+                    try:
+                        self.email_service.send_document_research_email(
+                            to_email=email,
+                            stock_symbol=stock_symbol,
+                            stock_name=run.get('stock_name', ''),
+                            years=years,
+                            analysis_content=llm_output,
+                            model_provider=provider_name,
+                            model_name=model_id
+                        )
+                    except Exception as e:
+                        print(f"[DocumentResearch] Failed to send email to {email}: {e}")
             
         except Exception as e:
             update_status("error", f"Unexpected error: {e}")

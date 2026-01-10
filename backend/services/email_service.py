@@ -129,6 +129,31 @@ class EmailService:
             return [row['email'] for row in cursor.fetchall()]
         finally:
             conn.close()
+
+    def _normalize_markdown(self, text: str) -> str:
+        """
+        Clean up common LLM Markdown quirks so tables render in HTML emails.
+        - Strip leading whitespace on pipe-table rows.
+        - Ensure blank lines surround table blocks for python-markdown parsing.
+        """
+        cleaned_lines = []
+        in_table = False
+        for line in (text or "").splitlines():
+            stripped = line.lstrip()
+            is_table_row = stripped.startswith("|") and stripped.count("|") >= 2
+
+            if is_table_row and not in_table:
+                if cleaned_lines and cleaned_lines[-1].strip():
+                    cleaned_lines.append("")
+                in_table = True
+            elif not is_table_row and in_table:
+                if cleaned_lines and cleaned_lines[-1].strip():
+                    cleaned_lines.append("")
+                in_table = False
+
+            cleaned_lines.append(stripped if is_table_row else line)
+
+        return "\n".join(cleaned_lines)
     
     def render_template(self, template_name: str, variables: Dict[str, str]) -> str:
         """Render email template with variables"""
@@ -160,35 +185,10 @@ class EmailService:
                            transcript_url: str = None) -> bool:
         """Send analysis email using template"""
         try:
-            def normalize_markdown(text: str) -> str:
-                """
-                Clean up common LLM Markdown quirks so tables render in HTML emails.
-                - Strip leading whitespace on pipe-table rows.
-                - Ensure blank lines surround table blocks for python-markdown parsing.
-                """
-                cleaned_lines = []
-                in_table = False
-                for line in (text or "").splitlines():
-                    stripped = line.lstrip()
-                    is_table_row = stripped.startswith("|") and stripped.count("|") >= 2
-
-                    if is_table_row and not in_table:
-                        if cleaned_lines and cleaned_lines[-1].strip():
-                            cleaned_lines.append("")
-                        in_table = True
-                    elif not is_table_row and in_table:
-                        if cleaned_lines and cleaned_lines[-1].strip():
-                            cleaned_lines.append("")
-                        in_table = False
-
-                    cleaned_lines.append(stripped if is_table_row else line)
-
-                return "\n".join(cleaned_lines)
-
             # Convert Markdown (including tables/lists) to HTML; fall back to escaped text on failure
             md_extensions = ['extra', 'tables', 'sane_lists', 'nl2br']
             try:
-                normalized = normalize_markdown(analysis_content or "")
+                normalized = self._normalize_markdown(analysis_content or "")
                 analysis_html = markdown.markdown(normalized, extensions=md_extensions)
             except Exception:
                 escaped = html.escape(analysis_content or "")
@@ -221,3 +221,49 @@ class EmailService:
             )
         except Exception as e:
             raise Exception(f"Failed to send analysis email: {str(e)}")
+
+    def send_document_research_email(
+        self,
+        to_email: str,
+        stock_symbol: str,
+        stock_name: str,
+        years: list[int],
+        analysis_content: str,
+        model_provider: str,
+        model_name: str = None
+    ) -> bool:
+        """Send annual report research email."""
+        try:
+            md_extensions = ['extra', 'tables', 'sane_lists', 'nl2br']
+            try:
+                normalized = self._normalize_markdown(analysis_content or "")
+                analysis_html = markdown.markdown(normalized, extensions=md_extensions)
+            except Exception:
+                escaped = html.escape(analysis_content or "")
+                escaped_with_br = escaped.replace('\n', '<br>')
+                analysis_html = f"<p>{escaped_with_br}</p>"
+
+            years_str = ", ".join(str(y) for y in sorted(years, reverse=True))
+            display_model = model_name if model_name else model_provider.upper()
+            generated_date = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+
+            html_body = self.render_template('email_document_research.html', {
+                'STOCK_SYMBOL': stock_symbol,
+                'STOCK_NAME': stock_name,
+                'YEARS': years_str,
+                'ANALYSIS_CONTENT': analysis_html,
+                'MODEL_PROVIDER': model_provider.upper(),
+                'MODEL_NAME': display_model,
+                'GENERATED_DATE': generated_date
+            })
+
+            subject = f"📄 Annual Report Research: {stock_symbol} ({years_str})"
+
+            return self.send_email(
+                to_email=to_email,
+                subject=subject,
+                body=html_body,
+                is_html=True
+            )
+        except Exception as e:
+            raise Exception(f"Failed to send document research email: {str(e)}")
