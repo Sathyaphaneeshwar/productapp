@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import DOMPurify from 'dompurify'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Plus, Settings, FileText, List, Trash2, X, Loader2, Search, Pencil } from 'lucide-react'
@@ -44,6 +45,7 @@ type GroupArticle = {
     created_at: string
     updated_at: string
     rendered_html?: string
+    error_message?: string
 }
 
 type Quarter = {
@@ -75,6 +77,7 @@ export default function Groups() {
     const [quarters, setQuarters] = useState<Quarter[]>([])
     const [selectedQuarter, setSelectedQuarter] = useState<Quarter | null>(null)
     const [settingsSaveStatus, setSettingsSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+    const [allowPartial, setAllowPartial] = useState(true)
     const stockSearchContainerRef = useRef<HTMLDivElement>(null)
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -301,14 +304,32 @@ export default function Groups() {
             const response = await fetch(`${API_URL}/groups/${selectedGroupId}/articles`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ quarter: selectedQuarter.quarter, year: selectedQuarter.year })
+                body: JSON.stringify({
+                    quarter: selectedQuarter.quarter,
+                    year: selectedQuarter.year,
+                    allow_partial: allowPartial
+                })
             })
             if (response.ok) {
+                const result = await response.json()
+                const included = result.included_symbols || []
+                const missing = result.missing_symbols || []
+                let message = `Sent ${included.length} stock(s) for analysis:\n${included.join(', ') || 'None'}`
+                if (missing.length > 0) {
+                    message += `\nSkipped (missing transcripts): ${missing.join(', ')}`
+                }
+                alert(message)
                 // Refresh articles list and start polling
                 fetchArticles(selectedGroupId)
                 startArticlePolling(selectedGroupId)
             } else {
-                const errorText = await response.text()
+                let errorText = 'Unknown error'
+                try {
+                    const errorJson = await response.json()
+                    errorText = errorJson.error || JSON.stringify(errorJson)
+                } catch {
+                    errorText = await response.text()
+                }
                 console.error('Force generate failed', errorText)
                 alert(`Failed to generate article: ${errorText || 'Unknown error'}`)
             }
@@ -358,6 +379,16 @@ export default function Groups() {
         }
     }, [selectedGroupId])
 
+    // Auto-start polling when viewing articles tab to catch scheduler-triggered runs
+    useEffect(() => {
+        if (activeTab === 'articles' && selectedGroupId) {
+            startArticlePolling(selectedGroupId)
+        } else if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current)
+            pollingIntervalRef.current = null
+        }
+    }, [activeTab, selectedGroupId])
+
     const updateGroup = async (updates: Partial<Group>, showFeedback = false) => {
         if (!selectedGroupId) return
 
@@ -372,7 +403,11 @@ export default function Groups() {
 
             if (response.ok) {
                 fetchGroups() // Update list for active status etc
-                fetchGroupDetails(selectedGroupId)
+                fetchGroupDetails(
+                    selectedGroupId,
+                    selectedQuarter?.quarter,
+                    selectedQuarter?.year
+                )
                 if (showFeedback) {
                     setSettingsSaveStatus('saved')
                     setTimeout(() => setSettingsSaveStatus('idle'), 2000)
@@ -419,7 +454,11 @@ export default function Groups() {
 
             if (response.ok) {
                 // Keep search results visible for adding multiple stocks
-                fetchGroupDetails(selectedGroupId)
+                fetchGroupDetails(
+                    selectedGroupId,
+                    selectedQuarter?.quarter,
+                    selectedQuarter?.year
+                )
                 fetchGroups() // Update count
             }
         } catch (error) {
@@ -436,7 +475,11 @@ export default function Groups() {
             })
 
             if (response.ok) {
-                fetchGroupDetails(selectedGroupId)
+                fetchGroupDetails(
+                    selectedGroupId,
+                    selectedQuarter?.quarter,
+                    selectedQuarter?.year
+                )
                 fetchGroups() // Update count
             }
         } catch (error) {
@@ -726,12 +769,21 @@ export default function Groups() {
 
                             {activeTab === 'articles' && (
                                 <div className="space-y-4">
-                                    <div className="flex items-center gap-3">
+                                    <div className="flex items-center gap-3 flex-wrap">
                                         <Button variant="outline" size="sm" disabled={forcingRun} onClick={forceGenerate}>
                                             {forcingRun ? 'Starting...' : 'Force Generate'}
                                         </Button>
+                                        <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <input
+                                                type="checkbox"
+                                                checked={allowPartial}
+                                                onChange={(e) => setAllowPartial(e.target.checked)}
+                                                className="h-4 w-4 accent-primary"
+                                            />
+                                            <span>Allow partial run (skip stocks without transcripts)</span>
+                                        </label>
                                         <div className="text-xs text-muted-foreground">
-                                            Uses whatever transcripts are available for the latest quarter. Missing stocks will be skipped.
+                                            Uses transcripts for the selected quarter. Missing stocks will be skipped when partial mode is on.
                                         </div>
                                     </div>
                                     {articlesLoading ? (
@@ -754,9 +806,14 @@ export default function Groups() {
                                                         <div className="text-xs text-muted-foreground mt-1">
                                                             Updated {new Date(article.updated_at).toLocaleString()}
                                                         </div>
-                                                        <div className="text-xs text-muted-foreground">
+                                                <div className="text-xs text-muted-foreground">
                                                             Status: <span className="font-medium">{article.status}</span>
-                                                        </div>
+                                                            {article.error_message && (
+                                                                <span className="ml-2 text-amber-600">
+                                                                    (Skipped: {article.error_message})
+                                                                </span>
+                                                            )}
+                                                    </div>
                                                     </div>
                                                     <div className="flex items-center gap-2">
                                                         <Button
@@ -776,7 +833,7 @@ export default function Groups() {
                                                 {openArticleId === article.id && openArticleContent && (
                                                     <div
                                                         className="mt-3 p-3 rounded-md bg-background border border-border max-h-96 overflow-auto text-sm prose prose-sm dark:prose-invert"
-                                                        dangerouslySetInnerHTML={{ __html: openArticleContent }}
+                                                        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(openArticleContent) }}
                                                     />
                                                 )}
                                             </div>

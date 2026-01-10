@@ -4,6 +4,7 @@ import sqlite3
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
 # Add parent directory to path
 from config import DATABASE_PATH
@@ -25,7 +26,7 @@ class AnalysisWorker:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def start_analysis_job(self, stock_id: int) -> str:
+    def start_analysis_job(self, stock_id: int, quarter: Optional[str] = None, year: Optional[int] = None) -> str:
         """
         Starts the analysis job in a background thread.
         Returns a Job ID (for now, we'll just return a timestamp-based ID).
@@ -35,14 +36,14 @@ class AnalysisWorker:
         # Start background thread
         thread = threading.Thread(
             target=self._process_analysis_job,
-            args=(stock_id, job_id)
+            args=(stock_id, job_id, quarter, year)
         )
         thread.daemon = True # Daemon thread so it doesn't block app exit
         thread.start()
         
         return job_id
 
-    def _process_analysis_job(self, stock_id: int, job_id: str):
+    def _process_analysis_job(self, stock_id: int, job_id: str, quarter: Optional[str] = None, year: Optional[int] = None):
         """
         Internal method running in background thread.
         """
@@ -52,64 +53,105 @@ class AnalysisWorker:
         
         try:
             # 1. Get Stock Symbol
-            cursor.execute("SELECT stock_symbol FROM stocks WHERE id = ?", (stock_id,))
+            cursor.execute("SELECT stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
             stock = cursor.fetchone()
             if not stock:
                 print(f"[{job_id}] Stock not found!")
                 return
             
-            symbol = stock['stock_symbol']
+            symbol = stock['stock_symbol'] or stock['bse_code']
+            if not symbol:
+                print(f"[{job_id}] No symbol/bse_code found for stock {stock_id}")
+                return
             print(f"[{job_id}] Processing symbol: {symbol}")
 
-            # 2. Fetch Available Transcripts
-            print(f"[{job_id}] Fetching transcripts for {symbol}...")
-            transcripts = self.transcript_service.fetch_available_transcripts(symbol)
-            
-            if not transcripts:
-                print(f"[{job_id}] No transcripts found for {symbol}")
-                return
-
-            # For now, we just take the first one (latest)
-            latest_transcript = transcripts[0]
-            print(f"[{job_id}] Found transcript: {latest_transcript.title}")
-
-            # Check if we already have a transcript for this quarter/year combination
-            # OR the exact same source_url (to handle URL changes for same quarter)
-            cursor.execute("""
-                SELECT id, source_url FROM transcripts 
-                WHERE stock_id = ? AND quarter = ? AND year = ?
-            """, (stock_id, latest_transcript.quarter, latest_transcript.year))
-            
-            transcript_row = cursor.fetchone()
-            
+            # 2. Resolve which transcript to analyze
+            transcript_id = None
             transcript_text = ""
-            
-            if not transcript_row:
-                print(f"[{job_id}] Downloading and extracting text...")
-                transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
-                
-                # Save to DB
+            target_quarter = quarter
+            target_year = year
+            transcript_source_url = None
+
+            if quarter and year:
+                print(f"[{job_id}] Using requested quarter/year: {quarter} {year}")
                 cursor.execute("""
-                    INSERT INTO transcripts (stock_id, quarter, year, source_url, content_path)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (stock_id, latest_transcript.quarter, latest_transcript.year, latest_transcript.source_url, "placeholder_path"))
-                conn.commit()
-                transcript_id = cursor.lastrowid
-            else:
-                print(f"[{job_id}] Using existing transcript record.")
+                    SELECT id, quarter, year, source_url, status 
+                    FROM transcripts 
+                    WHERE stock_id = ? AND quarter = ? AND year = ?
+                    LIMIT 1
+                """, (stock_id, quarter, year))
+                transcript_row = cursor.fetchone()
+
+                if not transcript_row:
+                    print(f"[{job_id}] Transcript not found for {symbol} {quarter} {year}")
+                    return
+
+                if transcript_row['status'] != 'available':
+                    print(f"[{job_id}] Transcript not available (status={transcript_row['status']}) for {symbol} {quarter} {year}")
+                    return
+
+                if not transcript_row['source_url']:
+                    print(f"[{job_id}] Transcript has no source_url for {symbol} {quarter} {year}")
+                    return
+
                 transcript_id = transcript_row['id']
+                target_quarter = transcript_row['quarter']
+                target_year = transcript_row['year']
+                transcript_source_url = transcript_row['source_url']
+                print(f"[{job_id}] Downloading and extracting text...")
+                transcript_text = self.transcript_service.download_and_extract(transcript_row['source_url'])
+
+            else:
+                # Fallback to latest transcript from provider
+                print(f"[{job_id}] Fetching transcripts for {symbol}...")
+                transcripts = self.transcript_service.fetch_available_transcripts(symbol)
                 
-                # Update source_url if it changed (API might return new URL for same quarter)
-                if transcript_row['source_url'] != latest_transcript.source_url:
-                    print(f"[{job_id}] Updating transcript URL (changed from API)...")
+                if not transcripts:
+                    print(f"[{job_id}] No transcripts found for {symbol}")
+                    return
+
+                latest_transcript = transcripts[0]
+                target_quarter = latest_transcript.quarter
+                target_year = latest_transcript.year
+                transcript_source_url = latest_transcript.source_url
+                print(f"[{job_id}] Found transcript: {latest_transcript.title}")
+
+                # Check if we already have a transcript for this quarter/year combination
+                # OR the exact same source_url (to handle URL changes for same quarter)
+                cursor.execute("""
+                    SELECT id, source_url FROM transcripts 
+                    WHERE stock_id = ? AND quarter = ? AND year = ?
+                """, (stock_id, latest_transcript.quarter, latest_transcript.year))
+                
+                transcript_row = cursor.fetchone()
+                
+                if not transcript_row:
+                    print(f"[{job_id}] Downloading and extracting text...")
+                    transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
+                    
+                    # Save to DB
                     cursor.execute("""
+                        INSERT INTO transcripts (stock_id, quarter, year, source_url, content_path)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (stock_id, latest_transcript.quarter, latest_transcript.year, latest_transcript.source_url, "placeholder_path"))
+                    conn.commit()
+                    transcript_id = cursor.lastrowid
+                else:
+                    print(f"[{job_id}] Using existing transcript record.")
+                    transcript_id = transcript_row['id']
+                    
+                    # Update source_url if it changed (API might return new URL for same quarter)
+                    if transcript_row['source_url'] != latest_transcript.source_url:
+                        print(f"[{job_id}] Updating transcript URL (changed from API)...")
+                        cursor.execute("""
                         UPDATE transcripts SET source_url = ? WHERE id = ?
                     """, (latest_transcript.source_url, transcript_id))
                     conn.commit()
-                
-                # Re-download text for analysis
-                print(f"[{job_id}] Downloading text for analysis...")
-                transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
+                    transcript_source_url = latest_transcript.source_url
+                    
+                    # Re-download text for analysis
+                    print(f"[{job_id}] Downloading text for analysis...")
+                    transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
 
             # 3. Resolve Prompt
             print(f"[{job_id}] Resolving prompt...")
@@ -159,12 +201,12 @@ class AnalysisWorker:
                             to_email=email,
                             stock_symbol=symbol,
                             stock_name=stock_name,
-                            quarter=latest_transcript.quarter,
-                            year=latest_transcript.year,
+                            quarter=target_quarter,
+                            year=target_year,
                             analysis_content=llm_output,
                             model_provider=provider_name,
                             model_name=model_name,
-                            transcript_url=latest_transcript.source_url
+                            transcript_url=transcript_source_url
                         )
                         print(f"[{job_id}] Email sent to {email}")
                     except Exception as e:

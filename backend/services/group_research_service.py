@@ -130,6 +130,50 @@ class GroupResearchService:
         cursor.execute("SELECT stock_id FROM group_stocks WHERE group_id = ?", (group_id,))
         return [row["stock_id"] for row in cursor.fetchall()]
 
+    def _collect_transcripts(
+        self, cursor, group_id: int, quarter: str, year: int
+    ) -> tuple[List[Dict], List[Dict], List[Dict]]:
+        """
+        Returns (stocks_in_group, available_transcripts, missing_stocks) for the requested quarter/year.
+        available_transcripts items carry stock metadata plus transcript id/url for convenience.
+        """
+        cursor.execute(
+            """
+            SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
+            FROM stocks s
+            JOIN group_stocks gs ON s.id = gs.stock_id
+            WHERE gs.group_id = ?
+            """,
+            (group_id,),
+        )
+        stocks = [dict(r) for r in cursor.fetchall()]
+
+        available = []
+        missing = []
+
+        for stock in stocks:
+            cursor.execute(
+                """
+                SELECT id, source_url
+                FROM transcripts
+                WHERE stock_id = ? AND quarter = ? AND year = ? AND status = 'available'
+                """,
+                (stock["id"], quarter, year),
+            )
+            t_row = cursor.fetchone()
+            if t_row:
+                available.append(
+                    {
+                        "stock": stock,
+                        "transcript_id": t_row["id"],
+                        "source_url": t_row["source_url"],
+                    }
+                )
+            else:
+                missing.append(stock)
+
+        return stocks, available, missing
+
     def _available_quarters_for_stock(self, cursor, stock_id: int) -> List[Tuple[str, int]]:
         cursor.execute(
             """
@@ -141,12 +185,13 @@ class GroupResearchService:
         )
         return [(row["quarter"], row["year"]) for row in cursor.fetchall()]
 
-    def _existing_run(self, cursor, group_id: int, quarter: str, year: int) -> bool:
+    def _existing_run(self, cursor, group_id: int, quarter: str, year: int):
         cursor.execute(
-            "SELECT id FROM group_research_runs WHERE group_id = ? AND quarter = ? AND year = ?",
+            "SELECT id, status FROM group_research_runs WHERE group_id = ? AND quarter = ? AND year = ?",
             (group_id, quarter, year),
         )
-        return cursor.fetchone() is not None
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
     def check_and_trigger_runs(self):
         """
@@ -162,6 +207,15 @@ class GroupResearchService:
 
             for group in groups:
                 group_id = group["id"]
+                # Skip groups without a configured prompt to avoid creating error runs
+                cursor.execute(
+                    "SELECT deep_research_prompt FROM groups WHERE id = ? AND is_active = 1",
+                    (group_id,),
+                )
+                prompt_row = cursor.fetchone()
+                if not prompt_row or not prompt_row["deep_research_prompt"]:
+                    continue
+
                 stock_ids = self._group_stock_ids(cursor, group_id)
                 if not stock_ids:
                     continue
@@ -181,19 +235,34 @@ class GroupResearchService:
                     continue
 
                 for quarter, year in intersection:
-                    if self._existing_run(cursor, group_id, quarter, year):
-                        continue
+                    existing = self._existing_run(cursor, group_id, quarter, year)
+                    if existing:
+                        if existing["status"] in ("pending", "in_progress", "done"):
+                            continue
+                        if existing["status"] == "error":
+                            cursor.execute(
+                                """
+                                UPDATE group_research_runs
+                                SET status = 'pending', updated_at = CURRENT_TIMESTAMP, error_message = NULL
+                                WHERE id = ?
+                                """,
+                                (existing["id"],),
+                            )
+                            conn.commit()
+                            run_id = existing["id"]
+                        else:
+                            continue
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO group_research_runs (group_id, quarter, year, status)
+                            VALUES (?, ?, ?, 'pending')
+                            """,
+                            (group_id, quarter, year),
+                        )
+                        conn.commit()
+                        run_id = cursor.lastrowid
 
-                    # Insert a pending run and start background processing
-                    cursor.execute(
-                        """
-                        INSERT INTO group_research_runs (group_id, quarter, year, status)
-                        VALUES (?, ?, ?, 'pending')
-                        """,
-                        (group_id, quarter, year),
-                    )
-                    conn.commit()
-                    run_id = cursor.lastrowid
                     threading.Thread(
                         target=self._process_run,
                         args=(run_id, group_id, group["name"], quarter, year),
@@ -236,74 +305,47 @@ class GroupResearchService:
             system_prompt = row["deep_research_prompt"]
             stock_summary_prompt = row["stock_summary_prompt"] or ""
 
-            # Get stocks in the group
-            cursor.execute(
-                """
-                SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
-                FROM stocks s
-                JOIN group_stocks gs ON s.id = gs.stock_id
-                WHERE gs.group_id = ?
-                """,
-                (group_id,),
+            # Get stocks in the group and available transcripts for requested quarter/year
+            stocks, available_transcripts, missing_stocks = self._collect_transcripts(
+                cursor, group_id, quarter, year
             )
-            stocks = [dict(r) for r in cursor.fetchall()]
             if not stocks:
                 update_status("error", "Group has no stocks")
                 return
 
-            # Collect transcripts for the target quarter/year
-            transcripts: List[Dict] = []
-            for stock in stocks:
-                cursor.execute(
-                    """
-                    SELECT id, source_url
-                    FROM transcripts
-                    WHERE stock_id = ? AND quarter = ? AND year = ? AND status = 'available'
-                    """,
-                    (stock["id"], quarter, year),
-                )
-                t_row = cursor.fetchone()
-                if not t_row:
-                    if allow_partial:
-                        continue
-                    update_status("error", f"Missing transcript for {stock['symbol']} {quarter} {year}")
-                    return
-                transcripts.append(
-                    {
-                        "stock": stock,
-                        "transcript_id": t_row["id"],
-                        "source_url": t_row["source_url"],
-                    }
-                )
+            if not allow_partial and missing_stocks:
+                missing_symbols = ", ".join([s["symbol"] for s in missing_stocks])
+                update_status("error", f"Missing transcripts for: {missing_symbols}")
+                return
 
-            if not transcripts:
+            if not available_transcripts:
                 update_status("error", "No transcripts available for requested quarter/year")
                 return
 
             # Download/extract text for each transcript (truncate to keep context reasonable)
             parts = []
-            usable = []
-            for item in transcripts:
+            failed_downloads = []
+            for item in available_transcripts:
                 text = ""
                 try:
                     text = self.transcript_service.download_and_extract(item["source_url"]) if item["source_url"] else ""
                 except Exception as e:
                     text = f"Error extracting text: {e}"
-                # Skip obviously bad downloads in partial mode
-                if allow_partial and (not text or text.lower().startswith("error extracting") or text.lower().startswith("error downloading")):
-                    continue
                 if not text or text.lower().startswith("error"):
+                    if allow_partial:
+                        failed_downloads.append(item["stock"]["symbol"])
+                        continue
                     update_status("error", f"Transcript fetch failed for {item['stock']['symbol']}")
                     return
                 truncated = text[:12000]  # keep prompt size manageable
                 stock = item["stock"]
-                usable.append(item["stock"]["symbol"])
                 parts.append(
                     f"### {stock['symbol']} - {stock['stock_name']} ({quarter} {year})\n\n{truncated}"
                 )
 
             if not parts:
-                update_status("error", "No transcripts could be processed")
+                skipped_msg = f"Skipped transcripts for: {', '.join(failed_downloads)}" if failed_downloads else "No transcripts could be processed"
+                update_status("error", skipped_msg)
                 return
 
             combined_context = "\n\n".join(parts)
@@ -341,11 +383,18 @@ class GroupResearchService:
                     llm_output = ?,
                     model_provider = ?,
                     model_id = ?,
-                    error_message = NULL,
+                    error_message = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (system_prompt, llm_output, provider_name, model_id, run_id),
+                (
+                    system_prompt,
+                    llm_output,
+                    provider_name,
+                    model_id,
+                    ", ".join(failed_downloads) if failed_downloads else None,
+                    run_id,
+                ),
             )
             conn.commit()
 
@@ -366,7 +415,7 @@ class GroupResearchService:
             # Send email to active list
             emails = self.email_service.get_active_email_list()
             if emails:
-                stocks_list = ", ".join([item["stock"]["symbol"] for item in transcripts])
+                stocks_list = ", ".join([item["stock"]["symbol"] for item in available_transcripts])
                 body = rendered_html.replace("{{STOCK_LIST}}", html.escape(stocks_list))
                 for email in emails:
                     try:
@@ -390,7 +439,7 @@ class GroupResearchService:
         try:
             cursor.execute(
                 """
-                SELECT id, quarter, year, status, model_provider, model_id, created_at, updated_at
+                SELECT id, quarter, year, status, model_provider, model_id, error_message, created_at, updated_at
                 FROM group_research_runs
                 WHERE group_id = ?
                 ORDER BY year DESC, quarter DESC, created_at DESC
@@ -438,14 +487,29 @@ class GroupResearchService:
         finally:
             conn.close()
 
-    def force_run(self, group_id: int, quarter: str, year: int):
+    def force_run(self, group_id: int, quarter: str, year: int, allow_partial: bool = True):
         """
-        Force-generate a run even if not all stocks have transcripts.
-        Stores run with status pending and processes in background.
+        Force-generate a run, optionally allowing partial execution when some transcripts are missing.
+        Returns (run_id, included_symbols, missing_symbols).
         """
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
+            # Determine which stocks have available transcripts for the requested quarter/year
+            stocks, available, missing = self._collect_transcripts(cursor, group_id, quarter, year)
+
+            # No stocks at all
+            if not stocks:
+                return None, [], []
+
+            # If partial mode is off, require all transcripts to be present
+            if not allow_partial and missing:
+                return None, [item["stock"]["symbol"] for item in available], [s["symbol"] for s in missing]
+
+            # If nothing available (and partial allowed), bail early
+            if not available:
+                return None, [], [s["symbol"] for s in missing]
+
             # Upsert run
             cursor.execute(
                 """
@@ -465,16 +529,16 @@ class GroupResearchService:
             )
             row = cursor.fetchone()
             if not row:
-                return None
+                return None, [item["stock"]["symbol"] for item in available], [s["symbol"] for s in missing]
             run_id = row["id"]
             group_name = row["group_name"]
 
             # Mark in_progress and start thread
             threading.Thread(
                 target=self._process_run,
-                args=(run_id, group_id, group_name, quarter, year, True),
+                args=(run_id, group_id, group_name, quarter, year, allow_partial),
                 daemon=True,
             ).start()
-            return run_id
+            return run_id, [item["stock"]["symbol"] for item in available], [s["symbol"] for s in missing]
         finally:
             conn.close()

@@ -30,7 +30,11 @@ class SchedulerService:
         Shared by the scheduler loop and one-off triggers.
         """
         stock_id = stock_row['id']
-        symbol = stock_row['stock_symbol']
+        symbol = stock_row['stock_symbol'] or stock_row['bse_code']
+
+        if not symbol:
+            print(f"[Scheduler] No symbol/bse_code found for stock id {stock_id}, skipping")
+            return
 
         print(f"[Scheduler] Checking {symbol}...")
 
@@ -104,7 +108,7 @@ class SchedulerService:
 
     def poll_watchlist(self):
         """
-        Polls Tijori API for all stocks in the watchlist.
+        Polls Tijori API for all stocks in the watchlist and all stocks that belong to any group.
         Updates transcripts table with new available transcripts or upcoming calls.
         """
         print(f"[Scheduler] Starting watchlist poll at {datetime.now()}")
@@ -113,17 +117,33 @@ class SchedulerService:
         cursor = conn.cursor()
         
         try:
-            # Get all stocks in watchlist
+            # Collect stocks from watchlist
             cursor.execute("""
-                SELECT s.id, s.stock_symbol, s.isin_number 
+                SELECT s.id, s.stock_symbol, s.bse_code, s.isin_number 
                 FROM stocks s
                 INNER JOIN watchlist_items w ON s.id = w.stock_id
             """)
-            
             watchlist_stocks = cursor.fetchall()
-            print(f"[Scheduler] Found {len(watchlist_stocks)} stocks in watchlist")
-            
+
+            # Collect stocks from groups
+            cursor.execute("""
+                SELECT DISTINCT s.id, s.stock_symbol, s.bse_code, s.isin_number
+                FROM stocks s
+                INNER JOIN group_stocks gs ON s.id = gs.stock_id
+            """)
+            group_stocks = cursor.fetchall()
+
+            # Merge and de-duplicate by stock id
+            unique_stocks = {}
             for stock in watchlist_stocks:
+                unique_stocks[stock["id"]] = stock
+            for stock in group_stocks:
+                unique_stocks[stock["id"]] = stock
+
+            stock_list = list(unique_stocks.values())
+            print(f"[Scheduler] Found {len(watchlist_stocks)} stocks in watchlist, {len(group_stocks)} in groups, {len(stock_list)} unique to check")
+            
+            for stock in stock_list:
                 self._process_stock(cursor, conn, stock)
                     
             print(f"[Scheduler] Poll completed at {datetime.now()}")
@@ -141,7 +161,7 @@ class SchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT id, stock_symbol FROM stocks WHERE id = ?", (stock_id,))
+            cursor.execute("SELECT id, stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
             stock = cursor.fetchone()
             if not stock:
                 print(f"[Scheduler] Stock id {stock_id} not found for immediate check")

@@ -591,15 +591,33 @@ def force_group_article(group_id):
     data = request.json or {}
     quarter = data.get('quarter')
     year = data.get('year')
+    raw_allow_partial = data.get('allow_partial', True)
+    if isinstance(raw_allow_partial, str):
+        allow_partial = raw_allow_partial.lower() != 'false'
+    else:
+        allow_partial = bool(raw_allow_partial)
 
     if not quarter or not year:
         return jsonify({'error': 'quarter and year are required'}), 400
 
     try:
-        run = group_research_service.force_run(group_id, quarter, int(year))
-        if run is None:
+        run_id, included, missing = group_research_service.force_run(
+            group_id, quarter, int(year), allow_partial
+        )
+        if run_id is None:
+            if missing and not allow_partial:
+                return jsonify({
+                    'error': 'Missing transcripts for some stocks',
+                    'missing_symbols': missing
+                }), 400
             return jsonify({'error': 'Unable to create run (group not found or no stocks)'}), 400
-        return jsonify({'message': 'Run started', 'run_id': run}), 202
+        return jsonify({
+            'message': 'Run started',
+            'run_id': run_id,
+            'included_symbols': included,
+            'missing_symbols': missing,
+            'allow_partial': bool(allow_partial)
+        }), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1178,6 +1196,26 @@ analysis_worker = AnalysisWorker()
 
 @app.route('/api/analyze/<int:stock_id>', methods=['POST'])
 def trigger_analysis(stock_id):
+    data = request.get_json(silent=True) or {}
+    # Accept params from body or query for compatibility
+    quarter = data.get('quarter') or request.args.get('quarter')
+    year_param = data.get('year') if 'year' in data else request.args.get('year', type=int)
+    year = None
+
+    if year_param is not None:
+        try:
+            year = int(year_param)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'year must be an integer'}), 400
+
+    if (quarter and not year) or (year and not quarter):
+        return jsonify({'error': 'Both quarter and year are required together'}), 400
+
+    if quarter:
+        quarter = quarter.upper()
+        if quarter not in ['Q1', 'Q2', 'Q3', 'Q4']:
+            return jsonify({'error': 'quarter must be one of Q1, Q2, Q3, Q4'}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -1186,11 +1224,30 @@ def trigger_analysis(stock_id):
     if not cursor.fetchone():
         conn.close()
         return jsonify({'error': 'Stock not found'}), 404
+
+    # If targeting a specific quarter/year, verify transcript is available
+    if quarter and year:
+        cursor.execute("""
+            SELECT id, status, source_url FROM transcripts 
+            WHERE stock_id = ? AND quarter = ? AND year = ?
+            LIMIT 1
+        """, (stock_id, quarter, year))
+        transcript = cursor.fetchone()
+        if not transcript:
+            conn.close()
+            return jsonify({'error': f'Transcript for {quarter} {year} not found'}), 404
+        if transcript['status'] != 'available':
+            conn.close()
+            return jsonify({'error': f'Transcript status is {transcript["status"]}, cannot analyze'}), 422
+        if not transcript['source_url']:
+            conn.close()
+            return jsonify({'error': f'Transcript for {quarter} {year} has no source_url to analyze'}), 422
+
     conn.close()
     
     # Start background job
     try:
-        job_id = analysis_worker.start_analysis_job(stock_id)
+        job_id = analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year)
         return jsonify({
             'message': 'Analysis started',
             'job_id': job_id,
@@ -1235,7 +1292,19 @@ def download_latest_analysis(stock_id):
     cursor = conn.cursor()
 
     try:
-        cursor.execute("""
+        quarter = request.args.get('quarter')
+        year = request.args.get('year', type=int)
+
+        if (quarter and not year) or (year and not quarter):
+            return jsonify({'error': 'Both quarter and year are required together'}), 400
+
+        if quarter:
+            quarter = quarter.upper()
+            if quarter not in ['Q1', 'Q2', 'Q3', 'Q4']:
+                return jsonify({'error': 'quarter must be one of Q1, Q2, Q3, Q4'}), 400
+
+        params = [stock_id]
+        query = """
             SELECT 
                 ta.llm_output,
                 ta.created_at,
@@ -1251,12 +1320,20 @@ def download_latest_analysis(stock_id):
             JOIN transcripts t ON ta.transcript_id = t.id
             JOIN stocks s ON t.stock_id = s.id
             WHERE s.id = ?
-            ORDER BY ta.created_at DESC
-            LIMIT 1
-        """, (stock_id,))
+        """
+
+        if quarter and year:
+            query += " AND t.quarter = ? AND t.year = ?"
+            params.extend([quarter, year])
+
+        query += " ORDER BY ta.created_at DESC LIMIT 1"
+
+        cursor.execute(query, tuple(params))
 
         analysis = cursor.fetchone()
         if not analysis:
+            if quarter and year:
+                return jsonify({'error': f'No analysis found for {quarter} {year}'}), 404
             return jsonify({'error': 'No analysis found for this stock'}), 404
 
         def normalize_markdown(text: str) -> str:

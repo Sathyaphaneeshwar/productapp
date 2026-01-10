@@ -41,6 +41,8 @@ export default function Watchlist() {
     const [isLoading, setIsLoading] = useState(true)
     const [reanalyzingId, setReanalyzingId] = useState<number | null>(null)
     const [downloadingId, setDownloadingId] = useState<number | null>(null)
+    const reanalyzeIntervalRef = useRef<number | null>(null)
+    const reanalyzeTimeoutRef = useRef<number | null>(null)
     const searchContainerRef = useRef<HTMLDivElement>(null)
 
     // Fetch quarters on mount
@@ -165,7 +167,13 @@ export default function Watchlist() {
                     ]
                 })
                 // Fetch after a short delay to pick up new transcript/analysis
-                setTimeout(fetchWatchlist, 3000)
+                setTimeout(() => {
+                    if (selectedQuarter) {
+                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+                    } else {
+                        fetchWatchlist()
+                    }
+                }, 3000)
                 // Keep search results visible for adding multiple stocks
             }
         } catch (error) {
@@ -202,13 +210,25 @@ export default function Watchlist() {
         ))
 
         try {
+            const payload = selectedQuarter
+                ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year }
+                : undefined
+
             const response = await fetch(`${API_URL}/analyze/${stock.id}`, {
                 method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: payload ? JSON.stringify(payload) : undefined,
             })
             if (!response.ok) {
                 console.error('Failed to start analysis', await response.text())
                 // Revert status on error
-                fetchWatchlist()
+                if (selectedQuarter) {
+                    fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+                } else {
+                    fetchWatchlist()
+                }
             } else {
                 // Start polling more frequently to catch when analysis completes
                 const pollInterval = setInterval(async () => {
@@ -227,26 +247,61 @@ export default function Watchlist() {
                             // Only stop polling if the timestamp changed (new analysis completed)
                             if (!previousAnalyzedAt || (newAnalyzedAt && newAnalyzedAt !== previousAnalyzedAt)) {
                                 clearInterval(pollInterval)
+                                reanalyzeIntervalRef.current = null
                                 setStocks(data)
                             }
                         }
                     }
                 }, 2000) // Poll every 2 seconds
 
+                // Track interval for cleanup on unmount
+                if (reanalyzeIntervalRef.current) {
+                    clearInterval(reanalyzeIntervalRef.current)
+                }
+                reanalyzeIntervalRef.current = pollInterval
+
                 // Stop polling after 2 minutes max and refresh to show current state
-                setTimeout(() => {
+                const timeoutId = setTimeout(() => {
                     clearInterval(pollInterval)
-                    fetchWatchlist() // Final refresh to show whatever state we're in
+                    reanalyzeIntervalRef.current = null
+                    if (selectedQuarter) {
+                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+                    } else {
+                        fetchWatchlist() // Final refresh to show whatever state we're in
+                    }
                 }, 120000)
+                // Track timeout for cleanup on unmount
+                if (reanalyzeTimeoutRef.current) {
+                    clearTimeout(reanalyzeTimeoutRef.current)
+                }
+                reanalyzeTimeoutRef.current = timeoutId
             }
         } catch (error) {
             console.error('Error starting analysis:', error)
             // Revert status on error
-            fetchWatchlist()
+            if (selectedQuarter) {
+                fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+            } else {
+                fetchWatchlist()
+            }
         } finally {
             setReanalyzingId(null)
         }
     }
+
+    // Cleanup any in-flight reanalyze polling if component unmounts
+    useEffect(() => {
+        return () => {
+            if (reanalyzeIntervalRef.current) {
+                clearInterval(reanalyzeIntervalRef.current)
+                reanalyzeIntervalRef.current = null
+            }
+            if (reanalyzeTimeoutRef.current) {
+                clearTimeout(reanalyzeTimeoutRef.current)
+                reanalyzeTimeoutRef.current = null
+            }
+        }
+    }, [])
 
     const handleDownloadAnalysis = async (stock: Stock) => {
         if (stock.status !== 'analyzed') {
@@ -260,7 +315,8 @@ export default function Watchlist() {
 
         setDownloadingId(stock.id)
         try {
-            const response = await fetch(`${API_URL}/analyses/${stock.id}/download`)
+            const query = selectedQuarter ? `?quarter=${selectedQuarter.quarter}&year=${selectedQuarter.year}` : ''
+            const response = await fetch(`${API_URL}/analyses/${stock.id}/download${query}`)
             if (!response.ok) {
                 console.error('Failed to download analysis', await response.text())
                 alert('Unable to download analysis. Please try again.')

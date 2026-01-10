@@ -40,10 +40,17 @@ class TranscriptService:
         }
 
     def _get_isin_from_symbol(self, stock_symbol: str) -> Optional[str]:
+        """Resolve ISIN using either NSE symbol or BSE code."""
+        if not stock_symbol:
+            return None
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT isin_number FROM stocks WHERE stock_symbol = ?", (stock_symbol,))
+            cursor.execute("""
+                SELECT isin_number FROM stocks 
+                WHERE stock_symbol = ? OR bse_code = ?
+                LIMIT 1
+            """, (stock_symbol, stock_symbol))
             result = cursor.fetchone()
             return result['isin_number'] if result else None
         finally:
@@ -139,7 +146,18 @@ class TranscriptService:
         
         try:
             print(f"Downloading PDF from {url}...")
-            response = requests.get(url, timeout=30)
+            # Some providers block default Python user agents; use a browsery UA
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+                "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            }
+            session = requests.Session()
+            session.headers.update(headers)
+            response = session.get(url, timeout=30)
+            if response.status_code == 403:
+                # Retry once with referrer to appease some CDNs
+                session.headers.update({"Referer": url.rsplit('/', 1)[0]})
+                response = session.get(url, timeout=30)
             response.raise_for_status()
             
             # Save to temporary file
@@ -245,4 +263,3 @@ class TranscriptService:
         except Exception as e:
             print(f"Error fetching upcoming calls from Tijori: {e}")
             return []
-
