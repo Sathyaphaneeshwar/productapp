@@ -101,7 +101,7 @@ function App() {
         <div className="max-w-7xl mx-auto px-8 py-6">
           <div className="flex items-center justify-between mb-6">
             <div className="flex-1"></div>
-            <h1 className="text-4xl font-bold text-foreground text-center">Earning Calls Analyzer</h1>
+            <h1 className="text-4xl font-bold text-foreground text-center">BLOOMira</h1>
             <div className="flex-1 flex justify-end gap-2">
               <UpdateButton />
               <Button
