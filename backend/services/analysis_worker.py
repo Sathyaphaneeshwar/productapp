@@ -129,10 +129,10 @@ class AnalysisWorker:
                     print(f"[{job_id}] Downloading and extracting text...")
                     transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
                     
-                    # Save to DB
+                    # Save to DB - set status to 'available' since we have a valid source_url
                     cursor.execute("""
-                        INSERT INTO transcripts (stock_id, quarter, year, source_url, content_path)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO transcripts (stock_id, quarter, year, source_url, status, content_path)
+                        VALUES (?, ?, ?, ?, 'available', ?)
                     """, (stock_id, latest_transcript.quarter, latest_transcript.year, latest_transcript.source_url, "placeholder_path"))
                     conn.commit()
                     transcript_id = cursor.lastrowid
@@ -141,11 +141,18 @@ class AnalysisWorker:
                     transcript_id = transcript_row['id']
                     
                     # Update source_url if it changed (API might return new URL for same quarter)
+                    # Also ensure status is 'available' since we have a valid transcript URL
                     if transcript_row['source_url'] != latest_transcript.source_url:
-                        print(f"[{job_id}] Updating transcript URL (changed from API)...")
+                        print(f"[{job_id}] Updating transcript URL and status (changed from API)...")
                         cursor.execute("""
-                        UPDATE transcripts SET source_url = ? WHERE id = ?
+                        UPDATE transcripts SET source_url = ?, status = 'available' WHERE id = ?
                     """, (latest_transcript.source_url, transcript_id))
+                    else:
+                        # Even if URL didn't change, ensure status is 'available' (fixes edge case where
+                        # transcript was marked 'upcoming' but now has a valid source_url)
+                        cursor.execute("""
+                        UPDATE transcripts SET status = 'available' WHERE id = ? AND status != 'available'
+                    """, (transcript_id,))
                     conn.commit()
                     transcript_source_url = latest_transcript.source_url
                     
