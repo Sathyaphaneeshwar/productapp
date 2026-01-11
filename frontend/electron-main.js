@@ -143,12 +143,57 @@ function log(message) {
   }
 }
 
-async function startBackend() {
+function resolveBackendExecutable() {
   const executableName = process.platform === 'win32' ? 'backend-app.exe' : 'backend-app';
 
-  const BACKEND_EXE = app.isPackaged
-    ? path.join(process.resourcesPath, 'python', 'backend-app', executableName)
-    : path.join(__dirname, '..', 'backend', 'dist', 'backend-app', executableName);
+  const sourceDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'python', 'backend-app')
+    : path.join(__dirname, '..', 'backend', 'dist', 'backend-app');
+
+  let backendExe = path.join(sourceDir, executableName);
+
+  if (app.isPackaged && process.platform === 'darwin') {
+    const targetDir = path.join(app.getPath('userData'), 'backend-app');
+    const versionFile = path.join(targetDir, '.backend-version');
+    const appVersion = app.getVersion();
+
+    let needsCopy = !fs.existsSync(targetDir);
+    if (!needsCopy) {
+      try {
+        const currentVersion = fs.readFileSync(versionFile, 'utf8').trim();
+        needsCopy = currentVersion !== appVersion;
+      } catch (err) {
+        needsCopy = true;
+      }
+    }
+
+    if (needsCopy) {
+      log(`Preparing backend copy for macOS at ${targetDir}`);
+      try {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+        fs.cpSync(sourceDir, targetDir, { recursive: true });
+        fs.writeFileSync(versionFile, appVersion);
+      } catch (err) {
+        log(`Failed to copy backend to userData: ${err.message}`);
+      }
+    }
+
+    const copiedExe = path.join(targetDir, executableName);
+    if (fs.existsSync(copiedExe)) {
+      backendExe = copiedExe;
+      try {
+        fs.chmodSync(backendExe, 0o755);
+      } catch (err) {
+        log(`Failed to set execute permissions: ${err.message}`);
+      }
+    }
+  }
+
+  return backendExe;
+}
+
+async function startBackend() {
+  const BACKEND_EXE = resolveBackendExecutable();
 
   const BACKEND_DIR = path.dirname(BACKEND_EXE);
 
@@ -288,20 +333,6 @@ app.whenReady().then(async () => {
   createWindow();
   setupTray();
   app.setLoginItemSettings({ openAtLogin: true, enabled: true });
-
-  // Add execute permissions for Mac/Linux
-  if (app.isPackaged && process.platform !== 'win32') {
-    const executableName = 'backend-app';
-    const backendPath = path.join(process.resourcesPath, 'python', 'backend-app', executableName);
-    if (fs.existsSync(backendPath)) {
-      try {
-        fs.chmodSync(backendPath, '755');
-        console.log('Set permissions for backend executable');
-      } catch (err) {
-        console.error('Failed to set permissions:', err);
-      }
-    }
-  }
 
   // Start backend
   await startBackend();

@@ -112,7 +112,7 @@ Write-Host "       App Started Successfully!       " -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Frontend: http://localhost:5173" -ForegroundColor White
-Write-Host "  Backend:  http://localhost:5000" -ForegroundColor White
+Write-Host "  Backend:  http://localhost:5001" -ForegroundColor White
 Write-Host ""
 Write-Host "  Press Ctrl+C to stop the app" -ForegroundColor Yellow
 Write-Host ""

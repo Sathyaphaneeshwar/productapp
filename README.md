@@ -116,7 +116,7 @@ The system includes a Flask-based REST API to serve stock data and manage the wa
    ```bash
    python app.py
    ```
-   The API will be available at `http://localhost:5000`.
+   The API will be available at `http://localhost:5001`.
 
 ### API Endpoints
 
@@ -213,7 +213,6 @@ The system includes a Flask-based REST API to serve stock data and manage the wa
   ```
   - Uses active SMTP configuration from database
   - Returns: `{ "status": "success/error", "message": "..." }`
-
 
 
 

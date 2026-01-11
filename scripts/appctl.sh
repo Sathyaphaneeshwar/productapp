@@ -97,10 +97,10 @@ cmd_status() {
     
     # Check ports
     echo -e "${YELLOW}Ports in use:${NC}"
-    if lsof -i :5000 -sTCP:LISTEN &>/dev/null; then
-        echo "  Port 5000 (Backend):  In use"
+    if lsof -i :5001 -sTCP:LISTEN &>/dev/null; then
+        echo "  Port 5001 (Backend):  In use"
     else
-        echo "  Port 5000 (Backend):  Available"
+        echo "  Port 5001 (Backend):  Available"
     fi
     
     if lsof -i :5173 -sTCP:LISTEN &>/dev/null; then
@@ -130,8 +130,8 @@ stop_backend() {
         echo -e "  ${YELLOW}Backend was not running${NC}"
     fi
     
-    # Also kill anything on port 5000
-    lsof -ti :5000 | xargs kill -9 2>/dev/null || true
+    # Also kill anything on port 5001
+    lsof -ti :5001 | xargs kill -9 2>/dev/null || true
 }
 
 stop_frontend() {

@@ -23,9 +23,9 @@ Get-Process -Name "python*" -ErrorAction SilentlyContinue | ForEach-Object {
 Write-Host "[FRONTEND] Stopping Node processes..." -ForegroundColor Yellow
 Get-Process -Name "node" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-# Kill anything on ports 5000 and 5173
-Write-Host "[PORTS] Freeing ports 5000 and 5173..." -ForegroundColor Yellow
-$connections = Get-NetTCPConnection -LocalPort 5000,5173 -ErrorAction SilentlyContinue
+# Kill anything on ports 5001 and 5173
+Write-Host "[PORTS] Freeing ports 5001 and 5173..." -ForegroundColor Yellow
+$connections = Get-NetTCPConnection -LocalPort 5001,5173 -ErrorAction SilentlyContinue
 foreach ($conn in $connections) {
     Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
 }
