@@ -42,7 +42,7 @@ def _get_latest_quarter():
         return "Q3", current_fy
 
 class SchedulerService:
-    def __init__(self, poll_interval_seconds=3600):  # Default: 1 hour
+    def __init__(self, poll_interval_seconds=600):  # Default: 10 minutes
         self.poll_interval = poll_interval_seconds
         self.transcript_service = TranscriptService()
         self.analysis_worker = AnalysisWorker()

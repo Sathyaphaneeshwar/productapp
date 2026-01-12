@@ -26,7 +26,7 @@ class AnalysisWorker:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def start_analysis_job(self, stock_id: int, quarter: Optional[str] = None, year: Optional[int] = None) -> str:
+    def start_analysis_job(self, stock_id: int, quarter: Optional[str] = None, year: Optional[int] = None, force: bool = False) -> str:
         """
         Starts the analysis job in a background thread.
         Returns a Job ID (for now, we'll just return a timestamp-based ID).
@@ -36,14 +36,14 @@ class AnalysisWorker:
         # Start background thread
         thread = threading.Thread(
             target=self._process_analysis_job,
-            args=(stock_id, job_id, quarter, year)
+            args=(stock_id, job_id, quarter, year, force)
         )
         thread.daemon = True # Daemon thread so it doesn't block app exit
         thread.start()
         
         return job_id
 
-    def _process_analysis_job(self, stock_id: int, job_id: str, quarter: Optional[str] = None, year: Optional[int] = None):
+    def _process_analysis_job(self, stock_id: int, job_id: str, quarter: Optional[str] = None, year: Optional[int] = None, force: bool = False):
         """
         Internal method running in background thread.
         """
@@ -103,7 +103,7 @@ class AnalysisWorker:
                 cursor.execute("""
                     SELECT id FROM transcript_analyses WHERE transcript_id = ?
                 """, (transcript_id,))
-                if cursor.fetchone():
+                if cursor.fetchone() and not force:
                     print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
                     return
                 
@@ -153,7 +153,7 @@ class AnalysisWorker:
                     cursor.execute("""
                         SELECT id FROM transcript_analyses WHERE transcript_id = ?
                     """, (transcript_id,))
-                    if cursor.fetchone():
+                    if cursor.fetchone() and not force:
                         print(f"[{job_id}] Analysis already exists for {symbol} {latest_transcript.quarter} {latest_transcript.year}, skipping to prevent duplicate email")
                         return
                     
@@ -207,6 +207,14 @@ class AnalysisWorker:
                 VALUES (?, ?, ?, ?)
             """, (transcript_id, system_prompt, llm_output, provider_name))
             conn.commit()
+            new_analysis_id = cursor.lastrowid
+
+            if force:
+                cursor.execute("""
+                    DELETE FROM transcript_analyses
+                    WHERE transcript_id = ? AND id != ?
+                """, (transcript_id, new_analysis_id))
+                conn.commit()
             
             # 6. Send Email
             print(f"[{job_id}] Sending emails...")

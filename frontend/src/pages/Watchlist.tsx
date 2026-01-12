@@ -210,16 +210,17 @@ export default function Watchlist() {
         ))
 
         try {
-            const payload = selectedQuarter
-                ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year }
-                : undefined
+            const payload = {
+                force: true,
+                ...(selectedQuarter ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year } : {})
+            }
 
             const response = await fetch(`${API_URL}/analyze/${stock.id}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: payload ? JSON.stringify(payload) : undefined,
+                body: JSON.stringify(payload),
             })
             if (!response.ok) {
                 console.error('Failed to start analysis', await response.text())

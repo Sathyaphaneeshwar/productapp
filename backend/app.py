@@ -20,7 +20,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Initialize and start the background scheduler
-scheduler = SchedulerService(poll_interval_seconds=3600)  # Poll every hour
+scheduler = SchedulerService(poll_interval_seconds=600)  # Poll every 10 minutes
 scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
@@ -1200,6 +1200,13 @@ def trigger_analysis(stock_id):
     # Accept params from body or query for compatibility
     quarter = data.get('quarter') or request.args.get('quarter')
     year_param = data.get('year') if 'year' in data else request.args.get('year', type=int)
+    force_raw = data.get('force') if 'force' in data else request.args.get('force')
+    if isinstance(force_raw, bool):
+        force = force_raw
+    elif force_raw is None:
+        force = False
+    else:
+        force = str(force_raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     year = None
 
     if year_param is not None:
@@ -1247,7 +1254,7 @@ def trigger_analysis(stock_id):
     
     # Start background job
     try:
-        job_id = analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year)
+        job_id = analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year, force=force)
         return jsonify({
             'message': 'Analysis started',
             'job_id': job_id,
