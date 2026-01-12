@@ -10,6 +10,37 @@ from services.transcript_service import TranscriptService
 from services.analysis_worker import AnalysisWorker
 from services.group_research_service import GroupResearchService
 
+
+def _get_latest_quarter():
+    """
+    Returns (quarter, year) for the latest quarter that should be auto-analyzed.
+    This is the 'previous' quarter since earnings are released after the quarter ends.
+    For January 2026 (Q4 FY26), this returns Q3 FY26.
+    """
+    now = datetime.now()
+    month = now.month
+    year = now.year
+    
+    # Determine current FY quarter
+    if 4 <= month <= 6:
+        current_q, current_fy = "Q1", year + 1
+    elif 7 <= month <= 9:
+        current_q, current_fy = "Q2", year + 1
+    elif 10 <= month <= 12:
+        current_q, current_fy = "Q3", year + 1
+    else:  # 1-3 (Jan, Feb, Mar)
+        current_q, current_fy = "Q4", year
+    
+    # Get previous quarter (the one being released)
+    if current_q == "Q1":
+        return "Q4", current_fy - 1
+    elif current_q == "Q2":
+        return "Q1", current_fy
+    elif current_q == "Q3":
+        return "Q2", current_fy
+    else:  # Q4
+        return "Q3", current_fy
+
 class SchedulerService:
     def __init__(self, poll_interval_seconds=3600):  # Default: 1 hour
         self.poll_interval = poll_interval_seconds
@@ -28,6 +59,9 @@ class SchedulerService:
         """
         Handles transcript availability/upcoming checks for a single stock.
         Shared by the scheduler loop and one-off triggers.
+        
+        NOTE: Auto-analysis only triggers for the LATEST quarter (previous FY quarter).
+        Other quarters are stored but require manual analysis trigger.
         """
         stock_id = stock_row['id']
         symbol = stock_row['stock_symbol'] or stock_row['bse_code']
@@ -37,6 +71,10 @@ class SchedulerService:
             return
 
         print(f"[Scheduler] Checking {symbol}...")
+        
+        # Get the latest quarter for auto-analysis
+        latest_quarter, latest_year = _get_latest_quarter()
+        print(f"[Scheduler] Latest quarter for auto-analysis: {latest_quarter} FY{latest_year}")
 
         # Fetch available transcripts
         transcripts = self.transcript_service.fetch_available_transcripts(symbol)
@@ -66,13 +104,25 @@ class SchedulerService:
                     VALUES (?, ?, ?, ?, 'available')
                 """, (stock_id, transcript.quarter, transcript.year, transcript.source_url))
                 conn.commit()
+                new_transcript_id = cursor.lastrowid
                 
-                print(f"[Scheduler] Auto-triggering analysis for {symbol}")
-                try:
-                    job_id = self.analysis_worker.start_analysis_job(stock_id)
-                    print(f"[Scheduler] Analysis job started: {job_id}")
-                except Exception as e:
-                    print(f"[Scheduler] Failed to start analysis: {e}")
+                # Only auto-trigger analysis for the LATEST quarter
+                if transcript.quarter != latest_quarter or transcript.year != latest_year:
+                    print(f"[Scheduler] Transcript {transcript.quarter} {transcript.year} stored but not auto-analyzed (not latest quarter)")
+                else:
+                    # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
+                    cursor.execute("""
+                        SELECT id FROM transcript_analyses WHERE transcript_id = ?
+                    """, (new_transcript_id,))
+                    if cursor.fetchone():
+                        print(f"[Scheduler] Analysis already exists for {symbol} {transcript.quarter} {transcript.year}, skipping")
+                    else:
+                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {transcript.quarter} {transcript.year}")
+                        try:
+                            job_id = self.analysis_worker.start_analysis_job(stock_id, transcript.quarter, transcript.year)
+                            print(f"[Scheduler] Analysis job started: {job_id}")
+                        except Exception as e:
+                            print(f"[Scheduler] Failed to start analysis: {e}")
             
             elif existing['status'] == 'upcoming':
                 print(f"[Scheduler] Upcoming transcript now available for {symbol}: {transcript.title}")
@@ -83,12 +133,23 @@ class SchedulerService:
                 """, (transcript.source_url, existing['id']))
                 conn.commit()
                 
-                print(f"[Scheduler] Auto-triggering analysis for {symbol}")
-                try:
-                    job_id = self.analysis_worker.start_analysis_job(stock_id)
-                    print(f"[Scheduler] Analysis job started: {job_id}")
-                except Exception as e:
-                    print(f"[Scheduler] Failed to start analysis: {e}")
+                # Only auto-trigger analysis for the LATEST quarter
+                if existing['quarter'] != latest_quarter or existing['year'] != latest_year:
+                    print(f"[Scheduler] Transcript {existing['quarter']} {existing['year']} updated but not auto-analyzed (not latest quarter)")
+                else:
+                    # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
+                    cursor.execute("""
+                        SELECT id FROM transcript_analyses WHERE transcript_id = ?
+                    """, (existing['id'],))
+                    if cursor.fetchone():
+                        print(f"[Scheduler] Analysis already exists for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                    else:
+                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {existing['quarter']} {existing['year']}")
+                        try:
+                            job_id = self.analysis_worker.start_analysis_job(stock_id, existing['quarter'], existing['year'])
+                            print(f"[Scheduler] Analysis job started: {job_id}")
+                        except Exception as e:
+                            print(f"[Scheduler] Failed to start analysis: {e}")
 
         # Fetch upcoming calls
         upcoming = self.transcript_service.get_upcoming_calls(symbol)

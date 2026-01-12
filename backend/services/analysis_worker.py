@@ -98,6 +98,15 @@ class AnalysisWorker:
                 target_quarter = transcript_row['quarter']
                 target_year = transcript_row['year']
                 transcript_source_url = transcript_row['source_url']
+                
+                # Check if analysis already exists for this transcript (prevents duplicate emails)
+                cursor.execute("""
+                    SELECT id FROM transcript_analyses WHERE transcript_id = ?
+                """, (transcript_id,))
+                if cursor.fetchone():
+                    print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
+                    return
+                
                 print(f"[{job_id}] Downloading and extracting text...")
                 transcript_text = self.transcript_service.download_and_extract(transcript_row['source_url'])
 
@@ -139,6 +148,14 @@ class AnalysisWorker:
                 else:
                     print(f"[{job_id}] Using existing transcript record.")
                     transcript_id = transcript_row['id']
+                    
+                    # Check if analysis already exists for this transcript (prevents duplicate emails)
+                    cursor.execute("""
+                        SELECT id FROM transcript_analyses WHERE transcript_id = ?
+                    """, (transcript_id,))
+                    if cursor.fetchone():
+                        print(f"[{job_id}] Analysis already exists for {symbol} {latest_transcript.quarter} {latest_transcript.year}, skipping to prevent duplicate email")
+                        return
                     
                     # Update source_url if it changed (API might return new URL for same quarter)
                     # Also ensure status is 'available' since we have a valid transcript URL
