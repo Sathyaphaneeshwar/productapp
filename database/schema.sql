@@ -110,10 +110,22 @@ CREATE TABLE IF NOT EXISTS transcripts (
     content_path TEXT,                  -- Path to local storage of extracted text
     status TEXT DEFAULT 'available', -- 'available', 'upcoming'
     event_date TIMESTAMP, -- For upcoming calls
+    analysis_status TEXT, -- 'in_progress', 'done', 'error'
+    analysis_error TEXT, -- Stores last analysis error (if any)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE,
     UNIQUE(stock_id, quarter, year)
 );
+
+-- Transcript Check Status Table (for polling visibility)
+CREATE TABLE IF NOT EXISTS transcript_checks (
+    stock_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'idle', -- idle, checking
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_checks_status ON transcript_checks(status);
 
 -- Transcript Analyses Table
 CREATE TABLE IF NOT EXISTS transcript_analyses (

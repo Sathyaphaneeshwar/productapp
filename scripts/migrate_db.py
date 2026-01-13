@@ -69,6 +69,44 @@ def migrate():
         except Exception as e:
             print(f"Error adding event_date column: {e}")
 
+    if 'analysis_status' not in columns:
+        print("Adding analysis_status column to transcripts...")
+        try:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN analysis_status TEXT")
+        except Exception as e:
+            print(f"Error adding analysis_status column: {e}")
+
+    if 'analysis_error' not in columns:
+        print("Adding analysis_error column to transcripts...")
+        try:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN analysis_error TEXT")
+        except Exception as e:
+            print(f"Error adding analysis_error column: {e}")
+
+    if 'updated_at' not in columns:
+        print("Adding updated_at column to transcripts...")
+        try:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN updated_at TIMESTAMP")
+            cursor.execute("UPDATE transcripts SET updated_at = CURRENT_TIMESTAMP")
+        except Exception as e:
+            print(f"Error adding updated_at column: {e}")
+
+    # 4b. Add transcript_checks table
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_checks'")
+    if not cursor.fetchone():
+        print("Creating transcript_checks table...")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transcript_checks (
+                stock_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'idle',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transcript_checks_status ON transcript_checks(status)
+        """)
+
     # 5. Add new columns to transcript_analyses table
     cursor.execute("PRAGMA table_info(transcript_analyses)")
     columns = [col[1] for col in cursor.fetchall()]

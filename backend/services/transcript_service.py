@@ -119,7 +119,8 @@ class TranscriptService:
             
             results = []
             for item in data.get('data', []):
-                if item.get('status') == 'recorded' and item.get('transcript'):
+                status = (item.get('status') or '').strip().lower()
+                if status == 'recorded' and item.get('transcript'):
                     quarter, fy = self._calculate_fy_quarter(item['concall_event_time'])
                     
                     results.append(TranscriptMetadata(
@@ -242,7 +243,8 @@ class TranscriptService:
             
             results = []
             for item in data.get('data', []):
-                if item.get('status') == 'Upcoming':
+                status = (item.get('status') or '').strip().lower()
+                if status == 'upcoming':
                     # For upcoming, we might not have quarter/year yet
                     # We'll calculate from event_date
                     event_time = item.get('concall_event_time')

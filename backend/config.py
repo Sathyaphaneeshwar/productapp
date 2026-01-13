@@ -4,6 +4,8 @@ Configuration file for backend - PyInstaller compatible
 import os
 import sys
 import shutil
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 def get_base_dir():
@@ -76,6 +78,75 @@ def initialize_user_data():
         if BUNDLED_SCHEMA_PATH.exists():
             shutil.copy2(BUNDLED_SCHEMA_PATH, SCHEMA_PATH)
 
+_migrations_ran = False
+
+def ensure_schema_migrations():
+    """Apply additive schema updates for existing user databases."""
+    global _migrations_ran
+    if _migrations_ran:
+        return
+    _migrations_ran = True
+
+    if not DATABASE_PATH.exists():
+        return
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transcripts'")
+        if not cursor.fetchone():
+            return
+
+        cursor.execute("PRAGMA table_info(transcripts)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_checks'")
+        transcript_checks_exists = cursor.fetchone() is not None
+
+        missing_analysis_status = 'analysis_status' not in columns
+        missing_analysis_error = 'analysis_error' not in columns
+        missing_updated_at = 'updated_at' not in columns
+        missing_transcript_checks = not transcript_checks_exists
+
+        if not (missing_analysis_status or missing_analysis_error or missing_updated_at or missing_transcript_checks):
+            return
+
+        backup_dir = DATABASE_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"stocks_backup_{timestamp}.db"
+        try:
+            shutil.copy2(DATABASE_PATH, backup_path)
+        except Exception as backup_error:
+            print(f"[Config] Backup failed before migration: {backup_error}")
+
+        if missing_analysis_status:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN analysis_status TEXT")
+        if missing_analysis_error:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN analysis_error TEXT")
+        if missing_updated_at:
+            cursor.execute("ALTER TABLE transcripts ADD COLUMN updated_at TIMESTAMP")
+            cursor.execute("UPDATE transcripts SET updated_at = CURRENT_TIMESTAMP")
+
+        if missing_transcript_checks:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transcript_checks (
+                    stock_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_transcript_checks_status ON transcript_checks(status)
+            """)
+
+        conn.commit()
+    except Exception as e:
+        print(f"[Config] Schema migration failed: {e}")
+    finally:
+        conn.close()
+
 # Initialize on import
 initialize_user_data()
-
+ensure_schema_migrations()

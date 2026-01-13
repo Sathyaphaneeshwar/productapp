@@ -20,7 +20,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Initialize and start the background scheduler
-scheduler = SchedulerService(poll_interval_seconds=600)  # Poll every 10 minutes
+scheduler = SchedulerService(poll_interval_seconds=120)  # Poll every 2 minutes
 scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
@@ -32,6 +32,23 @@ def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+@app.route('/api/poll/status', methods=['GET'])
+def get_poll_status():
+    try:
+        return jsonify(scheduler.get_poll_status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/poll/trigger', methods=['POST'])
+def trigger_poll():
+    try:
+        started = scheduler.trigger_poll()
+        if started:
+            return jsonify({'message': 'Poll started', 'started': True}), 202
+        return jsonify({'message': 'Poll already running', 'started': False}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 def get_current_fy_quarter():
     """
@@ -153,9 +170,11 @@ def get_watchlist():
             s.id,
             COALESCE(s.stock_symbol, s.bse_code) as symbol, 
             s.stock_name as name,
-            w.added_at
+            w.added_at,
+            tc.status as transcript_check_status
         FROM stocks s 
         JOIN watchlist_items w ON s.id = w.stock_id 
+        LEFT JOIN transcript_checks tc ON tc.stock_id = s.id
         ORDER BY w.added_at DESC
     """)
     
@@ -172,7 +191,9 @@ def get_watchlist():
                 status, 
                 event_date,
                 source_url,
-                created_at
+                created_at,
+                analysis_status,
+                analysis_error
             FROM transcripts 
             WHERE stock_id = ? AND quarter = ? AND year = ?
             LIMIT 1
@@ -181,7 +202,7 @@ def get_watchlist():
         transcript = cursor.fetchone()
         
         # Get latest analysis info
-        analysis_status = None
+        analysis_info = None
         if transcript:
             cursor.execute("""
                 SELECT 
@@ -196,7 +217,7 @@ def get_watchlist():
             
             analysis = cursor.fetchone()
             if analysis:
-                analysis_status = {
+                analysis_info = {
                     'completed': True,
                     'date': analysis['created_at'],
                     'provider': analysis['model_provider']
@@ -210,7 +231,28 @@ def get_watchlist():
         }
         
         if transcript:
-            if transcript['status'] == 'upcoming':
+            analysis_state = transcript['analysis_status']
+            analysis_error = transcript['analysis_error']
+
+            if analysis_state == 'in_progress':
+                status_info = {
+                    'status': 'analyzing',
+                    'message': 'Analyzing transcript...',
+                    'details': {
+                        'quarter': transcript['quarter'],
+                        'year': transcript['year']
+                    }
+                }
+            elif row['transcript_check_status'] == 'checking':
+                status_info = {
+                    'status': 'fetching',
+                    'message': 'Fetching transcript...',
+                    'details': {
+                        'quarter': transcript['quarter'],
+                        'year': transcript['year']
+                    }
+                }
+            elif transcript['status'] == 'upcoming':
                 status_info = {
                     'status': 'upcoming',
                     'message': f"Upcoming: {transcript['event_date']}",
@@ -221,15 +263,25 @@ def get_watchlist():
                     }
                 }
             elif transcript['status'] == 'available':
-                if analysis_status:
+                if analysis_state == 'error' and not analysis_info:
+                    status_info = {
+                        'status': 'analysis_failed',
+                        'message': 'Analysis failed',
+                        'details': {
+                            'quarter': transcript['quarter'],
+                            'year': transcript['year'],
+                            'analysis_error': analysis_error
+                        }
+                    }
+                elif analysis_info:
                     status_info = {
                         'status': 'analyzed',
                         'message': f"Analysis Complete ({transcript['quarter']} {transcript['year']})",
                         'details': {
                             'quarter': transcript['quarter'],
                             'year': transcript['year'],
-                            'analyzed_at': analysis_status['date'],
-                            'provider': analysis_status['provider']
+                            'analyzed_at': analysis_info['date'],
+                            'provider': analysis_info['provider']
                         }
                     }
                 else:
@@ -242,6 +294,12 @@ def get_watchlist():
                             'transcript_date': transcript['created_at']
                         }
                     }
+        elif row['transcript_check_status'] == 'checking':
+            status_info = {
+                'status': 'fetching',
+                'message': 'Fetching transcript...',
+                'details': None
+            }
         
         stocks.append({
             'id': stock_id,

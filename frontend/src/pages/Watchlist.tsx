@@ -13,7 +13,7 @@ type Stock = {
     symbol: string
     name: string
     added_at: string
-    status: 'no_transcript' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'fetching' | 'analyzing'
+    status: 'no_transcript' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'fetching' | 'analyzing' | 'analysis_failed'
     status_message: string
     status_details: {
         quarter?: string
@@ -22,6 +22,7 @@ type Stock = {
         transcript_date?: string
         analyzed_at?: string
         provider?: string
+        analysis_error?: string
     } | null
 }
 
@@ -44,6 +45,7 @@ export default function Watchlist() {
     const reanalyzeIntervalRef = useRef<number | null>(null)
     const reanalyzeTimeoutRef = useRef<number | null>(null)
     const searchContainerRef = useRef<HTMLDivElement>(null)
+    const pollingActiveRef = useRef(false)
 
     // Fetch quarters on mount
     useEffect(() => {
@@ -78,6 +80,29 @@ export default function Watchlist() {
                 fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
             }
         }, 10000) // 10 seconds
+        return () => clearInterval(interval)
+    }, [selectedQuarter])
+
+    // Refresh as soon as a poll cycle starts to surface fetching state
+    useEffect(() => {
+        const interval = setInterval(async () => {
+            try {
+                const response = await fetch(`${API_URL}/poll/status`)
+                if (!response.ok) return
+                const data = await response.json()
+                const isPolling = Boolean(data?.is_polling)
+                if (isPolling && !pollingActiveRef.current) {
+                    if (selectedQuarter) {
+                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+                    } else {
+                        fetchWatchlist()
+                    }
+                }
+                pollingActiveRef.current = isPolling
+            } catch (error) {
+                // Ignore poll status errors to avoid breaking watchlist updates
+            }
+        }, 1000)
         return () => clearInterval(interval)
     }, [selectedQuarter])
 
@@ -243,7 +268,11 @@ export default function Watchlist() {
                         const data = await watchlistResponse.json()
                         const updatedStock = data.find((s: Stock) => s.id === stock.id)
                         // Check if there's a NEW analysis by comparing timestamps
-                        if (updatedStock && updatedStock.status === 'analyzed') {
+                        if (updatedStock?.status === 'analysis_failed') {
+                            clearInterval(pollInterval)
+                            reanalyzeIntervalRef.current = null
+                            setStocks(data)
+                        } else if (updatedStock?.status === 'analyzed') {
                             const newAnalyzedAt = updatedStock.status_details?.analyzed_at
                             // Only stop polling if the timestamp changed (new analysis completed)
                             if (!previousAnalyzedAt || (newAnalyzedAt && newAnalyzedAt !== previousAnalyzedAt)) {
@@ -382,21 +411,28 @@ export default function Watchlist() {
                 )
             case 'no_transcript':
                 return (
-                    <Badge className="bg-gray-500/20 text-gray-400 border-gray-500/50 hover:bg-gray-500/40 hover:text-white transition-all duration-200">
+                    <Badge className="bg-gray-500/20 text-gray-400 border-gray-500/50 hover:bg-gray-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(156,163,175,0.5)] transition-all duration-200 cursor-pointer">
                         ⏳ No Transcript
                     </Badge>
                 )
             case 'fetching':
                 return (
-                    <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/50 hover:bg-blue-500/40 hover:text-white transition-all duration-200">
+                    <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/50 hover:bg-blue-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(59,130,246,0.5)] transition-all duration-200 cursor-pointer">
+                        <Loader2 className="h-3 w-3 animate-spin mr-1" />
                         Fetching Transcript...
                     </Badge>
                 )
             case 'analyzing':
                 return (
-                    <Badge className="bg-purple-500/20 text-purple-400 border-purple-500/50 hover:bg-purple-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(168,85,247,0.5)] transition-all duration-200">
+                    <Badge className="bg-purple-500/20 text-purple-400 border-purple-500/50 hover:bg-purple-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(168,85,247,0.5)] transition-all duration-200 cursor-pointer">
                         <Loader2 className="h-3 w-3 animate-spin mr-1" />
                         Analyzing...
+                    </Badge>
+                )
+            case 'analysis_failed':
+                return (
+                    <Badge className="bg-red-500/20 text-red-400 border-red-500/50 hover:bg-red-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(239,68,68,0.5)] transition-all duration-200 cursor-pointer">
+                        ✕ Analysis Failed
                     </Badge>
                 )
             default:

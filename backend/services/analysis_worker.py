@@ -26,6 +26,13 @@ class AnalysisWorker:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _set_analysis_status(self, cursor, transcript_id: int, status: str, error: Optional[str] = None):
+        cursor.execute("""
+            UPDATE transcripts
+            SET analysis_status = ?, analysis_error = ?
+            WHERE id = ?
+        """, (status, error, transcript_id))
+
     def start_analysis_job(self, stock_id: int, quarter: Optional[str] = None, year: Optional[int] = None, force: bool = False) -> str:
         """
         Starts the analysis job in a background thread.
@@ -71,6 +78,15 @@ class AnalysisWorker:
             target_quarter = quarter
             target_year = year
             transcript_source_url = None
+            analysis_started = False
+            analysis_completed = False
+
+            def mark_analysis_in_progress():
+                nonlocal analysis_started
+                if transcript_id and not analysis_started:
+                    self._set_analysis_status(cursor, transcript_id, 'in_progress', None)
+                    conn.commit()
+                    analysis_started = True
 
             if quarter and year:
                 print(f"[{job_id}] Using requested quarter/year: {quarter} {year}")
@@ -106,7 +122,8 @@ class AnalysisWorker:
                 if cursor.fetchone() and not force:
                     print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
                     return
-                
+
+                mark_analysis_in_progress()
                 print(f"[{job_id}] Downloading and extracting text...")
                 transcript_text = self.transcript_service.download_and_extract(transcript_row['source_url'])
 
@@ -145,6 +162,7 @@ class AnalysisWorker:
                     """, (stock_id, latest_transcript.quarter, latest_transcript.year, latest_transcript.source_url, "placeholder_path"))
                     conn.commit()
                     transcript_id = cursor.lastrowid
+                    mark_analysis_in_progress()
                 else:
                     print(f"[{job_id}] Using existing transcript record.")
                     transcript_id = transcript_row['id']
@@ -157,6 +175,7 @@ class AnalysisWorker:
                         print(f"[{job_id}] Analysis already exists for {symbol} {latest_transcript.quarter} {latest_transcript.year}, skipping to prevent duplicate email")
                         return
                     
+                    mark_analysis_in_progress()
                     # Update source_url if it changed (API might return new URL for same quarter)
                     # Also ensure status is 'available' since we have a valid transcript URL
                     if transcript_row['source_url'] != latest_transcript.source_url:
@@ -208,6 +227,10 @@ class AnalysisWorker:
             """, (transcript_id, system_prompt, llm_output, provider_name))
             conn.commit()
             new_analysis_id = cursor.lastrowid
+            if transcript_id:
+                self._set_analysis_status(cursor, transcript_id, 'done', None)
+                conn.commit()
+                analysis_completed = True
 
             if force:
                 cursor.execute("""
@@ -251,6 +274,15 @@ class AnalysisWorker:
 
         except Exception as e:
             print(f"[{job_id}] Job failed: {e}")
+            if transcript_id and not analysis_completed:
+                try:
+                    error_message = str(e)
+                    if len(error_message) > 500:
+                        error_message = error_message[:500]
+                    self._set_analysis_status(cursor, transcript_id, 'error', error_message)
+                    conn.commit()
+                except Exception as status_error:
+                    print(f"[{job_id}] Failed to record analysis error: {status_error}")
             import traceback
             traceback.print_exc()
         finally:
