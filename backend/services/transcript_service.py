@@ -43,18 +43,32 @@ class TranscriptService:
         """Resolve ISIN using either NSE symbol or BSE code."""
         if not stock_symbol:
             return None
+        stock_symbol = stock_symbol.strip()
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
                 SELECT isin_number FROM stocks 
-                WHERE stock_symbol = ? OR bse_code = ?
+                WHERE UPPER(stock_symbol) = UPPER(?) OR bse_code = ?
                 LIMIT 1
             """, (stock_symbol, stock_symbol))
             result = cursor.fetchone()
             return result['isin_number'] if result else None
         finally:
             conn.close()
+
+    def _parse_event_time(self, event_time_str: str) -> Optional[datetime]:
+        if not event_time_str:
+            return None
+        try:
+            return datetime.fromisoformat(str(event_time_str).replace('Z', '+00:00'))
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(str(event_time_str), fmt)
+                except ValueError:
+                    continue
+        return None
 
     def _calculate_fy_quarter(self, event_time_str: str) -> tuple[str, int]:
         """
@@ -69,7 +83,9 @@ class TranscriptService:
         
         Example: Concall on Nov 21, 2025 → Q2 FY26 earnings (Jul-Sep 2025)
         """
-        dt = datetime.fromisoformat(event_time_str.replace('Z', '+00:00'))
+        dt = event_time_str if isinstance(event_time_str, datetime) else self._parse_event_time(event_time_str)
+        if not dt:
+            raise ValueError(f"Invalid concall_event_time: {event_time_str}")
         month = dt.month
         year = dt.year
         
@@ -119,19 +135,37 @@ class TranscriptService:
             
             results = []
             for item in data.get('data', []):
-                status = (item.get('status') or '').strip().lower()
-                if status == 'recorded' and item.get('transcript'):
-                    quarter, fy = self._calculate_fy_quarter(item['concall_event_time'])
-                    
-                    results.append(TranscriptMetadata(
+                transcript_url = item.get('transcript')
+                if not transcript_url:
+                    continue
+
+                event_time = item.get('concall_event_time') or item.get('event_time') or item.get('event_date')
+                parsed_time = self._parse_event_time(event_time)
+                if not parsed_time:
+                    print(f"[TranscriptService] Missing/invalid concall_event_time for {stock_symbol}: {event_time}")
+                    continue
+
+                try:
+                    quarter, fy = self._calculate_fy_quarter(parsed_time)
+                except Exception as e:
+                    print(f"[TranscriptService] Failed to calculate quarter for {stock_symbol}: {event_time} ({e})")
+                    continue
+
+                results.append((
+                    parsed_time,
+                    TranscriptMetadata(
                         stock_symbol=stock_symbol,
                         quarter=quarter,
                         year=fy,
-                        source_url=item['transcript'],
+                        source_url=transcript_url,
                         title=f"{quarter} FY{fy} Earnings Call",
                         isin=isin
-                    ))
-            return results
+                    )
+                ))
+
+            # Ensure newest transcripts come first
+            results.sort(key=lambda item: item[0], reverse=True)
+            return [item[1] for item in results]
 
         except Exception as e:
             print(f"Error fetching transcripts from Tijori: {e}")
