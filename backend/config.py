@@ -147,6 +147,38 @@ def ensure_schema_migrations():
     finally:
         conn.close()
 
+def ensure_data_migrations():
+    """Apply data fixes for existing user databases."""
+    if not DATABASE_PATH.exists():
+        return
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        # Data fix: Correct ISIN for stocks where Tijori API uses a different ISIN
+        # These are known mismatches between our bundled data and Tijori's database
+        isin_corrections = [
+            # Kotak Bank: Our DB had INE237A01028, Tijori uses INE237A01036
+            ('KOTAKBANK', 'INE237A01028', 'INE237A01036'),
+        ]
+        
+        for symbol, wrong_isin, correct_isin in isin_corrections:
+            cursor.execute("""
+                UPDATE stocks 
+                SET isin_number = ? 
+                WHERE stock_symbol = ? AND isin_number = ?
+            """, (correct_isin, symbol, wrong_isin))
+            if cursor.rowcount > 0:
+                print(f"[Config] Fixed ISIN for {symbol}: {wrong_isin} -> {correct_isin}")
+        
+        conn.commit()
+    except Exception as e:
+        print(f"[Config] Data migration failed: {e}")
+    finally:
+        conn.close()
+
 # Initialize on import
 initialize_user_data()
 ensure_schema_migrations()
+ensure_data_migrations()
+
