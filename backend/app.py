@@ -20,7 +20,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Initialize and start the background scheduler
-scheduler = SchedulerService(poll_interval_seconds=120)  # Poll every 2 minutes
+scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
 scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
