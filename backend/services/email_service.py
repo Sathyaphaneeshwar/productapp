@@ -6,6 +6,7 @@ import os
 import sys
 import ssl
 import html
+from urllib.parse import urlsplit, urlunsplit, quote
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -153,6 +154,24 @@ class EmailService:
             cleaned_lines.append(stripped if is_table_row else line)
 
         return "\n".join(cleaned_lines)
+
+    def _sanitize_url(self, url: Optional[str]) -> str:
+        """Ensure URLs are safe for HTML email attributes (encode spaces, preserve scheme)."""
+        if not url:
+            return '#'
+        raw = str(url).strip()
+        if not raw:
+            return '#'
+        try:
+            parts = urlsplit(raw)
+            if not parts.scheme or not parts.netloc:
+                return raw.replace(' ', '%20')
+            path = quote(parts.path, safe='/%')
+            query = quote(parts.query, safe='=&%')
+            fragment = quote(parts.fragment, safe='%')
+            return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
+        except Exception:
+            return raw.replace(' ', '%20')
     
     def render_template(self, template_name: str, variables: Dict[str, str]) -> str:
         """Render email template with variables"""
@@ -196,6 +215,8 @@ class EmailService:
             
             # Use model_name if provided, otherwise use provider name
             display_model = model_name if model_name else model_provider.upper()
+
+            safe_transcript_url = self._sanitize_url(transcript_url)
             
             # Render template
             html_body = self.render_template('email_analysis_report.html', {
@@ -206,7 +227,7 @@ class EmailService:
                 'ANALYSIS_CONTENT': analysis_html,
                 'MODEL_PROVIDER': model_provider.upper(),
                 'MODEL_NAME': display_model,
-                'TRANSCRIPT_URL': transcript_url if transcript_url else '#',
+                'TRANSCRIPT_URL': html.escape(safe_transcript_url, quote=True),
                 'GENERATED_DATE': datetime.now().strftime('%B %d, %Y at %I:%M %p')
             })
             

@@ -80,6 +80,14 @@ export default function Groups() {
     const [allowPartial, setAllowPartial] = useState(true)
     const stockSearchContainerRef = useRef<HTMLDivElement>(null)
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+    const selectedGroupIdRef = useRef<number | null>(null)
+    const groupDetailsRequestIdRef = useRef(0)
+    const articlesRequestIdRef = useRef(0)
+    const articleContentRequestIdRef = useRef(0)
+
+    useEffect(() => {
+        selectedGroupIdRef.current = selectedGroupId
+    }, [selectedGroupId])
 
     // Fetch groups and quarters on mount
     useEffect(() => {
@@ -159,6 +167,7 @@ export default function Groups() {
     }
 
     const fetchGroupDetails = async (id: number, quarter?: string, year?: number) => {
+        const requestId = ++groupDetailsRequestIdRef.current
         try {
             let url = `${API_URL}/groups/${id}`
             if (quarter && year) {
@@ -167,6 +176,8 @@ export default function Groups() {
             const response = await fetch(url)
             if (response.ok) {
                 const data = await response.json()
+                if (requestId !== groupDetailsRequestIdRef.current) return
+                if (selectedGroupIdRef.current !== id) return
                 setSelectedGroup(data)
             }
         } catch (error) {
@@ -195,11 +206,14 @@ export default function Groups() {
     }
 
     const fetchArticles = async (groupId: number) => {
+        const requestId = ++articlesRequestIdRef.current
         setArticlesLoading(true)
         try {
             const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
             if (response.ok) {
                 const data = await response.json()
+                if (requestId !== articlesRequestIdRef.current) return
+                if (selectedGroupIdRef.current !== groupId) return
                 setArticles(data)
             } else {
                 setArticles([])
@@ -213,11 +227,14 @@ export default function Groups() {
     }
 
     const fetchArticleContent = async (groupId: number, runId: number) => {
+        const requestId = ++articleContentRequestIdRef.current
         setArticleContentLoading(true)
         try {
             const response = await fetch(`${API_URL}/groups/${groupId}/articles/${runId}`)
             if (response.ok) {
                 const data = await response.json()
+                if (requestId !== articleContentRequestIdRef.current) return
+                if (selectedGroupIdRef.current !== groupId) return
                 setOpenArticleId(runId)
                 setOpenArticleContent(data.rendered_html || data.llm_output || '')
             }
@@ -350,9 +367,17 @@ export default function Groups() {
 
         pollingIntervalRef.current = setInterval(async () => {
             try {
+                if (selectedGroupIdRef.current !== groupId) {
+                    if (pollingIntervalRef.current) {
+                        clearInterval(pollingIntervalRef.current)
+                        pollingIntervalRef.current = null
+                    }
+                    return
+                }
                 const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
                 if (response.ok) {
                     const data = await response.json()
+                    if (selectedGroupIdRef.current !== groupId) return
                     setArticles(data)
 
                     // Stop polling if no articles are in progress

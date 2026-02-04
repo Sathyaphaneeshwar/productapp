@@ -5,6 +5,7 @@ import os
 import sys
 import shutil
 import sqlite3
+from typing import Optional
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,86 @@ LOG_FILE = LOG_DIR / "app.log"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_LEVEL = "INFO"
 
+def _looks_like_database(db_path: Path) -> bool:
+    try:
+        if not db_path.exists():
+            return False
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stocks'")
+        ok = cursor.fetchone() is not None
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+def _legacy_db_candidates() -> list[Path]:
+    home = Path.home()
+    candidates: list[Path] = []
+
+    if sys.platform == 'darwin':
+        base = home / 'Library' / 'Application Support'
+        names = [
+            'ProductGemini',
+            'Product Gemini',
+            'ProductGemini Desktop',
+            'ProductGeminiApp',
+            'StockDiscovery',
+            'stockapp',
+        ]
+        for name in names:
+            candidates.append(base / name / 'database' / 'stocks.db')
+    elif sys.platform == 'win32':
+        base = Path(os.environ.get('APPDATA', home))
+        names = [
+            'ProductGemini',
+            'Product Gemini',
+            'ProductGemini Desktop',
+            'ProductGeminiApp',
+            'StockDiscovery',
+            'stockapp',
+        ]
+        for name in names:
+            candidates.append(base / name / 'database' / 'stocks.db')
+    else:
+        base = home / '.local' / 'share'
+        names = [
+            'ProductGemini',
+            'Product Gemini',
+            'ProductGemini Desktop',
+            'ProductGeminiApp',
+            'StockDiscovery',
+            'stockapp',
+        ]
+        for name in names:
+            candidates.append(base / name / 'database' / 'stocks.db')
+
+    return candidates
+
+def _find_legacy_db() -> Optional[Path]:
+    candidates = [p for p in _legacy_db_candidates() if p.exists()]
+    valid = [p for p in candidates if _looks_like_database(p)]
+    if not valid:
+        return None
+    valid.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return valid[0]
+
+def _clear_seeded_data():
+    try:
+        if not DATABASE_PATH.exists():
+            return
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM watchlist_items")
+        cursor.execute("DELETE FROM group_stocks")
+        cursor.execute("UPDATE groups SET is_active = 0")
+        conn.commit()
+        conn.close()
+        print("[Config] Cleared seeded watchlist/groups from bundled DB")
+    except Exception as e:
+        print(f"[Config] Seed cleanup failed: {e}")
+
 def initialize_user_data():
     """Copy bundled database to user data directory if it doesn't exist"""
     # Create directories
@@ -67,9 +148,14 @@ def initialize_user_data():
     
     # Copy database if it doesn't exist in user data
     if not DATABASE_PATH.exists():
-        if BUNDLED_DATABASE_PATH.exists():
+        legacy_db = _find_legacy_db()
+        if legacy_db:
+            print(f"[Config] Migrating legacy database from {legacy_db}")
+            shutil.copy2(legacy_db, DATABASE_PATH)
+        elif BUNDLED_DATABASE_PATH.exists():
             print(f"[Config] Copying database to {DATABASE_PATH}")
             shutil.copy2(BUNDLED_DATABASE_PATH, DATABASE_PATH)
+            _clear_seeded_data()
         else:
             print(f"[Config] WARNING: Bundled database not found at {BUNDLED_DATABASE_PATH}")
     
@@ -194,6 +280,31 @@ def ensure_data_migrations():
         cursor.execute("""
             DELETE FROM transcript_analyses
             WHERE transcript_id NOT IN (SELECT id FROM transcripts)
+        """)
+
+        # Reconcile: if a transcript is available for a quarter, mark upcoming rows as available.
+        cursor.execute("""
+            UPDATE transcripts
+            SET status = 'available',
+                source_url = COALESCE(
+                    source_url,
+                    (SELECT t2.source_url FROM transcripts t2
+                     WHERE t2.stock_id = transcripts.stock_id
+                       AND t2.quarter = transcripts.quarter
+                       AND t2.year = transcripts.year
+                       AND t2.status = 'available'
+                       AND t2.source_url IS NOT NULL
+                     LIMIT 1)
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'upcoming'
+              AND EXISTS (
+                  SELECT 1 FROM transcripts t2
+                  WHERE t2.stock_id = transcripts.stock_id
+                    AND t2.quarter = transcripts.quarter
+                    AND t2.year = transcripts.year
+                    AND t2.status = 'available'
+              )
         """)
 
         conn.commit()

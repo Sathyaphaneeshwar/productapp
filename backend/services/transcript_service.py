@@ -4,6 +4,7 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit, quote
 import sqlite3
 
 # Add parent directory to path
@@ -68,6 +69,24 @@ class TranscriptService:
                 except ValueError:
                     continue
         return None
+
+    def _sanitize_url(self, url: str) -> str:
+        """Encode unsafe URL characters (notably spaces) while preserving structure."""
+        if not url:
+            return url
+        raw = str(url).strip()
+        if not raw:
+            return raw
+        try:
+            parts = urlsplit(raw)
+            if not parts.scheme or not parts.netloc:
+                return raw.replace(' ', '%20')
+            path = quote(parts.path, safe='/%')
+            query = quote(parts.query, safe='=&%')
+            fragment = quote(parts.fragment, safe='%')
+            return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
+        except Exception:
+            return raw.replace(' ', '%20')
 
     def _calculate_fy_quarter(self, event_time_str: str) -> tuple[str, int]:
         """
@@ -179,7 +198,10 @@ class TranscriptService:
         from pypdf import PdfReader
         
         try:
-            print(f"Downloading PDF from {url}...")
+            safe_url = self._sanitize_url(url)
+            if safe_url != url:
+                print(f"[TranscriptService] Sanitized URL for download: {safe_url}")
+            print(f"Downloading PDF from {safe_url}...")
             # Some providers block default Python user agents; use a browsery UA
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -187,11 +209,11 @@ class TranscriptService:
             }
             session = requests.Session()
             session.headers.update(headers)
-            response = session.get(url, timeout=30)
+            response = session.get(safe_url, timeout=30)
             if response.status_code == 403:
                 # Retry once with referrer to appease some CDNs
-                session.headers.update({"Referer": url.rsplit('/', 1)[0]})
-                response = session.get(url, timeout=30)
+                session.headers.update({"Referer": safe_url.rsplit('/', 1)[0]})
+                response = session.get(safe_url, timeout=30)
             response.raise_for_status()
             
             # Save to temporary file

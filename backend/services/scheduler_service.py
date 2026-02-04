@@ -98,6 +98,39 @@ class SchedulerService:
                 updated_at = CURRENT_TIMESTAMP
         """, rows)
 
+    def _is_in_watchlist(self, cursor, stock_id: int) -> bool:
+        cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+        return cursor.fetchone() is not None
+
+    def _is_in_active_group(self, cursor, stock_id: int) -> bool:
+        cursor.execute("""
+            SELECT 1
+            FROM group_stocks gs
+            JOIN groups g ON g.id = gs.group_id
+            WHERE gs.stock_id = ? AND g.is_active = 1
+            LIMIT 1
+        """, (stock_id,))
+        return cursor.fetchone() is not None
+
+    def _analysis_exists_for_quarter(self, cursor, stock_id: int, quarter: str, year: int) -> bool:
+        cursor.execute("""
+            SELECT 1
+            FROM transcript_analyses ta
+            JOIN transcripts t ON t.id = ta.transcript_id
+            WHERE t.stock_id = ? AND t.quarter = ? AND t.year = ?
+            LIMIT 1
+        """, (stock_id, quarter, year))
+        return cursor.fetchone() is not None
+
+    def _analysis_in_progress_for_quarter(self, cursor, stock_id: int, quarter: str, year: int) -> bool:
+        cursor.execute("""
+            SELECT 1
+            FROM transcripts
+            WHERE stock_id = ? AND quarter = ? AND year = ? AND analysis_status = 'in_progress'
+            LIMIT 1
+        """, (stock_id, quarter, year))
+        return cursor.fetchone() is not None
+
     def _set_poll_status(self, *, is_polling: bool = None, started_at: datetime = None, completed_at: datetime = None, next_poll_at: datetime = None):
         with self.status_lock:
             if is_polling is not None:
@@ -227,35 +260,37 @@ class SchedulerService:
                         VALUES (?, ?, ?, ?, 'available')
                     """, (stock_id, transcript.quarter, transcript.year, transcript.source_url))
                     conn.commit()
-                    new_transcript_id = cursor.lastrowid
+
+                    # Ensure any existing upcoming rows for the same quarter/year are marked available
+                    cursor.execute("""
+                        UPDATE transcripts
+                        SET status = 'available', source_url = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE stock_id = ? AND quarter = ? AND year = ?
+                          AND (status != 'available' OR source_url IS NULL OR source_url != ?)
+                    """, (transcript.source_url, stock_id, transcript.quarter, transcript.year, transcript.source_url))
+                    if cursor.rowcount:
+                        conn.commit()
                     
                     # Only auto-trigger analysis for the LATEST quarter
                     if not auto_analyze:
                         print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
+                    elif not self._is_in_watchlist(cursor, stock_id):
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (no longer in watchlist)")
+                    elif self._is_in_active_group(cursor, stock_id):
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (stock is in an active group)")
                     elif transcript.quarter != latest_quarter or transcript.year != latest_year:
                         print(f"[Scheduler] Transcript {transcript.quarter} {transcript.year} stored but not auto-analyzed (not latest quarter)")
+                    elif self._analysis_in_progress_for_quarter(cursor, stock_id, transcript.quarter, transcript.year):
+                        print(f"[Scheduler] Analysis already in progress for {symbol} {transcript.quarter} {transcript.year}, skipping")
+                    elif self._analysis_exists_for_quarter(cursor, stock_id, transcript.quarter, transcript.year):
+                        print(f"[Scheduler] Analysis already exists for {symbol} {transcript.quarter} {transcript.year}, skipping")
                     else:
-                        # Skip if analysis already in progress
-                        cursor.execute("""
-                            SELECT analysis_status FROM transcripts WHERE id = ?
-                        """, (new_transcript_id,))
-                        status_row = cursor.fetchone()
-                        if status_row and status_row["analysis_status"] == "in_progress":
-                            print(f"[Scheduler] Analysis already in progress for {symbol} {transcript.quarter} {transcript.year}, skipping")
-                            continue
-                        # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
-                        cursor.execute("""
-                            SELECT id FROM transcript_analyses WHERE transcript_id = ?
-                        """, (new_transcript_id,))
-                        if cursor.fetchone():
-                            print(f"[Scheduler] Analysis already exists for {symbol} {transcript.quarter} {transcript.year}, skipping")
-                        else:
-                            print(f"[Scheduler] Auto-triggering analysis for {symbol} {transcript.quarter} {transcript.year}")
-                            try:
-                                job_id = self.analysis_worker.start_analysis_job(stock_id, transcript.quarter, transcript.year)
-                                print(f"[Scheduler] Analysis job started: {job_id}")
-                            except Exception as e:
-                                print(f"[Scheduler] Failed to start analysis: {e}")
+                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {transcript.quarter} {transcript.year}")
+                        try:
+                            job_id = self.analysis_worker.start_analysis_job(stock_id, transcript.quarter, transcript.year)
+                            print(f"[Scheduler] Analysis job started: {job_id}")
+                        except Exception as e:
+                            print(f"[Scheduler] Failed to start analysis: {e}")
                 else:
                     if existing['status'] != 'available' or existing['source_url'] != transcript.source_url:
                         print(f"[Scheduler] Transcript now available for {symbol}: {transcript.title}")
@@ -266,43 +301,63 @@ class SchedulerService:
                         """, (transcript.source_url, existing['id']))
                         conn.commit()
                     
+                    # Ensure any existing upcoming rows for the same quarter/year are marked available
+                    cursor.execute("""
+                        UPDATE transcripts
+                        SET status = 'available', source_url = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE stock_id = ? AND quarter = ? AND year = ?
+                          AND (status != 'available' OR source_url IS NULL OR source_url != ?)
+                    """, (transcript.source_url, stock_id, existing['quarter'], existing['year'], transcript.source_url))
+                    if cursor.rowcount:
+                        conn.commit()
+                    
                     # Only auto-trigger analysis for the LATEST quarter
                     if not auto_analyze:
                         print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
-                    elif existing['analysis_status'] == 'in_progress':
-                        print(f"[Scheduler] Analysis already in progress for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                    elif not self._is_in_watchlist(cursor, stock_id):
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (no longer in watchlist)")
+                    elif self._is_in_active_group(cursor, stock_id):
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (stock is in an active group)")
                     elif existing['quarter'] != latest_quarter or existing['year'] != latest_year:
                         print(f"[Scheduler] Transcript {existing['quarter']} {existing['year']} updated but not auto-analyzed (not latest quarter)")
+                    elif self._analysis_in_progress_for_quarter(cursor, stock_id, existing['quarter'], existing['year']):
+                        print(f"[Scheduler] Analysis already in progress for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                    elif self._analysis_exists_for_quarter(cursor, stock_id, existing['quarter'], existing['year']):
+                        print(f"[Scheduler] Analysis already exists for {symbol} {existing['quarter']} {existing['year']}, skipping")
                     else:
-                        # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
-                        cursor.execute("""
-                            SELECT id FROM transcript_analyses WHERE transcript_id = ?
-                        """, (existing['id'],))
-                        if cursor.fetchone():
-                            print(f"[Scheduler] Analysis already exists for {symbol} {existing['quarter']} {existing['year']}, skipping")
-                        else:
-                            print(f"[Scheduler] Auto-triggering analysis for {symbol} {existing['quarter']} {existing['year']}")
-                            try:
-                                job_id = self.analysis_worker.start_analysis_job(stock_id, existing['quarter'], existing['year'])
-                                print(f"[Scheduler] Analysis job started: {job_id}")
-                            except Exception as e:
-                                print(f"[Scheduler] Failed to start analysis: {e}")
+                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {existing['quarter']} {existing['year']}")
+                        try:
+                            job_id = self.analysis_worker.start_analysis_job(stock_id, existing['quarter'], existing['year'])
+                            print(f"[Scheduler] Analysis job started: {job_id}")
+                        except Exception as e:
+                            print(f"[Scheduler] Failed to start analysis: {e}")
 
             # Fetch upcoming calls
             upcoming = self.transcript_service.get_upcoming_calls(symbol)
             for call in upcoming:
                 cursor.execute("""
-                    SELECT id FROM transcripts 
-                    WHERE stock_id = ? AND quarter = ? AND year = ? AND status = 'upcoming'
+                    SELECT id, status, event_date FROM transcripts 
+                    WHERE stock_id = ? AND quarter = ? AND year = ?
+                    LIMIT 1
                 """, (stock_id, call.quarter, call.year))
                 
-                if not cursor.fetchone():
-                    print(f"[Scheduler] New upcoming call for {symbol}: {call.title} on {call.event_date}")
-                    cursor.execute("""
-                        INSERT INTO transcripts (stock_id, quarter, year, status, event_date)
-                        VALUES (?, ?, ?, 'upcoming', ?)
-                    """, (stock_id, call.quarter, call.year, call.event_date))
-                    conn.commit()
+                existing_call = cursor.fetchone()
+                if existing_call:
+                    if existing_call['status'] == 'upcoming' and call.event_date and call.event_date != existing_call['event_date']:
+                        cursor.execute("""
+                            UPDATE transcripts
+                            SET event_date = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (call.event_date, existing_call['id']))
+                        conn.commit()
+                    continue
+
+                print(f"[Scheduler] New upcoming call for {symbol}: {call.title} on {call.event_date}")
+                cursor.execute("""
+                    INSERT INTO transcripts (stock_id, quarter, year, status, event_date)
+                    VALUES (?, ?, ?, 'upcoming', ?)
+                """, (stock_id, call.quarter, call.year, call.event_date))
+                conn.commit()
         finally:
             if track_status:
                 try:

@@ -46,6 +46,51 @@ export default function Watchlist() {
     const reanalyzeTimeoutRef = useRef<number | null>(null)
     const searchContainerRef = useRef<HTMLDivElement>(null)
     const pollingActiveRef = useRef(false)
+    const selectedQuarterRef = useRef<Quarter | null>(null)
+    const watchlistRequestIdRef = useRef(0)
+    const watchlistAbortRef = useRef<AbortController | null>(null)
+    const reanalyzeContextRef = useRef<{ quarter?: string; year?: number } | null>(null)
+
+    const stopReanalyzePolling = () => {
+        if (reanalyzeIntervalRef.current) {
+            clearInterval(reanalyzeIntervalRef.current)
+            reanalyzeIntervalRef.current = null
+        }
+        if (reanalyzeTimeoutRef.current) {
+            clearTimeout(reanalyzeTimeoutRef.current)
+            reanalyzeTimeoutRef.current = null
+        }
+        reanalyzeContextRef.current = null
+    }
+
+    const refreshWatchlist = async (quarterOverride?: string, yearOverride?: number) => {
+        const quarter = quarterOverride ?? selectedQuarterRef.current?.quarter
+        const year = yearOverride ?? selectedQuarterRef.current?.year
+
+        watchlistAbortRef.current?.abort()
+        const controller = new AbortController()
+        watchlistAbortRef.current = controller
+        const requestId = ++watchlistRequestIdRef.current
+
+        try {
+            let url = `${API_URL}/watchlist`
+            if (quarter && year) {
+                url += `?quarter=${quarter}&year=${year}`
+            }
+            const response = await fetch(url, { signal: controller.signal })
+            if (!response.ok) return
+            const data = await response.json()
+            if (requestId !== watchlistRequestIdRef.current) return
+            setStocks(data)
+        } catch (error) {
+            if ((error as Error).name === 'AbortError') return
+            console.error('Error fetching watchlist:', error)
+        } finally {
+            if (requestId === watchlistRequestIdRef.current) {
+                setIsLoading(false)
+            }
+        }
+    }
 
     // Fetch quarters on mount
     useEffect(() => {
@@ -68,17 +113,18 @@ export default function Watchlist() {
 
     // Fetch watchlist when quarter changes
     useEffect(() => {
+        selectedQuarterRef.current = selectedQuarter
+        pollingActiveRef.current = false
+        stopReanalyzePolling()
         if (selectedQuarter) {
-            fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
+            refreshWatchlist(selectedQuarter.quarter, selectedQuarter.year)
         }
     }, [selectedQuarter])
 
     // Auto-refresh watchlist periodically to reflect backend progress
     useEffect(() => {
         const interval = setInterval(() => {
-            if (selectedQuarter) {
-                fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-            }
+            refreshWatchlist()
         }, 10000) // 10 seconds
         return () => clearInterval(interval)
     }, [selectedQuarter])
@@ -92,11 +138,7 @@ export default function Watchlist() {
                 const data = await response.json()
                 const isPolling = Boolean(data?.is_polling)
                 if (isPolling && !pollingActiveRef.current) {
-                    if (selectedQuarter) {
-                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-                    } else {
-                        fetchWatchlist()
-                    }
+                    refreshWatchlist()
                 }
                 pollingActiveRef.current = isPolling
             } catch (error) {
@@ -131,24 +173,6 @@ export default function Watchlist() {
         document.addEventListener('mousedown', handleClickOutside)
         return () => document.removeEventListener('mousedown', handleClickOutside)
     }, [])
-
-    const fetchWatchlist = async (quarter?: string, year?: number) => {
-        try {
-            let url = `${API_URL}/watchlist`
-            if (quarter && year) {
-                url += `?quarter=${quarter}&year=${year}`
-            }
-            const response = await fetch(url)
-            if (response.ok) {
-                const data = await response.json()
-                setStocks(data)
-            }
-        } catch (error) {
-            console.error('Error fetching watchlist:', error)
-        } finally {
-            setIsLoading(false)
-        }
-    }
 
     const searchStocks = async (query: string) => {
         setIsSearching(true)
@@ -193,11 +217,7 @@ export default function Watchlist() {
                 })
                 // Fetch after a short delay to pick up new transcript/analysis
                 setTimeout(() => {
-                    if (selectedQuarter) {
-                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-                    } else {
-                        fetchWatchlist()
-                    }
+                    refreshWatchlist()
                 }, 3000)
                 // Keep search results visible for adding multiple stocks
             }
@@ -226,6 +246,9 @@ export default function Watchlist() {
 
         // Get the current analyzed_at timestamp before triggering reanalysis
         const previousAnalyzedAt = stock.status_details?.analyzed_at
+        reanalyzeContextRef.current = selectedQuarter
+            ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year }
+            : null
 
         // Optimistically update status to 'analyzing'
         setStocks(prev => prev.map(s =>
@@ -250,14 +273,19 @@ export default function Watchlist() {
             if (!response.ok) {
                 console.error('Failed to start analysis', await response.text())
                 // Revert status on error
-                if (selectedQuarter) {
-                    fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-                } else {
-                    fetchWatchlist()
-                }
+                refreshWatchlist()
             } else {
                 // Start polling more frequently to catch when analysis completes
                 const pollInterval = setInterval(async () => {
+                    const context = reanalyzeContextRef.current
+                    const current = selectedQuarterRef.current
+                    if (
+                        (context?.quarter || context?.year) &&
+                        (context?.quarter !== current?.quarter || context?.year !== current?.year)
+                    ) {
+                        stopReanalyzePolling()
+                        return
+                    }
                     // Include quarter params to maintain current view
                     let pollUrl = `${API_URL}/watchlist`
                     if (selectedQuarter) {
@@ -269,15 +297,13 @@ export default function Watchlist() {
                         const updatedStock = data.find((s: Stock) => s.id === stock.id)
                         // Check if there's a NEW analysis by comparing timestamps
                         if (updatedStock?.status === 'analysis_failed') {
-                            clearInterval(pollInterval)
-                            reanalyzeIntervalRef.current = null
+                            stopReanalyzePolling()
                             setStocks(data)
                         } else if (updatedStock?.status === 'analyzed') {
                             const newAnalyzedAt = updatedStock.status_details?.analyzed_at
                             // Only stop polling if the timestamp changed (new analysis completed)
                             if (!previousAnalyzedAt || (newAnalyzedAt && newAnalyzedAt !== previousAnalyzedAt)) {
-                                clearInterval(pollInterval)
-                                reanalyzeIntervalRef.current = null
+                                stopReanalyzePolling()
                                 setStocks(data)
                             }
                         }
@@ -292,13 +318,8 @@ export default function Watchlist() {
 
                 // Stop polling after 2 minutes max and refresh to show current state
                 const timeoutId = setTimeout(() => {
-                    clearInterval(pollInterval)
-                    reanalyzeIntervalRef.current = null
-                    if (selectedQuarter) {
-                        fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-                    } else {
-                        fetchWatchlist() // Final refresh to show whatever state we're in
-                    }
+                    stopReanalyzePolling()
+                    refreshWatchlist() // Final refresh to show whatever state we're in
                 }, 120000)
                 // Track timeout for cleanup on unmount
                 if (reanalyzeTimeoutRef.current) {
@@ -309,11 +330,7 @@ export default function Watchlist() {
         } catch (error) {
             console.error('Error starting analysis:', error)
             // Revert status on error
-            if (selectedQuarter) {
-                fetchWatchlist(selectedQuarter.quarter, selectedQuarter.year)
-            } else {
-                fetchWatchlist()
-            }
+            refreshWatchlist()
         } finally {
             setReanalyzingId(null)
         }
@@ -322,14 +339,8 @@ export default function Watchlist() {
     // Cleanup any in-flight reanalyze polling if component unmounts
     useEffect(() => {
         return () => {
-            if (reanalyzeIntervalRef.current) {
-                clearInterval(reanalyzeIntervalRef.current)
-                reanalyzeIntervalRef.current = null
-            }
-            if (reanalyzeTimeoutRef.current) {
-                clearTimeout(reanalyzeTimeoutRef.current)
-                reanalyzeTimeoutRef.current = null
-            }
+            stopReanalyzePolling()
+            watchlistAbortRef.current?.abort()
         }
     }, [])
 

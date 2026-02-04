@@ -25,6 +25,26 @@ class AnalysisWorker:
     def get_db_connection(self):
         return get_db_connection(self.db_path)
 
+    def _analysis_exists_for_quarter(self, cursor, stock_id: int, quarter: str, year: int) -> bool:
+        cursor.execute("""
+            SELECT 1
+            FROM transcript_analyses ta
+            JOIN transcripts t ON t.id = ta.transcript_id
+            WHERE t.stock_id = ? AND t.quarter = ? AND t.year = ?
+            LIMIT 1
+        """, (stock_id, quarter, year))
+        return cursor.fetchone() is not None
+
+    def _is_in_active_group(self, cursor, stock_id: int) -> bool:
+        cursor.execute("""
+            SELECT 1
+            FROM group_stocks gs
+            JOIN groups g ON g.id = gs.group_id
+            WHERE gs.stock_id = ? AND g.is_active = 1
+            LIMIT 1
+        """, (stock_id,))
+        return cursor.fetchone() is not None
+
     def _set_analysis_status(self, cursor, transcript_id: int, status: str, error: Optional[str] = None):
         cursor.execute("""
             UPDATE transcripts
@@ -63,6 +83,16 @@ class AnalysisWorker:
             stock = cursor.fetchone()
             if not stock:
                 print(f"[{job_id}] Stock not found!")
+                return
+
+            # Only analyze stocks that are currently in the watchlist
+            cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+            if cursor.fetchone() is None:
+                print(f"[{job_id}] Stock {stock_id} not in watchlist; skipping analysis job.")
+                return
+
+            if self._is_in_active_group(cursor, stock_id):
+                print(f"[{job_id}] Stock {stock_id} is in an active group; skipping analysis job.")
                 return
             
             symbol = stock['stock_symbol'] or stock['bse_code']
@@ -109,6 +139,10 @@ class AnalysisWorker:
                     print(f"[{job_id}] Transcript has no source_url for {symbol} {quarter} {year}")
                     return
 
+                if not force and self._analysis_exists_for_quarter(cursor, stock_id, transcript_row['quarter'], transcript_row['year']):
+                    print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
+                    return
+
                 transcript_id = transcript_row['id']
                 target_quarter = transcript_row['quarter']
                 target_year = transcript_row['year']
@@ -140,6 +174,10 @@ class AnalysisWorker:
                 target_year = latest_transcript.year
                 transcript_source_url = latest_transcript.source_url
                 print(f"[{job_id}] Found transcript: {latest_transcript.title}")
+
+                if not force and self._analysis_exists_for_quarter(cursor, stock_id, target_quarter, target_year):
+                    print(f"[{job_id}] Analysis already exists for {symbol} {target_quarter} {target_year}, skipping to prevent duplicate email")
+                    return
 
                 # Check if we already have a transcript for this quarter/year combination
                 # OR the exact same source_url (to handle URL changes for same quarter)

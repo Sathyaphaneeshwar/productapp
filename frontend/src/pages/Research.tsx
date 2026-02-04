@@ -73,6 +73,7 @@ export default function Research() {
 
     const searchContainerRef = useRef<HTMLDivElement>(null)
     const searchRequestId = useRef(0)
+    const runsRequestIdRef = useRef(0)
 
     // Fetch runs on mount and periodically
     useEffect(() => {
@@ -107,10 +108,12 @@ export default function Research() {
     }, [])
 
     const fetchRuns = async () => {
+        const requestId = ++runsRequestIdRef.current
         try {
             const response = await fetch(`${API_URL}/research/runs`)
             if (response.ok) {
                 const data = await response.json()
+                if (requestId !== runsRequestIdRef.current) return
                 setRuns(data)
             }
         } catch (error) {

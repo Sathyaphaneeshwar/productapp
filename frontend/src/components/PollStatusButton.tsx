@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 
 const API_URL = 'http://localhost:5001/api'
@@ -16,8 +16,11 @@ export default function PollStatusButton() {
     const [error, setError] = useState<string | null>(null)
     const [now, setNow] = useState(Date.now())
     const [triggering, setTriggering] = useState(false)
+    const statusRequestInFlight = useRef(false)
 
     const fetchStatus = async () => {
+        if (statusRequestInFlight.current) return
+        statusRequestInFlight.current = true
         try {
             const response = await fetch(`${API_URL}/poll/status`)
             if (!response.ok) {
@@ -28,6 +31,8 @@ export default function PollStatusButton() {
             setError(null)
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed to fetch poll status')
+        } finally {
+            statusRequestInFlight.current = false
         }
     }
 

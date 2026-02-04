@@ -200,6 +200,14 @@ def get_watchlist():
                 analysis_error
             FROM transcripts 
             WHERE stock_id = ? AND quarter = ? AND year = ?
+            ORDER BY 
+                CASE status 
+                    WHEN 'available' THEN 0
+                    WHEN 'upcoming' THEN 1
+                    ELSE 2
+                END,
+                COALESCE(updated_at, created_at) DESC,
+                id DESC
             LIMIT 1
         """, (stock_id, quarter, year))
         
@@ -1293,6 +1301,24 @@ def trigger_analysis(stock_id):
     if not cursor.fetchone():
         conn.close()
         return jsonify({'error': 'Stock not found'}), 404
+
+    # Stock-level analysis is only allowed for watchlist stocks
+    cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return jsonify({'error': 'Stock is not in watchlist; stock-level analysis is disabled'}), 409
+
+    # Skip stock-level analysis for stocks that belong to an active group
+    cursor.execute("""
+        SELECT 1
+        FROM group_stocks gs
+        JOIN groups g ON g.id = gs.group_id
+        WHERE gs.stock_id = ? AND g.is_active = 1
+        LIMIT 1
+    """, (stock_id,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({'error': 'Stock belongs to an active group; use group research instead'}), 409
 
     # If targeting a specific quarter/year, verify transcript is available
     if quarter and year:
