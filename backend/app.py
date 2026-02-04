@@ -22,7 +22,7 @@ CORS(app)
 
 # Initialize and start the background scheduler
 scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("WERKZEUG_RUN_MAIN") is None:
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
