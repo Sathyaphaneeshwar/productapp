@@ -21,6 +21,7 @@ dist/
 build/
 backend/dist/
 backend/build/
+backend/.pyinstaller/
 
 # Node
 node_modules/
@@ -31,6 +32,7 @@ frontend/release/
 # Logs
 *.log
 logs/
+customerdebug/
 
 # IDE
 .idea/
