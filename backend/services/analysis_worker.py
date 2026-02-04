@@ -8,6 +8,7 @@ from typing import Optional
 
 # Add parent directory to path
 from config import DATABASE_PATH
+from db import get_db_connection
 from services.prompt_service import PromptService
 from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
@@ -22,9 +23,7 @@ class AnalysisWorker:
         self.db_path = str(DATABASE_PATH)
 
     def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(self.db_path)
 
     def _set_analysis_status(self, cursor, transcript_id: int, status: str, error: Optional[str] = None):
         cursor.execute("""
@@ -243,29 +242,33 @@ class AnalysisWorker:
             print(f"[{job_id}] Sending emails...")
             email_list = self.email_service.get_active_email_list()
             if email_list:
-                # Get stock name
-                cursor.execute("SELECT stock_name FROM stocks WHERE id = ?", (stock_id,))
-                stock_name = cursor.fetchone()['stock_name']
-                
-                # Get model name from LLM response
-                model_name = llm_response.model_id if hasattr(llm_response, 'model_id') else provider_name
-                
-                for email in email_list:
-                    try:
-                        self.email_service.send_analysis_email(
-                            to_email=email,
-                            stock_symbol=symbol,
-                            stock_name=stock_name,
-                            quarter=target_quarter,
-                            year=target_year,
-                            analysis_content=llm_output,
-                            model_provider=provider_name,
-                            model_name=model_name,
-                            transcript_url=transcript_source_url
-                        )
-                        print(f"[{job_id}] Email sent to {email}")
-                    except Exception as e:
-                        print(f"[{job_id}] Failed to send email to {email}: {e}")
+                cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+                if cursor.fetchone() is None:
+                    print(f"[{job_id}] Stock {stock_id} not in watchlist; skipping analysis emails.")
+                else:
+                    # Get stock name
+                    cursor.execute("SELECT stock_name FROM stocks WHERE id = ?", (stock_id,))
+                    stock_name = cursor.fetchone()['stock_name']
+                    
+                    # Get model name from LLM response
+                    model_name = llm_response.model_id if hasattr(llm_response, 'model_id') else provider_name
+                    
+                    for email in email_list:
+                        try:
+                            self.email_service.send_analysis_email(
+                                to_email=email,
+                                stock_symbol=symbol,
+                                stock_name=stock_name,
+                                quarter=target_quarter,
+                                year=target_year,
+                                analysis_content=llm_output,
+                                model_provider=provider_name,
+                                model_name=model_name,
+                                transcript_url=transcript_source_url
+                            )
+                            print(f"[{job_id}] Email sent to {email}")
+                        except Exception as e:
+                            print(f"[{job_id}] Failed to send email to {email}: {e}")
             else:
                 print(f"[{job_id}] No active email recipients found.")
             conn.commit()

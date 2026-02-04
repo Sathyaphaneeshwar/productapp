@@ -5,15 +5,14 @@ from typing import Optional
 
 # Add parent directory to path
 from config import DATABASE_PATH
+from db import get_db_connection
 
 class KeyService:
     def __init__(self, db_path: str = None):
         self.db_path = db_path or str(DATABASE_PATH)
 
     def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(self.db_path)
 
     def get_api_key(self, provider_name: str) -> Optional[str]:
         """

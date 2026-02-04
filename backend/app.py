@@ -11,6 +11,7 @@ from xhtml2pdf import pisa
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from config import DATABASE_PATH
+from db import get_db_connection as _get_db_connection
 from services.scheduler_service import SchedulerService
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
@@ -21,7 +22,8 @@ CORS(app)
 
 # Initialize and start the background scheduler
 scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-scheduler.start()
+if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("WERKZEUG_RUN_MAIN") is None:
+    scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
@@ -29,9 +31,7 @@ document_research_service = DocumentResearchService()
 DB_PATH = str(DATABASE_PATH)
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return _get_db_connection(DB_PATH)
 
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():

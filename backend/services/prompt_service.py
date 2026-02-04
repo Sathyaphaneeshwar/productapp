@@ -7,6 +7,7 @@ import os
 # Importing DB_PATH from config would be better.
 import sys
 from config import DATABASE_PATH
+from db import get_db_connection
 
 DEFAULT_PROMPT_TEXT = """
 You are an expert financial analyst. 
@@ -19,9 +20,7 @@ class PromptService:
         self.db_path = db_path or str(DATABASE_PATH)
 
     def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(self.db_path)
 
     def resolve_prompt(self, stock_id: int) -> str:
         """

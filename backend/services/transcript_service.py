@@ -8,6 +8,7 @@ import sqlite3
 
 # Add parent directory to path
 from config import DATABASE_PATH
+from db import get_db_connection
 from services.key_service import KeyService
 
 @dataclass
@@ -26,9 +27,7 @@ class TranscriptService:
         self.base_url = "https://www.tijoristack.ai/api/v1"
 
     def get_db_connection(self):
-        conn = sqlite3.connect(str(DATABASE_PATH))
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(DATABASE_PATH)
 
     def _get_headers(self) -> dict:
         api_key = self.key_service.get_api_key('tijori')

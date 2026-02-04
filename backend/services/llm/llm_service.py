@@ -7,6 +7,7 @@ import sys
 import os
 
 from config import DATABASE_PATH
+from db import get_db_connection
 from services.llm.base_provider import BaseLLMProvider, LLMResponse, ModelInfo
 from services.llm.google_ai_provider import GoogleAIProvider
 from services.llm.openai_provider import OpenAIProvider
@@ -20,9 +21,7 @@ class LLMService:
         self._provider_cache = {}
     
     def get_db_connection(self):
-        conn = sqlite3.connect(str(DATABASE_PATH))
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(DATABASE_PATH)
     
     def _get_provider(self, provider_name: str) -> Optional[BaseLLMProvider]:
         """Get or create a provider instance."""

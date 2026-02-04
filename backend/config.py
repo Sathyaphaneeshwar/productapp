@@ -91,6 +91,7 @@ def ensure_schema_migrations():
         return
 
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transcripts'")
@@ -153,6 +154,7 @@ def ensure_data_migrations():
         return
 
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
     try:
         # Data fix: Correct ISIN for stocks where Tijori API uses a different ISIN
@@ -171,6 +173,29 @@ def ensure_data_migrations():
             if cursor.rowcount > 0:
                 print(f"[Config] Fixed ISIN for {symbol}: {wrong_isin} -> {correct_isin}")
         
+        # Cleanup orphaned rows (idempotent)
+        cursor.execute("""
+            DELETE FROM group_stocks
+            WHERE group_id NOT IN (SELECT id FROM groups)
+               OR stock_id NOT IN (SELECT id FROM stocks)
+        """)
+        cursor.execute("""
+            DELETE FROM watchlist_items
+            WHERE stock_id NOT IN (SELECT id FROM stocks)
+        """)
+        cursor.execute("""
+            DELETE FROM transcript_checks
+            WHERE stock_id NOT IN (SELECT id FROM stocks)
+        """)
+        cursor.execute("""
+            DELETE FROM transcripts
+            WHERE stock_id NOT IN (SELECT id FROM stocks)
+        """)
+        cursor.execute("""
+            DELETE FROM transcript_analyses
+            WHERE transcript_id NOT IN (SELECT id FROM transcripts)
+        """)
+
         conn.commit()
     except Exception as e:
         print(f"[Config] Data migration failed: {e}")
@@ -181,4 +206,3 @@ def ensure_data_migrations():
 initialize_user_data()
 ensure_schema_migrations()
 ensure_data_migrations()
-

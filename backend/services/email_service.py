@@ -26,15 +26,14 @@ import markdown
 
 # Add parent directory to path
 from config import DATABASE_PATH
+from db import get_db_connection
 
 class EmailService:
     def __init__(self):
         self.db_path = str(DATABASE_PATH)
 
     def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(self.db_path)
 
     def get_active_smtp_config(self) -> Optional[Dict[str, Any]]:
         """Get the active SMTP configuration from database"""

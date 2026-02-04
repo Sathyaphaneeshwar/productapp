@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
+from db import get_db_connection
 from services.transcript_service import TranscriptService
 from services.analysis_worker import AnalysisWorker
 from services.group_research_service import GroupResearchService
@@ -58,9 +59,7 @@ class SchedulerService:
         self.ensure_transcript_checks_table()
 
     def get_db_connection(self):
-        conn = sqlite3.connect(str(DATABASE_PATH))
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(DATABASE_PATH)
 
     def ensure_transcript_checks_table(self):
         conn = self.get_db_connection()
@@ -170,7 +169,7 @@ class SchedulerService:
             'next_poll_in_seconds': next_in,
         }
 
-    def _process_stock(self, cursor, conn, stock_row, track_status: bool = True):
+    def _process_stock(self, cursor, conn, stock_row, track_status: bool = True, auto_analyze: bool = True):
         """
         Handles transcript availability/upcoming checks for a single stock.
         Shared by the scheduler loop and one-off triggers.
@@ -205,7 +204,7 @@ class SchedulerService:
                 # Check by source_url instead of quarter/year to prevent duplicates
                 # Same PDF URL = same transcript, regardless of calculated quarter
                 cursor.execute("""
-                    SELECT id, status, quarter, year, source_url FROM transcripts 
+                    SELECT id, status, quarter, year, source_url, analysis_status FROM transcripts 
                     WHERE stock_id = ? AND source_url = ?
                 """, (stock_id, transcript.source_url))
                 
@@ -215,7 +214,7 @@ class SchedulerService:
                 # This handles cases where the transcript URL changed when it became available
                 if not existing:
                     cursor.execute("""
-                        SELECT id, status, quarter, year, source_url FROM transcripts 
+                        SELECT id, status, quarter, year, source_url, analysis_status FROM transcripts 
                         WHERE stock_id = ? AND quarter = ? AND year = ?
                         LIMIT 1
                     """, (stock_id, transcript.quarter, transcript.year))
@@ -231,9 +230,19 @@ class SchedulerService:
                     new_transcript_id = cursor.lastrowid
                     
                     # Only auto-trigger analysis for the LATEST quarter
-                    if transcript.quarter != latest_quarter or transcript.year != latest_year:
+                    if not auto_analyze:
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
+                    elif transcript.quarter != latest_quarter or transcript.year != latest_year:
                         print(f"[Scheduler] Transcript {transcript.quarter} {transcript.year} stored but not auto-analyzed (not latest quarter)")
                     else:
+                        # Skip if analysis already in progress
+                        cursor.execute("""
+                            SELECT analysis_status FROM transcripts WHERE id = ?
+                        """, (new_transcript_id,))
+                        status_row = cursor.fetchone()
+                        if status_row and status_row["analysis_status"] == "in_progress":
+                            print(f"[Scheduler] Analysis already in progress for {symbol} {transcript.quarter} {transcript.year}, skipping")
+                            continue
                         # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
                         cursor.execute("""
                             SELECT id FROM transcript_analyses WHERE transcript_id = ?
@@ -258,7 +267,11 @@ class SchedulerService:
                         conn.commit()
                     
                     # Only auto-trigger analysis for the LATEST quarter
-                    if existing['quarter'] != latest_quarter or existing['year'] != latest_year:
+                    if not auto_analyze:
+                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
+                    elif existing['analysis_status'] == 'in_progress':
+                        print(f"[Scheduler] Analysis already in progress for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                    elif existing['quarter'] != latest_quarter or existing['year'] != latest_year:
                         print(f"[Scheduler] Transcript {existing['quarter']} {existing['year']} updated but not auto-analyzed (not latest quarter)")
                     else:
                         # Check if analysis already exists for this transcript (prevents duplicate emails on restart)
@@ -317,12 +330,15 @@ class SchedulerService:
                 INNER JOIN watchlist_items w ON s.id = w.stock_id
             """)
             watchlist_stocks = cursor.fetchall()
+            watchlist_ids = {stock["id"] for stock in watchlist_stocks}
 
             # Collect stocks from groups
             cursor.execute("""
                 SELECT DISTINCT s.id, s.stock_symbol, s.bse_code, s.isin_number
                 FROM stocks s
                 INNER JOIN group_stocks gs ON s.id = gs.stock_id
+                INNER JOIN groups g ON g.id = gs.group_id
+                WHERE g.is_active = 1
             """)
             group_stocks = cursor.fetchall()
 
@@ -344,7 +360,13 @@ class SchedulerService:
                 print(f"[Scheduler] Failed to set bulk check status: {e}")
 
             for stock in stock_list:
-                self._process_stock(cursor, conn, stock, track_status=False)
+                self._process_stock(
+                    cursor,
+                    conn,
+                    stock,
+                    track_status=False,
+                    auto_analyze=stock["id"] in watchlist_ids
+                )
                     
             print(f"[Scheduler] Poll completed at {datetime.now()}")
             
@@ -372,7 +394,9 @@ class SchedulerService:
             if not stock:
                 print(f"[Scheduler] Stock id {stock_id} not found for immediate check")
                 return
-            self._process_stock(cursor, conn, stock)
+            cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+            in_watchlist = cursor.fetchone() is not None
+            self._process_stock(cursor, conn, stock, auto_analyze=in_watchlist)
         except Exception as e:
             print(f"[Scheduler] Error checking stock {stock_id}: {e}")
         finally:

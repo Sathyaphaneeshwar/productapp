@@ -10,6 +10,7 @@ import re
 
 # Add parent directory to path
 from config import DATABASE_PATH
+from db import get_db_connection
 from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
 from services.email_service import EmailService
@@ -30,9 +31,7 @@ class GroupResearchService:
         self.ensure_table()
 
     def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return get_db_connection(self.db_path)
 
     def ensure_table(self):
         """Ensure the group_research_runs table exists (idempotent)."""
