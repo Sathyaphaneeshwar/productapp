@@ -22,7 +22,11 @@ CORS(app)
 
 # Initialize and start the background scheduler
 scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+if getattr(sys, "frozen", False):
+    # Packaged app: always start the scheduler
+    scheduler.start()
+elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    # Dev server: start only in the reloader child or non-debug mode
     scheduler.start()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
