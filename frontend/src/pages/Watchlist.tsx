@@ -1,10 +1,17 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
-import { Download, Sparkles, Trash2, Plus, Loader2 } from 'lucide-react'
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+    DropdownMenuCheckboxItem,
+    DropdownMenuSeparator
+} from '@/components/ui/dropdown-menu'
+import { Download, Sparkles, Trash2, Plus, Loader2, ArrowUp, ArrowDown, ArrowUpDown, ChevronDown } from 'lucide-react'
 
 const API_URL = 'http://localhost:5001/api'
 
@@ -32,6 +39,50 @@ type Quarter = {
     label: string
 }
 
+type StockStatus = Stock['status']
+
+type SortKey = 'symbol' | 'status'
+type SortDirection = 'asc' | 'desc'
+type SortSpec = {
+    key: SortKey
+    direction: SortDirection
+}
+
+const ALL_STATUSES: StockStatus[] = [
+    'analyzed',
+    'transcript_ready',
+    'upcoming',
+    'fetching',
+    'analyzing',
+    'no_transcript',
+    'analysis_failed'
+]
+
+const STATUS_LABELS: Record<StockStatus, string> = {
+    analyzed: 'Analyzed',
+    transcript_ready: 'Transcript Ready',
+    upcoming: 'Upcoming',
+    fetching: 'Fetching',
+    analyzing: 'Analyzing',
+    no_transcript: 'No Transcript',
+    analysis_failed: 'Analysis Failed'
+}
+
+const STATUS_RANK_ASC: StockStatus[] = [
+    'analyzed',
+    'transcript_ready',
+    'upcoming',
+    'fetching',
+    'analyzing',
+    'no_transcript',
+    'analysis_failed'
+]
+
+const STATUS_RANK: Record<StockStatus, number> = STATUS_RANK_ASC.reduce((acc, status, index) => {
+    acc[status] = index
+    return acc
+}, {} as Record<StockStatus, number>)
+
 export default function Watchlist() {
     const [stocks, setStocks] = useState<Stock[]>([])
     const [searchQuery, setSearchQuery] = useState('')
@@ -42,6 +93,8 @@ export default function Watchlist() {
     const [isLoading, setIsLoading] = useState(true)
     const [reanalyzingId, setReanalyzingId] = useState<number | null>(null)
     const [downloadingId, setDownloadingId] = useState<number | null>(null)
+    const [statusFilters, setStatusFilters] = useState<Set<StockStatus>>(() => new Set(ALL_STATUSES))
+    const [sortKeys, setSortKeys] = useState<SortSpec[]>([])
     const reanalyzeIntervalRef = useRef<number | null>(null)
     const reanalyzeTimeoutRef = useRef<number | null>(null)
     const searchContainerRef = useRef<HTMLDivElement>(null)
@@ -61,6 +114,39 @@ export default function Watchlist() {
             reanalyzeTimeoutRef.current = null
         }
         reanalyzeContextRef.current = null
+    }
+
+    const toggleStatusFilter = (status: StockStatus) => {
+        setStatusFilters(prev => {
+            const next = new Set(prev)
+            if (next.has(status)) {
+                next.delete(status)
+            } else {
+                next.add(status)
+            }
+            return next
+        })
+    }
+
+    const selectAllStatuses = () => {
+        setStatusFilters(new Set(ALL_STATUSES))
+    }
+
+    const clearAllStatuses = () => {
+        setStatusFilters(new Set())
+    }
+
+    const toggleSortKey = (key: SortKey) => {
+        setSortKeys(prev => {
+            const existing = prev.find(spec => spec.key === key)
+            if (!existing) {
+                return [{ key, direction: 'asc' }]
+            }
+            if (existing.direction === 'asc') {
+                return [{ key, direction: 'desc' }]
+            }
+            return []
+        })
     }
 
     const refreshWatchlist = async (quarterOverride?: string, yearOverride?: number) => {
@@ -451,6 +537,40 @@ export default function Watchlist() {
         }
     }
 
+    const displayStocks = useMemo(() => {
+        if (stocks.length === 0) return []
+        if (statusFilters.size === 0) return []
+
+        const filtered = stocks.filter(stock => statusFilters.has(stock.status))
+        if (filtered.length <= 1 || sortKeys.length === 0) return filtered
+
+        const indexBySymbol = new Map<string, number>()
+        stocks.forEach((stock, index) => {
+            indexBySymbol.set(stock.symbol, index)
+        })
+
+        const compareText = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: 'base' })
+
+        return [...filtered].sort((a, b) => {
+            for (const spec of sortKeys) {
+                let result = 0
+                if (spec.key === 'symbol') {
+                    result = compareText(a.symbol, b.symbol)
+                } else {
+                    result = (STATUS_RANK[a.status] ?? 0) - (STATUS_RANK[b.status] ?? 0)
+                }
+
+                if (result !== 0) {
+                    return spec.direction === 'asc' ? result : -result
+                }
+            }
+
+            return (indexBySymbol.get(a.symbol) ?? 0) - (indexBySymbol.get(b.symbol) ?? 0)
+        })
+    }, [stocks, statusFilters, sortKeys])
+
+    const getSortDirection = (key: SortKey) => sortKeys.find(spec => spec.key === key)?.direction
+
     return (
         <div className="bg-background text-foreground p-8 transition-colors duration-300 min-h-screen">
             <div className="max-w-7xl mx-auto">
@@ -496,24 +616,26 @@ export default function Watchlist() {
                         )}
                     </div>
 
-                    <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                            <Button variant="outline" className="min-w-[200px] justify-between border-border bg-secondary/50">
-                                {selectedQuarter?.label || 'Select Quarter'}
-                            </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent className="bg-popover border-border max-h-80 overflow-y-auto">
-                            {quarters.map((q) => (
-                                <DropdownMenuItem
-                                    key={`${q.quarter}-${q.year}`}
-                                    onClick={() => setSelectedQuarter(q)}
-                                    className="text-popover-foreground hover:bg-accent focus:bg-accent focus:text-accent-foreground"
-                                >
-                                    {q.label}
-                                </DropdownMenuItem>
-                            ))}
-                        </DropdownMenuContent>
-                    </DropdownMenu>
+                    <div className="flex items-center gap-2">
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button variant="outline" className="min-w-[200px] justify-between border-border bg-secondary/50">
+                                    {selectedQuarter?.label || 'Select Quarter'}
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent className="bg-popover border-border max-h-80 overflow-y-auto">
+                                {quarters.map((q) => (
+                                    <DropdownMenuItem
+                                        key={`${q.quarter}-${q.year}`}
+                                        onClick={() => setSelectedQuarter(q)}
+                                        className="text-popover-foreground hover:bg-accent focus:bg-accent focus:text-accent-foreground"
+                                    >
+                                        {q.label}
+                                    </DropdownMenuItem>
+                                ))}
+                            </DropdownMenuContent>
+                        </DropdownMenu>
+                    </div>
                 </div>
 
                 {/* Table */}
@@ -522,9 +644,87 @@ export default function Watchlist() {
                         <Table>
                             <TableHeader>
                                 <TableRow className="border-border hover:bg-transparent">
-                                    <TableHead className="text-muted-foreground">Symbol</TableHead>
+                                    <TableHead className="text-muted-foreground">
+                                        <div className="flex items-center gap-2">
+                                            <span>Symbol</span>
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                onClick={() => toggleSortKey('symbol')}
+                                                className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                                                aria-label="Sort by symbol"
+                                            >
+                                                {getSortDirection('symbol') === 'asc' ? (
+                                                    <ArrowUp className="h-3.5 w-3.5" />
+                                                ) : getSortDirection('symbol') === 'desc' ? (
+                                                    <ArrowDown className="h-3.5 w-3.5" />
+                                                ) : (
+                                                    <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground/70" />
+                                                )}
+                                            </Button>
+                                        </div>
+                                    </TableHead>
                                     <TableHead className="text-muted-foreground">Name</TableHead>
-                                    <TableHead className="text-muted-foreground">Status</TableHead>
+                                    <TableHead className="text-muted-foreground">
+                                        <div className="flex items-center gap-2">
+                                            <span>Status</span>
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                onClick={() => toggleSortKey('status')}
+                                                className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                                                aria-label="Sort by status"
+                                            >
+                                                {getSortDirection('status') === 'asc' ? (
+                                                    <ArrowUp className="h-3.5 w-3.5" />
+                                                ) : getSortDirection('status') === 'desc' ? (
+                                                    <ArrowDown className="h-3.5 w-3.5" />
+                                                ) : (
+                                                    <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground/70" />
+                                                )}
+                                            </Button>
+                                            <DropdownMenu>
+                                                <DropdownMenuTrigger asChild>
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="icon"
+                                                        className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                                                        aria-label="Status preferences"
+                                                    >
+                                                        <ChevronDown className="h-3.5 w-3.5" />
+                                                    </Button>
+                                                </DropdownMenuTrigger>
+                                                <DropdownMenuContent className="bg-popover border-border min-w-[220px]">
+                                                <DropdownMenuItem
+                                                    onClick={selectAllStatuses}
+                                                    onSelect={(event) => event.preventDefault()}
+                                                    className="text-popover-foreground hover:bg-accent focus:bg-accent focus:text-accent-foreground"
+                                                >
+                                                    Select all
+                                                </DropdownMenuItem>
+                                                <DropdownMenuItem
+                                                    onClick={clearAllStatuses}
+                                                    onSelect={(event) => event.preventDefault()}
+                                                    className="text-popover-foreground hover:bg-accent focus:bg-accent focus:text-accent-foreground"
+                                                >
+                                                    Clear all
+                                                </DropdownMenuItem>
+                                                    <DropdownMenuSeparator className="bg-muted" />
+                                                    {ALL_STATUSES.map(status => (
+                                                    <DropdownMenuCheckboxItem
+                                                        key={status}
+                                                        checked={statusFilters.has(status)}
+                                                        onCheckedChange={() => toggleStatusFilter(status)}
+                                                        onSelect={(event) => event.preventDefault()}
+                                                        className="text-popover-foreground focus:bg-accent focus:text-accent-foreground"
+                                                    >
+                                                        {STATUS_LABELS[status]}
+                                                    </DropdownMenuCheckboxItem>
+                                                    ))}
+                                                </DropdownMenuContent>
+                                            </DropdownMenu>
+                                        </div>
+                                    </TableHead>
                                     <TableHead className="text-muted-foreground text-right">Actions</TableHead>
                                 </TableRow>
                             </TableHeader>
@@ -544,8 +744,14 @@ export default function Watchlist() {
                                             No stocks in watchlist. Search to add some!
                                         </TableCell>
                                     </TableRow>
+                                ) : displayStocks.length === 0 ? (
+                                    <TableRow>
+                                        <TableCell colSpan={4} className="text-center py-8 text-muted-foreground">
+                                            No stocks match the current filters.
+                                        </TableCell>
+                                    </TableRow>
                                 ) : (
-                                    stocks.map((stock) => (
+                                    displayStocks.map((stock) => (
                                         <TableRow
                                             key={stock.symbol}
                                             className="border-border hover:bg-accent/50 transition-colors"
