@@ -31,6 +31,10 @@ type Stock = {
         provider?: string
         analysis_error?: string
     } | null
+    retrying?: boolean
+    retry_attempts?: number
+    retry_next_at?: string
+    retry_scope?: 'transcript_fetch' | 'analysis' | 'email'
 }
 
 type Quarter = {
@@ -537,6 +541,19 @@ export default function Watchlist() {
         }
     }
 
+    const getRetryLabel = (stock: Stock) => {
+        switch (stock.retry_scope) {
+            case 'transcript_fetch':
+                return 'Retrying transcript fetch...'
+            case 'analysis':
+                return 'Retrying analysis...'
+            case 'email':
+                return 'Retrying email delivery...'
+            default:
+                return 'Retrying...'
+        }
+    }
+
     const displayStocks = useMemo(() => {
         if (stocks.length === 0) return []
         if (statusFilters.size === 0) return []
@@ -758,7 +775,16 @@ export default function Watchlist() {
                                         >
                                             <TableCell className="font-medium text-foreground">{stock.symbol}</TableCell>
                                             <TableCell className="text-foreground">{stock.name}</TableCell>
-                                            <TableCell>{getStatusBadge(stock)}</TableCell>
+                                            <TableCell>
+                                                <div className="flex flex-col gap-1">
+                                                    {getStatusBadge(stock)}
+                                                    {stock.retrying && (
+                                                        <span className="text-xs text-amber-400">
+                                                            {getRetryLabel(stock)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </TableCell>
                                             <TableCell className="text-right">
                                                 <div className="flex items-center justify-end gap-2">
                                                     <Button

@@ -148,6 +148,79 @@ CREATE TABLE IF NOT EXISTS transcript_analyses (
 CREATE INDEX IF NOT EXISTS idx_transcripts_stock ON transcripts(stock_id);
 CREATE INDEX IF NOT EXISTS idx_analyses_transcript ON transcript_analyses(transcript_id);
 
+-- Transcript Fetch Schedule (Queue-First Scheduler)
+CREATE TABLE IF NOT EXISTS transcript_fetch_schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    quarter TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    next_check_at TIMESTAMP,
+    last_status TEXT,
+    last_checked_at TIMESTAMP,
+    last_available_at TIMESTAMP,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stock_id, quarter, year),
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_fetch_schedule_next ON transcript_fetch_schedule(next_check_at);
+CREATE INDEX IF NOT EXISTS idx_fetch_schedule_priority ON transcript_fetch_schedule(priority);
+
+-- Transcript Events (Normalized)
+CREATE TABLE IF NOT EXISTS transcript_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    quarter TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    source_url TEXT,
+    event_date TIMESTAMP,
+    observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    origin TEXT,
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_events_stock ON transcript_events(stock_id);
+CREATE INDEX IF NOT EXISTS idx_transcript_events_quarter ON transcript_events(quarter, year);
+
+-- Analysis Jobs (Queue)
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transcript_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT NOT NULL,
+    force INTEGER NOT NULL DEFAULT 0,
+    retry_next_at TIMESTAMP,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(idempotency_key),
+    FOREIGN KEY (transcript_id) REFERENCES transcripts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_retry ON analysis_jobs(retry_next_at);
+
+-- Email Outbox (Queue)
+CREATE TABLE IF NOT EXISTS email_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    retry_next_at TIMESTAMP,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(analysis_id, recipient),
+    FOREIGN KEY (analysis_id) REFERENCES transcript_analyses(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_retry ON email_outbox(retry_next_at);
+
 -- Group Deep Research Runs (per group, per quarter)
 CREATE TABLE IF NOT EXISTS group_research_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

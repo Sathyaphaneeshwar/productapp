@@ -60,6 +60,10 @@ LOG_FILE = LOG_DIR / "app.log"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_LEVEL = "INFO"
 
+# Queue configuration (Redis)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+QUEUE_PREFIX = os.environ.get("QUEUE_PREFIX", "pg")
+
 def _looks_like_database(db_path: Path) -> bool:
     try:
         if not db_path.exists():
@@ -187,15 +191,34 @@ def ensure_schema_migrations():
         cursor.execute("PRAGMA table_info(transcripts)")
         columns = {row[1] for row in cursor.fetchall()}
 
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_checks'")
-        transcript_checks_exists = cursor.fetchone() is not None
+        def table_exists(name: str) -> bool:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+            return cursor.fetchone() is not None
+
+        transcript_checks_exists = table_exists("transcript_checks")
 
         missing_analysis_status = 'analysis_status' not in columns
         missing_analysis_error = 'analysis_error' not in columns
         missing_updated_at = 'updated_at' not in columns
         missing_transcript_checks = not transcript_checks_exists
 
-        if not (missing_analysis_status or missing_analysis_error or missing_updated_at or missing_transcript_checks):
+        missing_fetch_schedule = not table_exists("transcript_fetch_schedule")
+        missing_transcript_events = not table_exists("transcript_events")
+        missing_analysis_jobs = not table_exists("analysis_jobs")
+        missing_email_outbox = not table_exists("email_outbox")
+
+        needs_migration = (
+            missing_analysis_status
+            or missing_analysis_error
+            or missing_updated_at
+            or missing_transcript_checks
+            or missing_fetch_schedule
+            or missing_transcript_events
+            or missing_analysis_jobs
+            or missing_email_outbox
+        )
+
+        if not needs_migration:
             return
 
         backup_dir = DATABASE_DIR / "backups"
@@ -227,6 +250,92 @@ def ensure_schema_migrations():
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_transcript_checks_status ON transcript_checks(status)
             """)
+
+        if missing_fetch_schedule:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transcript_fetch_schedule (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stock_id INTEGER NOT NULL,
+                    quarter TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    next_check_at TIMESTAMP,
+                    last_status TEXT,
+                    last_checked_at TIMESTAMP,
+                    last_available_at TIMESTAMP,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(stock_id, quarter, year),
+                    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_fetch_schedule_next ON transcript_fetch_schedule(next_check_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_fetch_schedule_priority ON transcript_fetch_schedule(priority)")
+
+        if missing_transcript_events:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS transcript_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stock_id INTEGER NOT NULL,
+                    quarter TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    source_url TEXT,
+                    event_date TIMESTAMP,
+                    observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    origin TEXT,
+                    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_transcript_events_stock ON transcript_events(stock_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_transcript_events_quarter ON transcript_events(quarter, year)")
+
+        if missing_analysis_jobs:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transcript_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    idempotency_key TEXT NOT NULL,
+                    force INTEGER NOT NULL DEFAULT 0,
+                    retry_next_at TIMESTAMP,
+                    locked_until TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(idempotency_key),
+                    FOREIGN KEY (transcript_id) REFERENCES transcripts(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_retry ON analysis_jobs(retry_next_at)")
+        else:
+            cursor.execute("PRAGMA table_info(analysis_jobs)")
+            analysis_job_columns = {row[1] for row in cursor.fetchall()}
+            if 'force' not in analysis_job_columns:
+                cursor.execute("ALTER TABLE analysis_jobs ADD COLUMN force INTEGER NOT NULL DEFAULT 0")
+
+        if missing_email_outbox:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS email_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    analysis_id INTEGER NOT NULL,
+                    recipient TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    retry_next_at TIMESTAMP,
+                    locked_until TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(analysis_id, recipient),
+                    FOREIGN KEY (analysis_id) REFERENCES transcript_analyses(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_outbox_retry ON email_outbox(retry_next_at)")
 
         conn.commit()
     except Exception as e:

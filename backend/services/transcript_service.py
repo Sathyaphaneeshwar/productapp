@@ -299,22 +299,24 @@ class TranscriptService:
             results = []
             for item in data.get('data', []):
                 status = (item.get('status') or '').strip().lower()
-                if status == 'upcoming':
-                    # For upcoming, we might not have quarter/year yet
-                    # We'll calculate from event_date
-                    event_time = item.get('concall_event_time')
-                    if event_time:
-                        quarter, fy = self._calculate_fy_quarter(event_time)
-                        
-                        results.append(TranscriptMetadata(
-                            stock_symbol=item['company_info']['name'],
-                            quarter=quarter,
-                            year=fy,
-                            source_url=None,  # Not available yet
-                            title=f"{quarter} FY{fy} Earnings Call (Upcoming)",
-                            isin=item['company_info']['isin'],
-                            event_date=event_time  # Include event date
-                        ))
+                if status and status != 'upcoming':
+                    continue
+
+                # For upcoming, we might not have quarter/year yet
+                # We'll calculate from event_date
+                event_time = item.get('concall_event_time') or item.get('event_time') or item.get('event_date')
+                if event_time:
+                    quarter, fy = self._calculate_fy_quarter(event_time)
+
+                    results.append(TranscriptMetadata(
+                        stock_symbol=item['company_info']['name'],
+                        quarter=quarter,
+                        year=fy,
+                        source_url=None,  # Not available yet
+                        title=f"{quarter} FY{fy} Earnings Call (Upcoming)",
+                        isin=item['company_info']['isin'],
+                        event_date=event_time  # Include event date
+                    ))
             return results
 
         except Exception as e:

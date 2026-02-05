@@ -13,6 +13,12 @@ from email.mime.multipart import MIMEMultipart
 from config import DATABASE_PATH
 from db import get_db_connection as _get_db_connection
 from services.scheduler_service import SchedulerService
+from services.queue_scheduler_service import QueueSchedulerService
+from services.transcript_fetcher_worker import TranscriptFetcherWorker
+from services.analysis_queue_worker import AnalysisQueueWorker
+from services.email_queue_worker import EmailQueueWorker
+from services.analysis_job_service import AnalysisJobService
+from services.analysis_worker import AnalysisWorker
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
@@ -20,14 +26,45 @@ from services.document_research_service import DocumentResearchService
 app = Flask(__name__)
 CORS(app)
 
-# Initialize and start the background scheduler
-scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-if getattr(sys, "frozen", False):
-    # Packaged app: always start the scheduler
-    scheduler.start()
-elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-    # Dev server: start only in the reloader child or non-debug mode
-    scheduler.start()
+# Initialize scheduler and queue workers
+USE_QUEUE_SCHEDULER = os.environ.get("USE_QUEUE_SCHEDULER", "1").strip().lower() in {"1", "true", "yes", "y"}
+queue_scheduler = None
+legacy_scheduler = None
+fetcher_worker = None
+analysis_queue_worker = None
+email_queue_worker = None
+legacy_analysis_worker = None
+
+if USE_QUEUE_SCHEDULER:
+    try:
+        queue_scheduler = QueueSchedulerService()
+        if queue_scheduler.queue.ping():
+            fetcher_worker = TranscriptFetcherWorker()
+            analysis_queue_worker = AnalysisQueueWorker()
+            email_queue_worker = EmailQueueWorker()
+            if getattr(sys, "frozen", False):
+                queue_scheduler.start()
+                fetcher_worker.start()
+                analysis_queue_worker.start()
+                email_queue_worker.start()
+            elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+                queue_scheduler.start()
+                fetcher_worker.start()
+                analysis_queue_worker.start()
+                email_queue_worker.start()
+        else:
+            queue_scheduler = None
+    except Exception as e:
+        print(f"[Scheduler] Queue scheduler init failed: {e}")
+        queue_scheduler = None
+
+if queue_scheduler is None:
+    legacy_scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
+    if getattr(sys, "frozen", False):
+        legacy_scheduler.start()
+    elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        legacy_scheduler.start()
+    legacy_analysis_worker = AnalysisWorker()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
@@ -40,17 +77,47 @@ def get_db_connection():
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
     try:
-        return jsonify(scheduler.get_poll_status())
+        if queue_scheduler is not None:
+            return jsonify(queue_scheduler.get_status())
+        return jsonify(legacy_scheduler.get_poll_status())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/poll/trigger', methods=['POST'])
 def trigger_poll():
     try:
-        started = scheduler.trigger_poll()
+        if queue_scheduler is not None:
+            queue_scheduler.trigger_now()
+            return jsonify({'message': 'Queue scheduler trigger executed', 'started': True}), 202
+        started = legacy_scheduler.trigger_poll()
         if started:
             return jsonify({'message': 'Poll started', 'started': True}), 202
         return jsonify({'message': 'Poll already running', 'started': False}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/scheduler/status', methods=['GET'])
+def get_scheduler_status():
+    if queue_scheduler is None:
+        return jsonify({'error': 'Queue scheduler not active'}), 404
+    try:
+        return jsonify(queue_scheduler.get_status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/scheduler/trigger', methods=['POST'])
+def trigger_scheduler():
+    if queue_scheduler is None:
+        return jsonify({'error': 'Queue scheduler not active'}), 404
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
+    quarter = data.get('quarter')
+    year = data.get('year')
+    if stock_id is None:
+        return jsonify({'error': 'stock_id is required'}), 400
+    try:
+        queue_scheduler.trigger_for_stock(int(stock_id), quarter=quarter, year=year)
+        return jsonify({'message': 'Stock queued for transcript check'}), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -230,9 +297,67 @@ def get_watchlist():
             analysis = cursor.fetchone()
             if analysis:
                 analysis_info = {
+                    'id': analysis['id'],
                     'completed': True,
                     'date': analysis['created_at'],
                     'provider': analysis['model_provider']
+                }
+
+        retry_info = {
+            'retrying': False,
+            'retry_attempts': 0,
+            'retry_next_at': None,
+            'retry_scope': None
+        }
+
+        if transcript:
+            cursor.execute("""
+                SELECT attempts, retry_next_at
+                FROM analysis_jobs
+                WHERE transcript_id = ? AND status = 'retrying'
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """, (transcript['id'],))
+            retry_row = cursor.fetchone()
+            if retry_row:
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': retry_row['attempts'],
+                    'retry_next_at': retry_row['retry_next_at'],
+                    'retry_scope': 'analysis'
+                }
+
+        if not retry_info['retrying'] and analysis_info:
+            cursor.execute("""
+                SELECT attempts, retry_next_at
+                FROM email_outbox
+                WHERE analysis_id = ? AND status = 'retrying'
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """, (analysis_info['id'],))
+            retry_row = cursor.fetchone()
+            if retry_row:
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': retry_row['attempts'],
+                    'retry_next_at': retry_row['retry_next_at'],
+                    'retry_scope': 'email'
+                }
+
+        if not retry_info['retrying']:
+            cursor.execute("""
+                SELECT attempts, next_check_at, last_status
+                FROM transcript_fetch_schedule
+                WHERE stock_id = ? AND quarter = ? AND year = ?
+                LIMIT 1
+            """, (stock_id, quarter, year))
+            retry_row = cursor.fetchone()
+            if retry_row and retry_row['attempts'] > 0 and retry_row['last_status'] == 'error':
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': retry_row['attempts'],
+                    'retry_next_at': retry_row['next_check_at'],
+                    'retry_scope': 'transcript_fetch'
                 }
         
         # Determine detailed status
@@ -320,7 +445,11 @@ def get_watchlist():
             'added_at': row['added_at'],
             'status': status_info['status'],
             'status_message': status_info['message'],
-            'status_details': status_info['details']
+            'status_details': status_info['details'],
+            'retrying': retry_info['retrying'],
+            'retry_attempts': retry_info['retry_attempts'],
+            'retry_next_at': retry_info['retry_next_at'],
+            'retry_scope': retry_info['retry_scope']
         })
     
     conn.close()
@@ -350,7 +479,10 @@ def add_to_watchlist():
         conn.commit()
 
         # Kick off immediate transcript check instead of waiting for the next poll
-        scheduler.trigger_check_for_stock(stock['id'])
+        if queue_scheduler is not None:
+            queue_scheduler.trigger_for_stock(stock['id'])
+        else:
+            legacy_scheduler.trigger_check_for_stock(stock['id'])
         return jsonify({'message': 'Added to watchlist'}), 201
         
     except sqlite3.IntegrityError:
@@ -601,7 +733,10 @@ def add_stock_to_group(group_id):
         conn.commit()
 
         # Immediately check for transcripts for newly grouped stock
-        scheduler.trigger_check_for_stock(stock['id'])
+        if queue_scheduler is not None:
+            queue_scheduler.trigger_for_stock(stock['id'])
+        else:
+            legacy_scheduler.trigger_check_for_stock(stock['id'])
         return jsonify({'message': 'Stock added to group'}), 201
         
     except sqlite3.IntegrityError:
@@ -1260,9 +1395,7 @@ def update_default_prompt():
 
 # Analysis API Endpoints
 
-from services.analysis_worker import AnalysisWorker
-
-analysis_worker = AnalysisWorker()
+analysis_job_service = AnalysisJobService()
 
 @app.route('/api/analyze/<int:stock_id>', methods=['POST'])
 def trigger_analysis(stock_id):
@@ -1320,6 +1453,7 @@ def trigger_analysis(stock_id):
         conn.close()
         return jsonify({'error': 'Stock belongs to an active group; use group research instead'}), 409
 
+    transcript_id = None
     # If targeting a specific quarter/year, verify transcript is available
     if quarter and year:
         cursor.execute("""
@@ -1337,12 +1471,37 @@ def trigger_analysis(stock_id):
         if not transcript['source_url']:
             conn.close()
             return jsonify({'error': f'Transcript for {quarter} {year} has no source_url to analyze'}), 422
+        transcript_id = transcript['id']
+    else:
+        cursor.execute("""
+            SELECT id, status, source_url
+            FROM transcripts
+            WHERE stock_id = ? AND status = 'available'
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT 1
+        """, (stock_id,))
+        transcript = cursor.fetchone()
+        if not transcript:
+            conn.close()
+            return jsonify({'error': 'No available transcript found to analyze'}), 404
+        if not transcript['source_url']:
+            conn.close()
+            return jsonify({'error': 'Transcript has no source_url to analyze'}), 422
+        transcript_id = transcript['id']
 
     conn.close()
     
     # Start background job
     try:
-        job_id = analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year, force=force)
+        if queue_scheduler is not None:
+            job_id = analysis_job_service.enqueue_for_transcript(transcript_id, force=force)
+            if job_id is None:
+                return jsonify({
+                    'message': 'Analysis already exists for this transcript',
+                    'status': 'skipped'
+                }), 200
+        else:
+            job_id = legacy_analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year, force=force)
         return jsonify({
             'message': 'Analysis started',
             'job_id': job_id,
