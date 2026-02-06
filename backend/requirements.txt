@@ -14,4 +14,3 @@ beautifulsoup4
 xhtml2pdf
 markdown
 certifi
-redis

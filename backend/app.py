@@ -12,13 +12,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from config import DATABASE_PATH
 from db import get_db_connection as _get_db_connection
-from services.scheduler_service import SchedulerService
 from services.queue_scheduler_service import QueueSchedulerService
 from services.transcript_fetcher_worker import TranscriptFetcherWorker
 from services.analysis_queue_worker import AnalysisQueueWorker
 from services.email_queue_worker import EmailQueueWorker
 from services.analysis_job_service import AnalysisJobService
-from services.analysis_worker import AnalysisWorker
+from services.recovery_service import RecoveryService
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
@@ -26,50 +25,46 @@ from services.document_research_service import DocumentResearchService
 app = Flask(__name__)
 CORS(app)
 
-# Initialize scheduler and queue workers
-USE_QUEUE_SCHEDULER = os.environ.get("USE_QUEUE_SCHEDULER", "1").strip().lower() in {"1", "true", "yes", "y"}
-queue_scheduler = None
-legacy_scheduler = None
-fetcher_worker = None
-analysis_queue_worker = None
-email_queue_worker = None
-legacy_analysis_worker = None
-
-if USE_QUEUE_SCHEDULER:
-    try:
-        queue_scheduler = QueueSchedulerService()
-        if queue_scheduler.queue.ping():
-            fetcher_worker = TranscriptFetcherWorker()
-            analysis_queue_worker = AnalysisQueueWorker()
-            email_queue_worker = EmailQueueWorker()
-            if getattr(sys, "frozen", False):
-                queue_scheduler.start()
-                fetcher_worker.start()
-                analysis_queue_worker.start()
-                email_queue_worker.start()
-            elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-                queue_scheduler.start()
-                fetcher_worker.start()
-                analysis_queue_worker.start()
-                email_queue_worker.start()
-        else:
-            queue_scheduler = None
-    except Exception as e:
-        print(f"[Scheduler] Queue scheduler init failed: {e}")
-        queue_scheduler = None
-
-if queue_scheduler is None:
-    legacy_scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-    if getattr(sys, "frozen", False):
-        legacy_scheduler.start()
-    elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        legacy_scheduler.start()
-    legacy_analysis_worker = AnalysisWorker()
+# Queue-first runtime (single scheduler/worker model)
+queue_scheduler = QueueSchedulerService()
+fetcher_worker = TranscriptFetcherWorker()
+analysis_queue_worker = AnalysisQueueWorker()
+email_queue_worker = EmailQueueWorker()
+analysis_job_service = AnalysisJobService()
+recovery_service = RecoveryService()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
 
 DB_PATH = str(DATABASE_PATH)
+
+
+def _should_start_background_workers() -> bool:
+    if getattr(sys, "frozen", False):
+        return True
+    return not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+
+
+def _run_startup_recovery():
+    stale_minutes = os.environ.get("ANALYSIS_STALE_MINUTES", "5")
+    summary = recovery_service.run_startup_recovery(
+        analysis_job_service=analysis_job_service,
+        stale_minutes=stale_minutes,
+    )
+    if any(summary.values()):
+        print(f"[Recovery] Startup recovery summary: {summary}")
+
+
+if _should_start_background_workers():
+    try:
+        _run_startup_recovery()
+        queue_scheduler.start()
+        fetcher_worker.start()
+        analysis_queue_worker.start()
+        email_queue_worker.start()
+    except Exception as e:
+        print(f"[Scheduler] Queue runtime initialization failed: {e}")
+
 
 def get_db_connection():
     return _get_db_connection(DB_PATH)
@@ -77,29 +72,20 @@ def get_db_connection():
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
     try:
-        if queue_scheduler is not None:
-            return jsonify(queue_scheduler.get_status())
-        return jsonify(legacy_scheduler.get_poll_status())
+        return jsonify(queue_scheduler.get_status())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/poll/trigger', methods=['POST'])
 def trigger_poll():
     try:
-        if queue_scheduler is not None:
-            queue_scheduler.trigger_now()
-            return jsonify({'message': 'Queue scheduler trigger executed', 'started': True}), 202
-        started = legacy_scheduler.trigger_poll()
-        if started:
-            return jsonify({'message': 'Poll started', 'started': True}), 202
-        return jsonify({'message': 'Poll already running', 'started': False}), 200
+        queue_scheduler.trigger_now()
+        return jsonify({'message': 'Queue scheduler trigger executed', 'started': True}), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/scheduler/status', methods=['GET'])
 def get_scheduler_status():
-    if queue_scheduler is None:
-        return jsonify({'error': 'Queue scheduler not active'}), 404
     try:
         return jsonify(queue_scheduler.get_status())
     except Exception as e:
@@ -107,8 +93,6 @@ def get_scheduler_status():
 
 @app.route('/api/scheduler/trigger', methods=['POST'])
 def trigger_scheduler():
-    if queue_scheduler is None:
-        return jsonify({'error': 'Queue scheduler not active'}), 404
     data = request.get_json(silent=True) or {}
     stock_id = data.get('stock_id')
     quarter = data.get('quarter')
@@ -479,10 +463,7 @@ def add_to_watchlist():
         conn.commit()
 
         # Kick off immediate transcript check instead of waiting for the next poll
-        if queue_scheduler is not None:
-            queue_scheduler.trigger_for_stock(stock['id'])
-        else:
-            legacy_scheduler.trigger_check_for_stock(stock['id'])
+        queue_scheduler.trigger_for_stock(stock['id'])
         return jsonify({'message': 'Added to watchlist'}), 201
         
     except sqlite3.IntegrityError:
@@ -733,10 +714,7 @@ def add_stock_to_group(group_id):
         conn.commit()
 
         # Immediately check for transcripts for newly grouped stock
-        if queue_scheduler is not None:
-            queue_scheduler.trigger_for_stock(stock['id'])
-        else:
-            legacy_scheduler.trigger_check_for_stock(stock['id'])
+        queue_scheduler.trigger_for_stock(stock['id'])
         return jsonify({'message': 'Stock added to group'}), 201
         
     except sqlite3.IntegrityError:
@@ -1395,8 +1373,6 @@ def update_default_prompt():
 
 # Analysis API Endpoints
 
-analysis_job_service = AnalysisJobService()
-
 @app.route('/api/analyze/<int:stock_id>', methods=['POST'])
 def trigger_analysis(stock_id):
     data = request.get_json(silent=True) or {}
@@ -1493,15 +1469,12 @@ def trigger_analysis(stock_id):
     
     # Start background job
     try:
-        if queue_scheduler is not None:
-            job_id = analysis_job_service.enqueue_for_transcript(transcript_id, force=force)
-            if job_id is None:
-                return jsonify({
-                    'message': 'Analysis already exists for this transcript',
-                    'status': 'skipped'
-                }), 200
-        else:
-            job_id = legacy_analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year, force=force)
+        job_id = analysis_job_service.enqueue_for_transcript(transcript_id, force=force)
+        if job_id is None:
+            return jsonify({
+                'message': 'Analysis already exists for this transcript',
+                'status': 'skipped'
+            }), 200
         return jsonify({
             'message': 'Analysis started',
             'job_id': job_id,

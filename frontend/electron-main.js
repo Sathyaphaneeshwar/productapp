@@ -15,6 +15,19 @@ let mainWindow;
 let backendProcess;
 let isQuitting = false;
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
+app.on('second-instance', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
 // Update status tracking
 let updateStatus = 'idle'; // 'idle', 'checking', 'available', 'downloading', 'ready', 'error'
 let updateInfo = null;
@@ -65,67 +78,122 @@ autoUpdater.on('error', (err) => {
 // Backend port
 const BACKEND_PORT = 5001;
 
-// Kill any process using the backend port
-async function killProcessOnPort(port) {
-  log(`killProcessOnPort: Starting for port ${port}`);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+function execAsync(command) {
   return new Promise((resolve) => {
-    try {
-      if (process.platform === 'win32') {
-        // Windows command to find and kill process on port
-        exec(`netstat -ano | findstr :${port}`, (err, stdout) => {
-          if (err || !stdout) {
-            log(`killProcessOnPort: No process on port ${port} (Windows)`);
-            resolve();
-            return;
-          }
-          // Extract PID from netstat output
-          const lines = stdout.trim().split('\n');
-          const pids = new Set();
-          lines.forEach(line => {
-            const parts = line.trim().split(/\s+/);
-            const pid = parts[parts.length - 1];
-            if (pid && !isNaN(pid)) {
-              pids.add(pid);
-            }
-          });
-          log(`killProcessOnPort: Found ${pids.size} processes to kill`);
-          // Kill each PID
-          pids.forEach(pid => {
-            try {
-              exec(`taskkill /PID ${pid} /F`, () => { });
-            } catch (e) {
-              log(`killProcessOnPort: Error killing PID ${pid}: ${e.message}`);
-            }
-          });
-          setTimeout(resolve, 500);
-        });
-      } else {
-        // Mac/Linux command to find and kill process on port
-        exec(`lsof -i :${port} -t`, (err, stdout) => {
-          if (err || !stdout) {
-            log(`killProcessOnPort: No process on port ${port} (Mac/Linux)`);
-            resolve();
-            return;
-          }
-          const pids = stdout.trim().split('\n');
-          log(`killProcessOnPort: Found ${pids.length} processes to kill: ${pids.join(', ')}`);
-          pids.forEach(pid => {
-            if (pid) {
-              try {
-                exec(`kill -9 ${pid}`, () => { });
-              } catch (e) {
-                log(`killProcessOnPort: Error killing PID ${pid}: ${e.message}`);
-              }
-            }
-          });
-          setTimeout(resolve, 500);
-        });
-      }
-    } catch (e) {
-      log(`killProcessOnPort: Exception caught: ${e.message}`);
-      resolve(); // Resolve anyway to not block
+    exec(command, (error, stdout, stderr) => {
+      resolve({ error, stdout, stderr });
+    });
+  });
+}
+
+async function listPidsOnPort(port) {
+  try {
+    if (process.platform === 'win32') {
+      const { error, stdout } = await execAsync(`netstat -ano | findstr :${port}`);
+      if (error || !stdout) return [];
+
+      const pids = new Set();
+      stdout.trim().split('\n').forEach((line) => {
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && !isNaN(pid)) {
+          pids.add(pid);
+        }
+      });
+      return [...pids];
     }
+
+    const { error, stdout } = await execAsync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`);
+    if (error || !stdout) return [];
+    return stdout
+      .trim()
+      .split('\n')
+      .map((pid) => pid.trim())
+      .filter(Boolean);
+  } catch (e) {
+    log(`listPidsOnPort error: ${e.message}`);
+    return [];
+  }
+}
+
+async function isPidAlive(pid) {
+  if (!pid) return false;
+
+  if (process.platform === 'win32') {
+    const { error, stdout } = await execAsync(`tasklist /FI "PID eq ${pid}" /NH`);
+    if (error) return false;
+    return stdout && !stdout.includes('No tasks are running');
+  }
+
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+async function stopPidGracefully(pid, graceMs = 4000) {
+  if (!pid) return;
+
+  try {
+    if (process.platform === 'win32') {
+      await execAsync(`taskkill /PID ${pid} /T`);
+    } else {
+      process.kill(Number(pid), 'SIGTERM');
+    }
+  } catch (e) {
+    log(`Graceful stop failed for PID ${pid}: ${e.message}`);
+  }
+
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    if (!(await isPidAlive(pid))) {
+      return;
+    }
+    await sleep(200);
+  }
+
+  log(`PID ${pid} did not exit after SIGTERM, forcing stop`);
+  try {
+    if (process.platform === 'win32') {
+      await execAsync(`taskkill /PID ${pid} /T /F`);
+    } else {
+      process.kill(Number(pid), 'SIGKILL');
+    }
+  } catch (e) {
+    log(`Force stop failed for PID ${pid}: ${e.message}`);
+  }
+}
+
+async function stopProcessesOnPort(port) {
+  const pids = await listPidsOnPort(port);
+  if (pids.length === 0) {
+    return;
+  }
+
+  log(`Port ${port} is in use by PID(s): ${pids.join(', ')}`);
+  for (const pid of pids) {
+    await stopPidGracefully(pid);
+  }
+}
+
+async function isBackendResponsive(timeoutMs = 1200) {
+  const url = `http://127.0.0.1:${BACKEND_PORT}/api/poll/status`;
+  return new Promise((resolve) => {
+    const req = http.get(url, (res) => {
+      res.resume();
+      resolve(res.statusCode && res.statusCode < 500);
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
   });
 }
 
@@ -169,12 +237,25 @@ function resolveBackendExecutable() {
 
     if (needsCopy) {
       log(`Preparing backend copy for macOS at ${targetDir}`);
+      const stagedTargetDir = `${targetDir}.staged`;
+      const stagedVersionFile = path.join(stagedTargetDir, '.backend-version');
       try {
+        fs.rmSync(stagedTargetDir, { recursive: true, force: true });
+        fs.cpSync(sourceDir, stagedTargetDir, { recursive: true });
+        const stagedExecutable = path.join(stagedTargetDir, executableName);
+        if (!fs.existsSync(stagedExecutable)) {
+          throw new Error(`Staged backend executable missing at ${stagedExecutable}`);
+        }
+        fs.writeFileSync(stagedVersionFile, appVersion);
         fs.rmSync(targetDir, { recursive: true, force: true });
-        fs.cpSync(sourceDir, targetDir, { recursive: true });
-        fs.writeFileSync(versionFile, appVersion);
+        fs.renameSync(stagedTargetDir, targetDir);
       } catch (err) {
         log(`Failed to copy backend to userData: ${err.message}`);
+        try {
+          fs.rmSync(stagedTargetDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup errors
+        }
       }
     }
 
@@ -193,6 +274,15 @@ function resolveBackendExecutable() {
 }
 
 async function startBackend() {
+  const existingBackendHealthy = await isBackendResponsive();
+  if (existingBackendHealthy) {
+    log('Detected healthy backend already running; skipping restart');
+    return true;
+  }
+
+  // Only stop listeners when the backend is not healthy.
+  await stopProcessesOnPort(BACKEND_PORT);
+
   const BACKEND_EXE = resolveBackendExecutable();
 
   const BACKEND_DIR = path.dirname(BACKEND_EXE);
@@ -202,11 +292,8 @@ async function startBackend() {
 
   if (!fs.existsSync(BACKEND_EXE)) {
     log(`ERROR: Backend executable not found at ${BACKEND_EXE}`);
-    return;
+    return false;
   }
-
-  // Kill any process blocking our port first
-  await killProcessOnPort(BACKEND_PORT);
 
   try {
     // Ensure proper environment for macOS
@@ -243,6 +330,7 @@ async function startBackend() {
 
     backendProcess.on('close', (code, signal) => {
       log(`Backend process exited with code ${code}, signal ${signal}`);
+      backendProcess = null;
     });
 
     backendProcess.on('exit', (code, signal) => {
@@ -251,12 +339,15 @@ async function startBackend() {
 
     if (backendProcess.pid) {
       log(`Backend started successfully with PID: ${backendProcess.pid}`);
+      return true;
     } else {
       log(`WARNING: Backend process created but no PID assigned`);
+      return false;
     }
   } catch (e) {
     log(`Exception starting backend: ${e.message}`);
     log(`Exception stack: ${e.stack}`);
+    return false;
   }
 }
 
@@ -327,6 +418,10 @@ async function waitForBackend(retries = 20) {
 }
 
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) {
+    return;
+  }
+
   Menu.setApplicationMenu(null);
 
   // Create window FIRST so user sees something
@@ -385,10 +480,8 @@ app.on('window-all-closed', (event) => {
 app.on('before-quit', () => {
   isQuitting = true;
   if (backendProcess?.pid) {
-    try {
-      process.kill(backendProcess.pid);
-    } catch (err) {
+    stopPidGracefully(String(backendProcess.pid)).catch((err) => {
       console.error('Failed to stop backend process', err);
-    }
+    });
   }
 });

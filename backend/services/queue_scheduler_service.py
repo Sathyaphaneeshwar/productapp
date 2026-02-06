@@ -156,6 +156,18 @@ class QueueSchedulerService:
             now = datetime.now()
             cursor.execute(
                 """
+                UPDATE analysis_jobs
+                SET status = 'retrying',
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'in_progress'
+                  AND (locked_until IS NULL OR locked_until < ?)
+                """,
+                (now,),
+            )
+            cursor.execute(
+                """
                 SELECT id
                 FROM analysis_jobs
                 WHERE status IN ('pending', 'retrying', 'queued')
@@ -187,6 +199,18 @@ class QueueSchedulerService:
         cursor = conn.cursor()
         try:
             now = datetime.now()
+            cursor.execute(
+                """
+                UPDATE email_outbox
+                SET status = 'retrying',
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'in_progress'
+                  AND (locked_until IS NULL OR locked_until < ?)
+                """,
+                (now,),
+            )
             cursor.execute(
                 """
                 SELECT id

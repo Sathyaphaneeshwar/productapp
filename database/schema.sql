@@ -203,6 +203,16 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_retry ON analysis_jobs(retry_next_at);
 
+-- Durable Queue Messages (SQLite-backed broker)
+CREATE TABLE IF NOT EXISTS queue_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_queue_messages_due ON queue_messages(queue_name, available_at, id);
+
 -- Email Outbox (Queue)
 CREATE TABLE IF NOT EXISTS email_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

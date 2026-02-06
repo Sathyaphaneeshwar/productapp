@@ -60,10 +60,6 @@ LOG_FILE = LOG_DIR / "app.log"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_LEVEL = "INFO"
 
-# Queue configuration (Redis)
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-QUEUE_PREFIX = os.environ.get("QUEUE_PREFIX", "pg")
-
 def _looks_like_database(db_path: Path) -> bool:
     try:
         if not db_path.exists():
@@ -205,7 +201,14 @@ def ensure_schema_migrations():
         missing_fetch_schedule = not table_exists("transcript_fetch_schedule")
         missing_transcript_events = not table_exists("transcript_events")
         missing_analysis_jobs = not table_exists("analysis_jobs")
+        missing_queue_messages = not table_exists("queue_messages")
         missing_email_outbox = not table_exists("email_outbox")
+
+        queue_index_missing = False
+        if not missing_queue_messages:
+            cursor.execute("PRAGMA index_list(queue_messages)")
+            queue_indexes = {row[1] for row in cursor.fetchall()}
+            queue_index_missing = "idx_queue_messages_due" not in queue_indexes
 
         needs_migration = (
             missing_analysis_status
@@ -215,6 +218,8 @@ def ensure_schema_migrations():
             or missing_fetch_schedule
             or missing_transcript_events
             or missing_analysis_jobs
+            or missing_queue_messages
+            or queue_index_missing
             or missing_email_outbox
         )
 
@@ -316,6 +321,22 @@ def ensure_schema_migrations():
             analysis_job_columns = {row[1] for row in cursor.fetchall()}
             if 'force' not in analysis_job_columns:
                 cursor.execute("ALTER TABLE analysis_jobs ADD COLUMN force INTEGER NOT NULL DEFAULT 0")
+
+        if missing_queue_messages:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS queue_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_name TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        if missing_queue_messages or queue_index_missing:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_queue_messages_due
+                ON queue_messages(queue_name, available_at, id)
+            """)
 
         if missing_email_outbox:
             cursor.execute("""

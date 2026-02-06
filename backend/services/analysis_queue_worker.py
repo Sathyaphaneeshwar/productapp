@@ -121,7 +121,9 @@ class AnalysisQueueWorker:
             cursor.execute(
                 """
                 UPDATE transcripts
-                SET analysis_status = 'in_progress', analysis_error = NULL
+                SET analysis_status = 'in_progress',
+                    analysis_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (transcript_id,),
@@ -165,7 +167,9 @@ class AnalysisQueueWorker:
             cursor.execute(
                 """
                 UPDATE transcripts
-                SET analysis_status = 'done', analysis_error = NULL
+                SET analysis_status = 'done',
+                    analysis_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (transcript_id,),
@@ -211,7 +215,9 @@ class AnalysisQueueWorker:
                 cursor.execute(
                     """
                     UPDATE transcripts
-                    SET analysis_status = 'error', analysis_error = ?
+                    SET analysis_status = 'error',
+                        analysis_error = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (message[:500], transcript_id),
