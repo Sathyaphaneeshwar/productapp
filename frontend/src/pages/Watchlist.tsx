@@ -361,7 +361,17 @@ export default function Watchlist() {
                 body: JSON.stringify(payload),
             })
             if (!response.ok) {
-                console.error('Failed to start analysis', await response.text())
+                let errorMessage = 'Failed to start analysis'
+                try {
+                    const errorPayload = await response.json()
+                    if (errorPayload?.error) {
+                        errorMessage = errorPayload.error
+                    }
+                } catch {
+                    // Ignore JSON parsing errors and use default message.
+                }
+                console.error('Failed to start analysis', errorMessage)
+                alert(errorMessage)
                 // Revert status on error
                 refreshWatchlist()
             } else {

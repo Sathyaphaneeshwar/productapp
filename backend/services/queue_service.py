@@ -14,22 +14,32 @@ class QueueService:
         conn = sqlite3.connect(self.db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def enqueue(self, queue_name: str, payload: dict) -> None:
         body = json.dumps(payload)
-        conn = self._get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                (queue_name, body),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        attempts = 0
+        max_attempts = 5
+        while True:
+            conn = self._get_connection()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    (queue_name, body),
+                )
+                conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempts >= max_attempts:
+                    raise
+                attempts += 1
+                time.sleep(0.1 * attempts)
+            finally:
+                conn.close()
 
     def dequeue(self, queue_name: str, timeout: int = 5) -> Optional[dict]:
         timeout_seconds = max(float(timeout), 0.0)
@@ -38,8 +48,6 @@ class QueueService:
         while True:
             conn = self._get_connection(timeout=1.0)
             try:
-                conn.isolation_level = None
-                conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
                     """
                     SELECT id, payload_json
@@ -52,20 +60,21 @@ class QueueService:
                 ).fetchone()
 
                 if row is not None:
-                    conn.execute("DELETE FROM queue_messages WHERE id = ?", (row["id"],))
+                    deleted = conn.execute(
+                        "DELETE FROM queue_messages WHERE id = ?",
+                        (row["id"],),
+                    ).rowcount
                     conn.commit()
+                    if deleted != 1:
+                        # Lost race to another worker, keep polling.
+                        continue
                     try:
                         return json.loads(row["payload_json"])
                     except json.JSONDecodeError:
                         return None
-
-                conn.commit()
             except sqlite3.OperationalError:
-                # Retry on transient lock errors during concurrent dequeues.
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+                # Retry on transient lock errors during concurrent dequeues/writes.
+                pass
             finally:
                 conn.close()
 

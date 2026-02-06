@@ -293,21 +293,23 @@ def get_watchlist():
             'retry_next_at': None,
             'retry_scope': None
         }
+        active_analysis_job = None
 
         if transcript:
             cursor.execute("""
-                SELECT attempts, retry_next_at
+                SELECT status, attempts, retry_next_at
                 FROM analysis_jobs
-                WHERE transcript_id = ? AND status = 'retrying'
-                ORDER BY updated_at DESC
+                WHERE transcript_id = ?
+                  AND status IN ('pending', 'queued', 'retrying', 'in_progress')
+                ORDER BY updated_at DESC, id DESC
                 LIMIT 1
             """, (transcript['id'],))
-            retry_row = cursor.fetchone()
-            if retry_row:
+            active_analysis_job = cursor.fetchone()
+            if active_analysis_job and active_analysis_job['status'] == 'retrying':
                 retry_info = {
                     'retrying': True,
-                    'retry_attempts': retry_row['attempts'],
-                    'retry_next_at': retry_row['retry_next_at'],
+                    'retry_attempts': active_analysis_job['attempts'],
+                    'retry_next_at': active_analysis_job['retry_next_at'],
                     'retry_scope': 'analysis'
                 }
 
@@ -355,7 +357,24 @@ def get_watchlist():
             analysis_state = transcript['analysis_status']
             analysis_error = transcript['analysis_error']
 
-            if analysis_state == 'in_progress':
+            if active_analysis_job:
+                analysis_job_status = active_analysis_job['status']
+                if analysis_job_status in ('pending', 'queued'):
+                    analysis_message = 'Analysis queued...'
+                elif analysis_job_status == 'retrying':
+                    analysis_message = 'Retrying analysis...'
+                else:
+                    analysis_message = 'Analyzing transcript...'
+
+                status_info = {
+                    'status': 'analyzing',
+                    'message': analysis_message,
+                    'details': {
+                        'quarter': transcript['quarter'],
+                        'year': transcript['year']
+                    }
+                }
+            elif analysis_state == 'in_progress':
                 status_info = {
                     'status': 'analyzing',
                     'message': 'Analyzing transcript...',

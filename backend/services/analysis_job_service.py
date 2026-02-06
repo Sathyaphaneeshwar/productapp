@@ -64,12 +64,28 @@ class AnalysisJobService:
                     """
                     UPDATE analysis_jobs
                     SET status = 'queued', locked_until = DATETIME(CURRENT_TIMESTAMP, '+15 minutes'), updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND status IN ('pending', 'retrying')
+                    WHERE id = ? AND status IN ('pending', 'retrying', 'error')
                     """,
                     (job_id,),
                 )
                 conn.commit()
-                self.queue.enqueue("analysis", {"analysis_job_id": job_id})
+                try:
+                    self.queue.enqueue("analysis", {"analysis_job_id": job_id})
+                except Exception as e:
+                    # Fallback: allow scheduler to pick it up quickly if direct enqueue fails.
+                    cursor.execute(
+                        """
+                        UPDATE analysis_jobs
+                        SET status = 'pending',
+                            retry_next_at = CURRENT_TIMESTAMP,
+                            locked_until = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status = 'queued'
+                        """,
+                        (job_id,),
+                    )
+                    conn.commit()
+                    print(f"[AnalysisJobService] Direct queue enqueue failed for job {job_id}: {e}")
             return job_id
         finally:
             conn.close()
