@@ -13,6 +13,7 @@ class QueueService:
     def _get_connection(self, timeout: float = 30.0) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
@@ -72,9 +73,10 @@ class QueueService:
                         return json.loads(row["payload_json"])
                     except json.JSONDecodeError:
                         return None
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower():
+                    raise
                 # Retry on transient lock errors during concurrent dequeues/writes.
-                pass
             finally:
                 conn.close()
 

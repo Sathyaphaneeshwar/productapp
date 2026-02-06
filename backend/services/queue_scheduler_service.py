@@ -124,17 +124,27 @@ class QueueSchedulerService:
                 """,
                 (quarter, year, now, now),
             )
-            rows = cursor.fetchall()
-            lock_until = now + timedelta(seconds=120)
-            for row in rows:
-                cursor.execute(
+            rows = [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        lock_until = now + timedelta(seconds=120)
+        for row in rows:
+            conn = self.get_db_connection()
+            try:
+                conn.execute(
                     """
                     UPDATE transcript_fetch_schedule
                     SET locked_until = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)
                     """,
-                    (lock_until, row["id"]),
+                    (lock_until, row["id"], now),
                 )
+                conn.commit()
+            finally:
+                conn.close()
+
+            try:
                 self.queue.enqueue(
                     "transcript_check",
                     {
@@ -145,27 +155,74 @@ class QueueSchedulerService:
                         "reason": "scheduled",
                     },
                 )
-            conn.commit()
-        finally:
-            conn.close()
+            except Exception as e:
+                # Release lock so scheduler can retry next cycle
+                conn = self.get_db_connection()
+                try:
+                    conn.execute(
+                        "UPDATE transcript_fetch_schedule SET locked_until = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                print(f"[QueueScheduler] Enqueue failed for stock {row['stock_id']}: {e}")
 
     def _enqueue_due_analysis_jobs(self):
+        now = datetime.now()
+
+        # Step 1: Recover stale in-progress jobs and their transcripts
         conn = self.get_db_connection()
-        cursor = conn.cursor()
         try:
-            now = datetime.now()
+            cursor = conn.cursor()
+            # Find stale analysis jobs so we can also fix their transcript status
             cursor.execute(
                 """
-                UPDATE analysis_jobs
-                SET status = 'retrying',
-                    retry_next_at = CURRENT_TIMESTAMP,
-                    locked_until = NULL,
-                    updated_at = CURRENT_TIMESTAMP
+                SELECT id, transcript_id
+                FROM analysis_jobs
                 WHERE status = 'in_progress'
                   AND (locked_until IS NULL OR locked_until < ?)
                 """,
                 (now,),
             )
+            stale_jobs = cursor.fetchall()
+            if stale_jobs:
+                stale_ids = [r["id"] for r in stale_jobs]
+                stale_transcript_ids = [r["transcript_id"] for r in stale_jobs if r["transcript_id"]]
+                placeholders = ",".join("?" for _ in stale_ids)
+                cursor.execute(
+                    f"""
+                    UPDATE analysis_jobs
+                    SET status = 'retrying',
+                        retry_next_at = CURRENT_TIMESTAMP,
+                        locked_until = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                    """,
+                    tuple(stale_ids),
+                )
+                # Also reset the transcript's analysis_status so the UI doesn't show "analysing" forever
+                if stale_transcript_ids:
+                    t_placeholders = ",".join("?" for _ in stale_transcript_ids)
+                    cursor.execute(
+                        f"""
+                        UPDATE transcripts
+                        SET analysis_status = NULL,
+                            analysis_error = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id IN ({t_placeholders})
+                          AND analysis_status = 'in_progress'
+                        """,
+                        tuple(stale_transcript_ids),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Step 2: Fetch due jobs
+        conn = self.get_db_connection()
+        try:
+            cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT id
@@ -178,28 +235,48 @@ class QueueSchedulerService:
                 """,
                 (now, now),
             )
-            rows = cursor.fetchall()
-            lock_until = now + timedelta(seconds=900)
-            for row in rows:
-                cursor.execute(
-                    """
-                    UPDATE analysis_jobs
-                    SET locked_until = ?, status = 'queued', updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (lock_until, row["id"]),
-                )
-                self.queue.enqueue("analysis", {"analysis_job_id": row["id"]})
-            conn.commit()
+            rows = [dict(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
+        # Step 3: Lock and enqueue each job individually
+        lock_until = now + timedelta(seconds=900)
+        for row in rows:
+            conn = self.get_db_connection()
+            try:
+                conn.execute(
+                    """
+                    UPDATE analysis_jobs
+                    SET locked_until = ?, status = 'queued', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)
+                    """,
+                    (lock_until, row["id"], now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            try:
+                self.queue.enqueue("analysis", {"analysis_job_id": row["id"]})
+            except Exception as e:
+                conn = self.get_db_connection()
+                try:
+                    conn.execute(
+                        "UPDATE analysis_jobs SET status = 'pending', locked_until = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                print(f"[QueueScheduler] Enqueue failed for analysis job {row['id']}: {e}")
+
     def _enqueue_due_email_jobs(self):
+        now = datetime.now()
+
+        # Step 1: Recover stale in-progress email jobs
         conn = self.get_db_connection()
-        cursor = conn.cursor()
         try:
-            now = datetime.now()
-            cursor.execute(
+            conn.execute(
                 """
                 UPDATE email_outbox
                 SET status = 'retrying',
@@ -211,6 +288,14 @@ class QueueSchedulerService:
                 """,
                 (now,),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Step 2: Fetch due jobs
+        conn = self.get_db_connection()
+        try:
+            cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT id
@@ -223,21 +308,40 @@ class QueueSchedulerService:
                 """,
                 (now, now),
             )
-            rows = cursor.fetchall()
-            lock_until = now + timedelta(seconds=900)
-            for row in rows:
-                cursor.execute(
+            rows = [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        # Step 3: Lock and enqueue each job individually
+        lock_until = now + timedelta(seconds=900)
+        for row in rows:
+            conn = self.get_db_connection()
+            try:
+                conn.execute(
                     """
                     UPDATE email_outbox
                     SET locked_until = ?, status = 'queued', updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)
                     """,
-                    (lock_until, row["id"]),
+                    (lock_until, row["id"], now),
                 )
+                conn.commit()
+            finally:
+                conn.close()
+
+            try:
                 self.queue.enqueue("email", {"email_outbox_id": row["id"]})
-            conn.commit()
-        finally:
-            conn.close()
+            except Exception as e:
+                conn = self.get_db_connection()
+                try:
+                    conn.execute(
+                        "UPDATE email_outbox SET status = 'pending', locked_until = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                print(f"[QueueScheduler] Enqueue failed for email job {row['id']}: {e}")
 
     def _maybe_trigger_group_research(self, quarter: str, year: int):
         conn = self.get_db_connection()

@@ -83,29 +83,41 @@ class TranscriptFetcherWorker:
         if not stock_id or not quarter or not year:
             return
 
+        # Phase 1: Read stock info and mark checking (short-lived connection)
         conn = self.get_db_connection()
-        cursor = conn.cursor()
         try:
+            cursor = conn.cursor()
             cursor.execute("SELECT id, stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
             stock = cursor.fetchone()
             if not stock:
                 return
-
             symbol = stock["stock_symbol"] or stock["bse_code"]
             if not symbol:
                 return
-
             self._mark_check_status(cursor, stock_id, "checking")
             conn.commit()
+        finally:
+            conn.close()
 
+        # Phase 2: API calls (no DB connection held)
+        try:
             available = self.transcript_service.fetch_available_transcripts(symbol)
             available = [t for t in available if t.quarter == quarter and t.year == year]
 
             upcoming = self.transcript_service.get_upcoming_calls(symbol)
             upcoming = [t for t in upcoming if t.quarter == quarter and t.year == year]
+        except Exception as e:
+            self._handle_fetch_error(stock_id, quarter, year, e)
+            return
 
-            schedule_status = "none"
-            event_date = None
+        # Phase 3: Persist results (short-lived connection)
+        schedule_status = "none"
+        event_date = None
+        trigger_analysis_transcript_id = None
+
+        conn = self.get_db_connection()
+        try:
+            cursor = conn.cursor()
 
             if available:
                 transcript = available[0]
@@ -113,10 +125,8 @@ class TranscriptFetcherWorker:
 
                 cursor.execute(
                     """
-                    SELECT id, status, source_url
-                    FROM transcripts
-                    WHERE stock_id = ? AND quarter = ? AND year = ?
-                    LIMIT 1
+                    SELECT id, status, source_url FROM transcripts
+                    WHERE stock_id = ? AND quarter = ? AND year = ? LIMIT 1
                     """,
                     (stock_id, quarter, year),
                 )
@@ -129,7 +139,6 @@ class TranscriptFetcherWorker:
                         """,
                         (stock_id, quarter, year, transcript.source_url),
                     )
-                    conn.commit()
                     transcript_id = cursor.lastrowid
                 else:
                     transcript_id = existing["id"]
@@ -142,7 +151,6 @@ class TranscriptFetcherWorker:
                             """,
                             (transcript.source_url, transcript_id),
                         )
-                        conn.commit()
 
                 cursor.execute(
                     """
@@ -151,25 +159,20 @@ class TranscriptFetcherWorker:
                     """,
                     (stock_id, quarter, year, transcript.source_url),
                 )
-                conn.commit()
 
-                # Auto-trigger analysis for watchlist stocks only
+                # Check eligibility for auto-analysis
                 cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
                 in_watchlist = cursor.fetchone() is not None
                 cursor.execute(
                     """
-                    SELECT 1
-                    FROM group_stocks gs
-                    JOIN groups g ON g.id = gs.group_id
-                    WHERE gs.stock_id = ? AND g.is_active = 1
-                    LIMIT 1
+                    SELECT 1 FROM group_stocks gs JOIN groups g ON g.id = gs.group_id
+                    WHERE gs.stock_id = ? AND g.is_active = 1 LIMIT 1
                     """,
                     (stock_id,),
                 )
                 in_active_group = cursor.fetchone() is not None
-
                 if in_watchlist and not in_active_group:
-                    self.analysis_job_service.enqueue_for_transcript(transcript_id)
+                    trigger_analysis_transcript_id = transcript_id
 
             elif upcoming:
                 call = upcoming[0]
@@ -177,10 +180,8 @@ class TranscriptFetcherWorker:
                 event_date = call.event_date
                 cursor.execute(
                     """
-                    SELECT id, status, event_date
-                    FROM transcripts
-                    WHERE stock_id = ? AND quarter = ? AND year = ?
-                    LIMIT 1
+                    SELECT id, status, event_date FROM transcripts
+                    WHERE stock_id = ? AND quarter = ? AND year = ? LIMIT 1
                     """,
                     (stock_id, quarter, year),
                 )
@@ -193,7 +194,6 @@ class TranscriptFetcherWorker:
                         """,
                         (stock_id, quarter, year, call.event_date),
                     )
-                    conn.commit()
                 else:
                     if existing["status"] != "upcoming" or existing["event_date"] != call.event_date:
                         cursor.execute(
@@ -204,7 +204,6 @@ class TranscriptFetcherWorker:
                             """,
                             (call.event_date, existing["id"]),
                         )
-                        conn.commit()
 
                 cursor.execute(
                     """
@@ -213,14 +212,10 @@ class TranscriptFetcherWorker:
                     """,
                     (stock_id, quarter, year, call.event_date),
                 )
-                conn.commit()
 
             # Update schedule row
             cursor.execute(
-                """
-                SELECT attempts FROM transcript_fetch_schedule
-                WHERE stock_id = ? AND quarter = ? AND year = ?
-                """,
+                "SELECT attempts FROM transcript_fetch_schedule WHERE stock_id = ? AND quarter = ? AND year = ?",
                 (stock_id, quarter, year),
             )
             sched = cursor.fetchone()
@@ -237,17 +232,29 @@ class TranscriptFetcherWorker:
                 """,
                 (schedule_status, schedule_status, next_check_at, stock_id, quarter, year),
             )
-            conn.commit()
 
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
-
         except Exception as e:
+            conn.close()
+            self._handle_fetch_error(stock_id, quarter, year, e)
+            return
+        else:
+            conn.close()
+
+        # Phase 4: Trigger analysis (separate connection via AnalysisJobService)
+        if trigger_analysis_transcript_id:
+            try:
+                self.analysis_job_service.enqueue_for_transcript(trigger_analysis_transcript_id)
+            except Exception as e:
+                print(f"[FetcherWorker] Analysis enqueue failed for stock {stock_id}: {e}")
+
+    def _handle_fetch_error(self, stock_id: int, quarter: str, year: int, error: Exception):
+        conn = self.get_db_connection()
+        try:
+            cursor = conn.cursor()
             cursor.execute(
-                """
-                SELECT attempts FROM transcript_fetch_schedule
-                WHERE stock_id = ? AND quarter = ? AND year = ?
-                """,
+                "SELECT attempts FROM transcript_fetch_schedule WHERE stock_id = ? AND quarter = ? AND year = ?",
                 (stock_id, quarter, year),
             )
             sched = cursor.fetchone()
@@ -264,6 +271,8 @@ class TranscriptFetcherWorker:
             )
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
-            print(f"[FetcherWorker] Error processing stock {stock_id}: {e}")
+        except Exception as inner_e:
+            print(f"[FetcherWorker] Error handler failed for stock {stock_id}: {inner_e}")
         finally:
             conn.close()
+        print(f"[FetcherWorker] Error processing stock {stock_id}: {error}")
