@@ -1,8 +1,11 @@
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
+
+logger = logging.getLogger(__name__)
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.transcript_service import TranscriptService
@@ -42,7 +45,7 @@ class TranscriptFetcherWorker:
             try:
                 self._process_job(job)
             except Exception as e:
-                print(f"[FetcherWorker] Job failed: {e}")
+                logger.exception("FetcherWorker job failed")
 
     def _mark_check_status(self, cursor, stock_id: int, status: str):
         cursor.execute(
@@ -264,6 +267,6 @@ class TranscriptFetcherWorker:
             )
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
-            print(f"[FetcherWorker] Error processing stock {stock_id}: {e}")
+            logger.warning("FetcherWorker error processing stock %s: %s", stock_id, e)
         finally:
             conn.close()

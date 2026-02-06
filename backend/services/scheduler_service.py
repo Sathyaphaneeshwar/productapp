@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 import sqlite3
@@ -10,6 +11,8 @@ from db import get_db_connection
 from services.transcript_service import TranscriptService
 from services.analysis_worker import AnalysisWorker
 from services.group_research_service import GroupResearchService
+
+logger = logging.getLogger(__name__)
 
 
 def _get_latest_quarter():
@@ -155,7 +158,7 @@ class SchedulerService:
             self.poll_watchlist()
             self.group_research_service.check_and_trigger_runs()
         except Exception as e:
-            print(f"[Scheduler] Unexpected error: {e}")
+            logger.exception("Unexpected error in poll cycle")
         finally:
             completed_at = datetime.now()
             fallback_next = completed_at + timedelta(seconds=self.poll_interval)
@@ -219,17 +222,17 @@ class SchedulerService:
                     self._update_check_status(cursor, stock_id, 'checking')
                     conn.commit()
                 except Exception as e:
-                    print(f"[Scheduler] Failed to set check status for stock {stock_id}: {e}")
+                    logger.warning("Failed to set check status for stock %s: %s", stock_id, e)
 
             if not symbol:
-                print(f"[Scheduler] No symbol/bse_code found for stock id {stock_id}, skipping")
+                logger.warning("No symbol/bse_code found for stock id %s, skipping", stock_id)
                 return
 
-            print(f"[Scheduler] Checking {symbol}...")
+            logger.info("Checking %s...", symbol)
 
             # Get the latest quarter for auto-analysis
             latest_quarter, latest_year = _get_latest_quarter()
-            print(f"[Scheduler] Latest quarter for auto-analysis: {latest_quarter} FY{latest_year}")
+            logger.debug("Latest quarter for auto-analysis: %s FY%s", latest_quarter, latest_year)
 
             # Fetch available transcripts
             transcripts = self.transcript_service.fetch_available_transcripts(symbol)
@@ -254,7 +257,7 @@ class SchedulerService:
                     existing = cursor.fetchone()
                 
                 if not existing:
-                    print(f"[Scheduler] New transcript found for {symbol}: {transcript.title}")
+                    logger.info("New transcript found for %s: %s", symbol, transcript.title)
                     cursor.execute("""
                         INSERT INTO transcripts (stock_id, quarter, year, source_url, status)
                         VALUES (?, ?, ?, ?, 'available')
@@ -273,27 +276,27 @@ class SchedulerService:
                     
                     # Only auto-trigger analysis for the LATEST quarter
                     if not auto_analyze:
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
+                        logger.debug("Skipping auto-analysis for %s (not in watchlist)", symbol)
                     elif not self._is_in_watchlist(cursor, stock_id):
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (no longer in watchlist)")
+                        logger.debug("Skipping auto-analysis for %s (no longer in watchlist)", symbol)
                     elif self._is_in_active_group(cursor, stock_id):
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (stock is in an active group)")
+                        logger.debug("Skipping auto-analysis for %s (stock is in an active group)", symbol)
                     elif transcript.quarter != latest_quarter or transcript.year != latest_year:
-                        print(f"[Scheduler] Transcript {transcript.quarter} {transcript.year} stored but not auto-analyzed (not latest quarter)")
+                        logger.debug("Transcript %s %s stored but not auto-analyzed (not latest quarter)", transcript.quarter, transcript.year)
                     elif self._analysis_in_progress_for_quarter(cursor, stock_id, transcript.quarter, transcript.year):
-                        print(f"[Scheduler] Analysis already in progress for {symbol} {transcript.quarter} {transcript.year}, skipping")
+                        logger.debug("Analysis already in progress for %s %s %s, skipping", symbol, transcript.quarter, transcript.year)
                     elif self._analysis_exists_for_quarter(cursor, stock_id, transcript.quarter, transcript.year):
-                        print(f"[Scheduler] Analysis already exists for {symbol} {transcript.quarter} {transcript.year}, skipping")
+                        logger.debug("Analysis already exists for %s %s %s, skipping", symbol, transcript.quarter, transcript.year)
                     else:
-                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {transcript.quarter} {transcript.year}")
+                        logger.info("Auto-triggering analysis for %s %s %s", symbol, transcript.quarter, transcript.year)
                         try:
                             job_id = self.analysis_worker.start_analysis_job(stock_id, transcript.quarter, transcript.year)
-                            print(f"[Scheduler] Analysis job started: {job_id}")
+                            logger.info("Analysis job started: %s", job_id)
                         except Exception as e:
-                            print(f"[Scheduler] Failed to start analysis: {e}")
+                            logger.exception("Failed to start analysis for %s", symbol)
                 else:
                     if existing['status'] != 'available' or existing['source_url'] != transcript.source_url:
-                        print(f"[Scheduler] Transcript now available for {symbol}: {transcript.title}")
+                        logger.info("Transcript now available for %s: %s", symbol, transcript.title)
                         cursor.execute("""
                             UPDATE transcripts 
                             SET status = 'available', source_url = ?, updated_at = CURRENT_TIMESTAMP
@@ -313,24 +316,24 @@ class SchedulerService:
                     
                     # Only auto-trigger analysis for the LATEST quarter
                     if not auto_analyze:
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (not in watchlist)")
+                        logger.debug("Skipping auto-analysis for %s (not in watchlist)", symbol)
                     elif not self._is_in_watchlist(cursor, stock_id):
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (no longer in watchlist)")
+                        logger.debug("Skipping auto-analysis for %s (no longer in watchlist)", symbol)
                     elif self._is_in_active_group(cursor, stock_id):
-                        print(f"[Scheduler] Skipping auto-analysis for {symbol} (stock is in an active group)")
+                        logger.debug("Skipping auto-analysis for %s (stock is in an active group)", symbol)
                     elif existing['quarter'] != latest_quarter or existing['year'] != latest_year:
-                        print(f"[Scheduler] Transcript {existing['quarter']} {existing['year']} updated but not auto-analyzed (not latest quarter)")
+                        logger.debug("Transcript %s %s updated but not auto-analyzed (not latest quarter)", existing['quarter'], existing['year'])
                     elif self._analysis_in_progress_for_quarter(cursor, stock_id, existing['quarter'], existing['year']):
-                        print(f"[Scheduler] Analysis already in progress for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                        logger.debug("Analysis already in progress for %s %s %s, skipping", symbol, existing['quarter'], existing['year'])
                     elif self._analysis_exists_for_quarter(cursor, stock_id, existing['quarter'], existing['year']):
-                        print(f"[Scheduler] Analysis already exists for {symbol} {existing['quarter']} {existing['year']}, skipping")
+                        logger.debug("Analysis already exists for %s %s %s, skipping", symbol, existing['quarter'], existing['year'])
                     else:
-                        print(f"[Scheduler] Auto-triggering analysis for {symbol} {existing['quarter']} {existing['year']}")
+                        logger.info("Auto-triggering analysis for %s %s %s", symbol, existing['quarter'], existing['year'])
                         try:
                             job_id = self.analysis_worker.start_analysis_job(stock_id, existing['quarter'], existing['year'])
-                            print(f"[Scheduler] Analysis job started: {job_id}")
+                            logger.info("Analysis job started: %s", job_id)
                         except Exception as e:
-                            print(f"[Scheduler] Failed to start analysis: {e}")
+                            logger.exception("Failed to start analysis for %s", symbol)
 
             # Fetch upcoming calls
             upcoming = self.transcript_service.get_upcoming_calls(symbol)
@@ -352,7 +355,7 @@ class SchedulerService:
                         conn.commit()
                     continue
 
-                print(f"[Scheduler] New upcoming call for {symbol}: {call.title} on {call.event_date}")
+                logger.info("New upcoming call for %s: %s on %s", symbol, call.title, call.event_date)
                 cursor.execute("""
                     INSERT INTO transcripts (stock_id, quarter, year, status, event_date)
                     VALUES (?, ?, ?, 'upcoming', ?)
@@ -364,14 +367,14 @@ class SchedulerService:
                     self._update_check_status(cursor, stock_id, 'idle')
                     conn.commit()
                 except Exception as e:
-                    print(f"[Scheduler] Failed to update check status for stock {stock_id}: {e}")
+                    logger.warning("Failed to update check status for stock %s: %s", stock_id, e)
 
     def poll_watchlist(self):
         """
         Polls Tijori API for all stocks in the watchlist and all stocks that belong to any group.
         Updates transcripts table with new available transcripts or upcoming calls.
         """
-        print(f"[Scheduler] Starting watchlist poll at {datetime.now()}")
+        logger.info("Starting watchlist poll at %s", datetime.now())
         
         conn = self.get_db_connection()
         cursor = conn.cursor()
@@ -405,14 +408,14 @@ class SchedulerService:
                 unique_stocks[stock["id"]] = stock
 
             stock_list = list(unique_stocks.values())
-            print(f"[Scheduler] Found {len(watchlist_stocks)} stocks in watchlist, {len(group_stocks)} in groups, {len(stock_list)} unique to check")
+            logger.info("Found %s stocks in watchlist, %s in groups, %s unique to check", len(watchlist_stocks), len(group_stocks), len(stock_list))
             stock_ids = [stock["id"] for stock in stock_list]
 
             try:
                 self._update_bulk_check_status(cursor, stock_ids, 'checking')
                 conn.commit()
             except Exception as e:
-                print(f"[Scheduler] Failed to set bulk check status: {e}")
+                logger.warning("Failed to set bulk check status: %s", e)
 
             for stock in stock_list:
                 self._process_stock(
@@ -423,17 +426,17 @@ class SchedulerService:
                     auto_analyze=stock["id"] in watchlist_ids
                 )
                     
-            print(f"[Scheduler] Poll completed at {datetime.now()}")
+            logger.info("Poll completed at %s", datetime.now())
             
         except Exception as e:
-            print(f"[Scheduler] Error during poll: {e}")
+            logger.exception("Error during poll")
         finally:
             if stock_ids:
                 try:
                     self._update_bulk_check_status(cursor, stock_ids, 'idle')
                     conn.commit()
                 except Exception as e:
-                    print(f"[Scheduler] Failed to clear bulk check status: {e}")
+                    logger.warning("Failed to clear bulk check status: %s", e)
             conn.close()
 
     def check_and_schedule_stock(self, stock_id: int):
@@ -447,13 +450,13 @@ class SchedulerService:
             cursor.execute("SELECT id, stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
             stock = cursor.fetchone()
             if not stock:
-                print(f"[Scheduler] Stock id {stock_id} not found for immediate check")
+                logger.warning("Stock id %s not found for immediate check", stock_id)
                 return
             cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
             in_watchlist = cursor.fetchone() is not None
             self._process_stock(cursor, conn, stock, auto_analyze=in_watchlist)
         except Exception as e:
-            print(f"[Scheduler] Error checking stock {stock_id}: {e}")
+            logger.exception("Error checking stock %s", stock_id)
         finally:
             conn.close()
 
@@ -480,10 +483,10 @@ class SchedulerService:
     def start(self):
         """Starts the background scheduler."""
         if self.running:
-            print("[Scheduler] Already running")
+            logger.info("Scheduler already running")
             return
         
-        print(f"[Scheduler] Starting with {self.poll_interval}s interval")
+        logger.info("Starting with %ss interval", self.poll_interval)
         self.running = True
         self._set_poll_status(next_poll_at=datetime.now())
         self.thread = threading.Thread(target=self._run_scheduler, daemon=True)
@@ -491,7 +494,7 @@ class SchedulerService:
 
     def stop(self):
         """Stops the background scheduler."""
-        print("[Scheduler] Stopping...")
+        logger.info("Scheduler stopping")
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)

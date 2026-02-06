@@ -1,8 +1,11 @@
 """
 Encryption utility for API keys using Fernet symmetric encryption.
 """
+import logging
 import os
 from cryptography.fernet import Fernet
+
+logger = logging.getLogger(__name__)
 
 class EncryptionService:
     def __init__(self):
@@ -21,14 +24,14 @@ class EncryptionService:
                 try:
                     with open(self.key_file, 'r') as f:
                         self.encryption_key = f.read().strip()
-                    print(f"[INFO] Loaded encryption key from {self.key_file}")
+                    logger.info("Loaded encryption key from %s", self.key_file)
                 except Exception as e:
-                    print(f"[WARNING] Failed to load encryption key from file: {e}")
+                    logger.warning("Failed to load encryption key from file: %s", e)
         
         if not self.encryption_key:
             # Generate a new key if not found (for first-time setup)
             self.encryption_key = Fernet.generate_key().decode()
-            print(f"[INFO] Generated new encryption key")
+            logger.info("Generated new encryption key")
             
             # Save to persistent file
             try:
@@ -36,10 +39,10 @@ class EncryptionService:
                     f.write(self.encryption_key)
                 # Set file permissions to read/write for owner only
                 os.chmod(self.key_file, 0o600)
-                print(f"[INFO] Saved encryption key to {self.key_file}")
+                logger.info("Saved encryption key to %s", self.key_file)
             except Exception as e:
-                print(f"[WARNING] Failed to save encryption key: {e}")
-                print(f"[WARNING] Please add this to your .env file: ENCRYPTION_KEY={self.encryption_key}")
+                logger.warning("Failed to save encryption key: %s", e)
+                logger.warning("Please set ENCRYPTION_KEY in environment or .env file")
         
         self.cipher = Fernet(self.encryption_key.encode() if isinstance(self.encryption_key, str) else self.encryption_key)
     

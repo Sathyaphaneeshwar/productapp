@@ -2,10 +2,13 @@
 OpenRouter Provider Implementation.
 Provides access to 400+ models from multiple providers.
 """
+import logging
 from openai import OpenAI
 from typing import List
 import requests
 from .base_provider import BaseLLMProvider, LLMResponse, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 class OpenRouterProvider(BaseLLMProvider):
     """OpenRouter provider for accessing 400+ models."""
@@ -143,7 +146,7 @@ class OpenRouterProvider(BaseLLMProvider):
             return models
             
         except Exception as e:
-            print(f"Error fetching OpenRouter models: {e}")
+            logger.warning("Error fetching OpenRouter models: %s", e)
             return []
     
     def validate_api_key(self) -> bool:
@@ -156,5 +159,5 @@ class OpenRouterProvider(BaseLLMProvider):
             )
             return response.status_code == 200
         except Exception as e:
-            print(f"OpenRouter API key validation failed: {e}")
+            logger.warning("OpenRouter API key validation failed: %s", e)
             return False

@@ -2,9 +2,12 @@
 Anthropic (Claude) Provider Implementation.
 Supports Claude 3 Opus, Sonnet, and Haiku models.
 """
+import logging
 from anthropic import Anthropic
 from typing import List
 from .base_provider import BaseLLMProvider, LLMResponse, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 class AnthropicProvider(BaseLLMProvider):
     """Anthropic provider for Claude models."""
@@ -154,5 +157,5 @@ Then provide your comprehensive analysis.
             )
             return True
         except Exception as e:
-            print(f"Anthropic API key validation failed: {e}")
+            logger.warning("Anthropic API key validation failed: %s", e)
             return False

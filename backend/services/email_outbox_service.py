@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from typing import Optional
 
@@ -5,6 +6,8 @@ from config import DATABASE_PATH
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.email_service import EmailService
+
+logger = logging.getLogger(__name__)
 
 
 class EmailOutboxService:
@@ -21,9 +24,10 @@ class EmailOutboxService:
         if not recipients:
             return 0
 
+        # Phase 1: Insert all outbox rows and collect IDs, then commit.
+        to_enqueue = []
         conn = self.get_db_connection()
         cursor = conn.cursor()
-        created = 0
         try:
             for recipient in recipients:
                 try:
@@ -34,15 +38,22 @@ class EmailOutboxService:
                         """,
                         (analysis_id, recipient),
                     )
-                    conn.commit()
-                    outbox_id = cursor.lastrowid
-                    self.queue.enqueue("email", {"email_outbox_id": outbox_id})
-                    created += 1
+                    to_enqueue.append(cursor.lastrowid)
                 except sqlite3.IntegrityError:
                     # Already exists, skip
                     continue
+            conn.commit()
         finally:
             conn.close()
+
+        # Phase 2: Enqueue on separate connections — no DB lock held.
+        created = 0
+        for outbox_id in to_enqueue:
+            try:
+                self.queue.enqueue("email", {"email_outbox_id": outbox_id})
+                created += 1
+            except Exception as e:
+                logger.warning("Failed to enqueue email outbox %s: %s", outbox_id, e)
         return created
 
     def enqueue_job(self, outbox_id: int) -> None:

@@ -13,6 +13,7 @@ class QueueService:
     def _get_connection(self, timeout: float = 30.0) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=timeout)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
@@ -46,7 +47,7 @@ class QueueService:
         deadline = time.monotonic() + timeout_seconds
 
         while True:
-            conn = self._get_connection(timeout=1.0)
+            conn = self._get_connection()
             try:
                 row = conn.execute(
                     """
@@ -81,7 +82,7 @@ class QueueService:
             if timeout_seconds == 0 or time.monotonic() >= deadline:
                 return None
 
-            time.sleep(0.1)
+            time.sleep(0.5)
 
     def ping(self) -> bool:
         conn = self._get_connection(timeout=1.0)

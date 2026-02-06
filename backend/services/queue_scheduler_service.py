@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
@@ -7,6 +8,8 @@ from config import DATABASE_PATH
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.group_research_service import GroupResearchService
+
+logger = logging.getLogger(__name__)
 
 
 def _get_latest_quarter():
@@ -108,6 +111,13 @@ class QueueSchedulerService:
             conn.close()
 
     def _enqueue_due_transcript_checks(self, quarter: str, year: int):
+        """Collect due transcript checks, commit DB changes, then enqueue.
+
+        The two phases (DB update then queue insert) use separate connections
+        to avoid holding a write-lock while enqueuing, which previously
+        caused a self-deadlock.
+        """
+        to_enqueue = []
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
@@ -135,21 +145,30 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue(
-                    "transcript_check",
-                    {
-                        "stock_id": row["stock_id"],
-                        "priority": row["priority"],
-                        "quarter": quarter,
-                        "year": year,
-                        "reason": "scheduled",
-                    },
-                )
+                to_enqueue.append({
+                    "stock_id": row["stock_id"],
+                    "priority": row["priority"],
+                    "quarter": quarter,
+                    "year": year,
+                    "reason": "scheduled",
+                })
             conn.commit()
         finally:
             conn.close()
 
+        # Enqueue on separate connections — no DB lock held here
+        for payload in to_enqueue:
+            try:
+                self.queue.enqueue("transcript_check", payload)
+            except Exception as e:
+                logger.warning(
+                    "Failed to enqueue transcript_check for stock %s: %s",
+                    payload["stock_id"], e,
+                )
+
     def _enqueue_due_analysis_jobs(self):
+        """Collect due analysis jobs, commit DB changes, then enqueue."""
+        to_enqueue = []
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
@@ -189,12 +208,20 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue("analysis", {"analysis_job_id": row["id"]})
+                to_enqueue.append(row["id"])
             conn.commit()
         finally:
             conn.close()
 
+        for job_id in to_enqueue:
+            try:
+                self.queue.enqueue("analysis", {"analysis_job_id": job_id})
+            except Exception as e:
+                logger.warning("Failed to enqueue analysis job %s: %s", job_id, e)
+
     def _enqueue_due_email_jobs(self):
+        """Collect due email jobs, commit DB changes, then enqueue."""
+        to_enqueue = []
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
@@ -234,10 +261,16 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue("email", {"email_outbox_id": row["id"]})
+                to_enqueue.append(row["id"])
             conn.commit()
         finally:
             conn.close()
+
+        for outbox_id in to_enqueue:
+            try:
+                self.queue.enqueue("email", {"email_outbox_id": outbox_id})
+            except Exception as e:
+                logger.warning("Failed to enqueue email job %s: %s", outbox_id, e)
 
     def _maybe_trigger_group_research(self, quarter: str, year: int):
         conn = self.get_db_connection()
@@ -341,8 +374,8 @@ class QueueSchedulerService:
                     self._maybe_trigger_group_research(quarter, year)
                     self.last_group_check = now
                     next_group_check = now + timedelta(seconds=self.group_check_seconds)
-            except Exception as e:
-                print(f"[QueueScheduler] Error in loop: {e}")
+            except Exception:
+                logger.exception("Error in scheduler loop")
 
             time.sleep(1)
 
@@ -352,8 +385,10 @@ class QueueSchedulerService:
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        logger.info("QueueSchedulerService started")
 
     def stop(self):
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
+        logger.info("QueueSchedulerService stopped")

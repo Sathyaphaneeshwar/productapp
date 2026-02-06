@@ -1,8 +1,11 @@
+import logging
 import sqlite3
 import time
 from typing import Optional
 
 from config import DATABASE_PATH
+
+logger = logging.getLogger(__name__)
 from db import get_db_connection
 from services.queue_service import QueueService
 
@@ -85,7 +88,7 @@ class AnalysisJobService:
                         (job_id,),
                     )
                     conn.commit()
-                    print(f"[AnalysisJobService] Direct queue enqueue failed for job {job_id}: {e}")
+                    logger.warning("Direct queue enqueue failed for analysis job %s: %s", job_id, e)
             return job_id
         finally:
             conn.close()

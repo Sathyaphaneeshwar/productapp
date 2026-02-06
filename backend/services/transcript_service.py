@@ -1,3 +1,4 @@
+import logging
 import requests
 import os
 import sys
@@ -6,6 +7,8 @@ from typing import List, Optional
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, quote
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path
 from config import DATABASE_PATH
@@ -134,7 +137,7 @@ class TranscriptService:
         """
         isin = self._get_isin_from_symbol(stock_symbol)
         if not isin:
-            print(f"ISIN not found for {stock_symbol}")
+            logger.warning("ISIN not found for %s", stock_symbol)
             return []
 
         url = f"{self.base_url}/concalls/list"
@@ -160,13 +163,13 @@ class TranscriptService:
                 event_time = item.get('concall_event_time') or item.get('event_time') or item.get('event_date')
                 parsed_time = self._parse_event_time(event_time)
                 if not parsed_time:
-                    print(f"[TranscriptService] Missing/invalid concall_event_time for {stock_symbol}: {event_time}")
+                    logger.warning("Missing/invalid concall_event_time for %s: %s", stock_symbol, event_time)
                     continue
 
                 try:
                     quarter, fy = self._calculate_fy_quarter(parsed_time)
                 except Exception as e:
-                    print(f"[TranscriptService] Failed to calculate quarter for {stock_symbol}: {event_time} ({e})")
+                    logger.warning("Failed to calculate quarter for %s: %s (%s)", stock_symbol, event_time, e)
                     continue
 
                 results.append((
@@ -186,7 +189,7 @@ class TranscriptService:
             return [item[1] for item in results]
 
         except Exception as e:
-            print(f"Error fetching transcripts from Tijori: {e}")
+            logger.warning("Error fetching transcripts from Tijori: %s", e)
             # Fallback to empty list or re-raise depending on requirement
             return []
 
@@ -200,8 +203,8 @@ class TranscriptService:
         try:
             safe_url = self._sanitize_url(url)
             if safe_url != url:
-                print(f"[TranscriptService] Sanitized URL for download: {safe_url}")
-            print(f"Downloading PDF from {safe_url}...")
+                logger.debug("Sanitized URL for download: %s", safe_url)
+            logger.info("Downloading PDF from %s", safe_url)
             # Some providers block default Python user agents; use a browsery UA
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -221,7 +224,7 @@ class TranscriptService:
                 tmp_file.write(response.content)
                 tmp_path = tmp_file.name
             
-            print(f"Extracting text from PDF...")
+            logger.info("Extracting text from PDF")
             reader = PdfReader(tmp_path)
             
             # Extract text from all pages
@@ -236,12 +239,12 @@ class TranscriptService:
             os.unlink(tmp_path)
             
             full_text = "\n\n".join(text_content)
-            print(f"Extracted {len(full_text)} characters from {len(reader.pages)} pages")
+            logger.info("Extracted %d characters from %d pages", len(full_text), len(reader.pages))
             
             return full_text
             
         except Exception as e:
-            print(f"Error downloading/extracting PDF: {e}")
+            logger.warning("Error downloading/extracting PDF: %s", e)
             return f"Error extracting text: {str(e)}"
 
     def validate_api_key(self) -> bool:
@@ -267,7 +270,7 @@ class TranscriptService:
             response.raise_for_status()
             return True
         except Exception as e:
-            print(f"API Validation failed: {e}")
+            logger.warning("API validation failed: %s", e)
             return False
 
     def get_upcoming_calls(self, stock_symbol: str = None) -> List[TranscriptMetadata]:
@@ -320,5 +323,5 @@ class TranscriptService:
             return results
 
         except Exception as e:
-            print(f"Error fetching upcoming calls from Tijori: {e}")
+            logger.warning("Error fetching upcoming calls from Tijori: %s", e)
             return []

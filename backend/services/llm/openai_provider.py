@@ -2,10 +2,13 @@
 OpenAI Provider Implementation.
 Supports GPT-5, GPT-4, GPT-3.5, and o1 thinking models.
 """
+import logging
 from openai import OpenAI
 from typing import List
 import tiktoken
 from .base_provider import BaseLLMProvider, LLMResponse, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 class OpenAIProvider(BaseLLMProvider):
     """OpenAI provider for GPT models."""
@@ -186,7 +189,7 @@ Then provide your comprehensive analysis.
             return models
             
         except Exception as e:
-            print(f"Error fetching OpenAI models: {e}")
+            logger.warning("Error fetching OpenAI models: %s", e)
             # Fallback list if API fails
             return [
                 ModelInfo(
@@ -218,5 +221,5 @@ Then provide your comprehensive analysis.
             self.client.models.list()
             return True
         except Exception as e:
-            print(f"OpenAI API key validation failed: {e}")
+            logger.warning("OpenAI API key validation failed: %s", e)
             return False

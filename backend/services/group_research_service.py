@@ -1,8 +1,11 @@
+import logging
 import threading
 import sqlite3
 import os
 import sys
 import html
+
+logger = logging.getLogger(__name__)
 from datetime import datetime
 from typing import List, Tuple, Dict
 import markdown
@@ -269,7 +272,7 @@ class GroupResearchService:
                     ).start()
 
         except Exception as e:
-            print(f"[GroupResearch] Error scanning groups: {e}")
+            logger.exception("Error scanning groups for research")
         finally:
             conn.close()
 
@@ -425,7 +428,7 @@ class GroupResearchService:
                             is_html=True,
                         )
                     except Exception as e:
-                        print(f"[GroupResearch] Failed to send email to {email}: {e}")
+                        logger.warning("Failed to send group research email to %s: %s", email, e)
 
         except Exception as e:
             update_status("error", f"Unexpected error: {e}")

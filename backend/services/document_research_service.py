@@ -1,6 +1,7 @@
 """
 Document Research Service - Handles annual report fetching and LLM analysis.
 """
+import logging
 import threading
 import sqlite3
 import os
@@ -29,6 +30,8 @@ try:
     HAS_PDF = True
 except ImportError:
     HAS_PDF = False
+
+logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'templates')
 
@@ -338,7 +341,7 @@ Years included: {', '.join(str(y) for y in sorted(document_years, reverse=True))
                             model_name=model_id
                         )
                     except Exception as e:
-                        print(f"[DocumentResearch] Failed to send email to {email}: {e}")
+                        logger.warning("Failed to send research email to %s: %s", email, e)
             
         except Exception as e:
             update_status("error", f"Unexpected error: {e}")

@@ -1,7 +1,10 @@
+import logging
 import sqlite3
 import os
 import sys
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path
 from config import DATABASE_PATH
@@ -31,7 +34,7 @@ class KeyService:
             result = cursor.fetchone()
             return result['api_key'] if result else None
         except Exception as e:
-            print(f"Error fetching API key for {provider_name}: {e}")
+            logger.warning("Error fetching API key for %s: %s", provider_name, e)
             return None
         finally:
             conn.close()
@@ -53,7 +56,7 @@ class KeyService:
             """, (provider_name, api_key))
             conn.commit()
         except Exception as e:
-            print(f"Error setting API key for {provider_name}: {e}")
+            logger.warning("Error setting API key for %s: %s", provider_name, e)
             raise e
         finally:
             conn.close()

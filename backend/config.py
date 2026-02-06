@@ -1,6 +1,7 @@
 """
 Configuration file for backend - PyInstaller compatible
 """
+import logging
 import os
 import sys
 import shutil
@@ -8,6 +9,8 @@ import sqlite3
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 def get_base_dir():
     """Get base directory for bundled resources (read-only in frozen mode)"""
@@ -65,6 +68,7 @@ def _looks_like_database(db_path: Path) -> bool:
         if not db_path.exists():
             return False
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode = WAL")
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stocks'")
         ok = cursor.fetchone() is not None
@@ -129,6 +133,7 @@ def _clear_seeded_data():
         if not DATABASE_PATH.exists():
             return
         conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
         cursor.execute("DELETE FROM watchlist_items")
@@ -136,9 +141,9 @@ def _clear_seeded_data():
         cursor.execute("UPDATE groups SET is_active = 0")
         conn.commit()
         conn.close()
-        print("[Config] Cleared seeded watchlist/groups from bundled DB")
+        logger.info("Cleared seeded watchlist/groups from bundled DB")
     except Exception as e:
-        print(f"[Config] Seed cleanup failed: {e}")
+        logger.warning("Seed cleanup failed: %s", e)
 
 def initialize_user_data():
     """Copy bundled database to user data directory if it doesn't exist"""
@@ -150,14 +155,14 @@ def initialize_user_data():
     if not DATABASE_PATH.exists():
         legacy_db = _find_legacy_db()
         if legacy_db:
-            print(f"[Config] Migrating legacy database from {legacy_db}")
+            logger.info("Migrating legacy database from %s", legacy_db)
             shutil.copy2(legacy_db, DATABASE_PATH)
         elif BUNDLED_DATABASE_PATH.exists():
-            print(f"[Config] Copying database to {DATABASE_PATH}")
+            logger.info("Copying database to %s", DATABASE_PATH)
             shutil.copy2(BUNDLED_DATABASE_PATH, DATABASE_PATH)
             _clear_seeded_data()
         else:
-            print(f"[Config] WARNING: Bundled database not found at {BUNDLED_DATABASE_PATH}")
+            logger.warning("Bundled database not found at %s", BUNDLED_DATABASE_PATH)
     
     # Copy schema if it doesn't exist
     if not SCHEMA_PATH.exists():
@@ -177,6 +182,7 @@ def ensure_schema_migrations():
         return
 
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
     try:
@@ -233,7 +239,7 @@ def ensure_schema_migrations():
         try:
             shutil.copy2(DATABASE_PATH, backup_path)
         except Exception as backup_error:
-            print(f"[Config] Backup failed before migration: {backup_error}")
+            logger.warning("Backup failed before migration: %s", backup_error)
 
         if missing_analysis_status:
             cursor.execute("ALTER TABLE transcripts ADD COLUMN analysis_status TEXT")
@@ -360,7 +366,7 @@ def ensure_schema_migrations():
 
         conn.commit()
     except Exception as e:
-        print(f"[Config] Schema migration failed: {e}")
+        logger.exception("Schema migration failed")
     finally:
         conn.close()
 
@@ -370,6 +376,7 @@ def ensure_data_migrations():
         return
 
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
     try:
@@ -387,7 +394,7 @@ def ensure_data_migrations():
                 WHERE stock_symbol = ? AND isin_number = ?
             """, (correct_isin, symbol, wrong_isin))
             if cursor.rowcount > 0:
-                print(f"[Config] Fixed ISIN for {symbol}: {wrong_isin} -> {correct_isin}")
+                logger.info("Fixed ISIN for %s: %s -> %s", symbol, wrong_isin, correct_isin)
         
         # Cleanup orphaned rows (idempotent)
         cursor.execute("""
@@ -439,7 +446,7 @@ def ensure_data_migrations():
 
         conn.commit()
     except Exception as e:
-        print(f"[Config] Data migration failed: {e}")
+        logger.exception("Data migration failed")
     finally:
         conn.close()
 

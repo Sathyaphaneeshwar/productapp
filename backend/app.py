@@ -3,6 +3,8 @@ from flask_cors import CORS
 import sqlite3
 import os
 import sys
+import logging
+import logging.handlers
 import smtplib
 import html
 import markdown
@@ -10,8 +12,25 @@ from io import BytesIO
 from xhtml2pdf import pisa
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from config import DATABASE_PATH
+from config import DATABASE_PATH, LOG_DIR, LOG_FILE, LOG_FORMAT, LOG_LEVEL
 from db import get_db_connection as _get_db_connection
+
+# Configure logging early, before any service imports start background threads.
+# Writes to both a rotating log file and stderr (captured by Electron).
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.handlers.RotatingFileHandler(
+    str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    handlers=[_file_handler, _stream_handler],
+)
+
+logger = logging.getLogger(__name__)
+
 from services.queue_scheduler_service import QueueSchedulerService
 from services.transcript_fetcher_worker import TranscriptFetcherWorker
 from services.analysis_queue_worker import AnalysisQueueWorker
@@ -52,7 +71,7 @@ def _run_startup_recovery():
         stale_minutes=stale_minutes,
     )
     if any(summary.values()):
-        print(f"[Recovery] Startup recovery summary: {summary}")
+        logger.info("Startup recovery summary: %s", summary)
 
 
 if _should_start_background_workers():
@@ -63,7 +82,7 @@ if _should_start_background_workers():
         analysis_queue_worker.start()
         email_queue_worker.start()
     except Exception as e:
-        print(f"[Scheduler] Queue runtime initialization failed: {e}")
+        logger.exception("Queue runtime initialization failed")
 
 
 def get_db_connection():
@@ -1242,7 +1261,7 @@ Management maintains positive outlook with guided revenue growth of 15-18% for F
                 sent_count += 1
             except Exception as e:
                 error_msg = f"Failed to send to {email}: {str(e)}"
-                print(error_msg)
+                logger.warning("%s", error_msg)
                 errors.append(error_msg)
         
         response = {

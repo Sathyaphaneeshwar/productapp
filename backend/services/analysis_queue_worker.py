@@ -1,7 +1,10 @@
+import logging
 import threading
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
+
+logger = logging.getLogger(__name__)
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.prompt_service import PromptService
@@ -48,7 +51,7 @@ class AnalysisQueueWorker:
             try:
                 self._process_job(job_id)
             except Exception as e:
-                print(f"[AnalysisWorker] Job {job_id} failed: {e}")
+                logger.exception("AnalysisWorker job %s failed", job_id)
 
     def _process_job(self, job_id: int):
         conn = self.get_db_connection()
@@ -223,6 +226,6 @@ class AnalysisQueueWorker:
                     (message[:500], transcript_id),
                 )
             conn.commit()
-            print(f"[AnalysisWorker] Job {job_id} error: {e}")
+            logger.warning("AnalysisWorker job %s error: %s", job_id, e)
         finally:
             conn.close()

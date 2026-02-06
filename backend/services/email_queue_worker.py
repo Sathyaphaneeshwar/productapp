@@ -1,7 +1,10 @@
+import logging
 import threading
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
+
+logger = logging.getLogger(__name__)
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.email_service import EmailService
@@ -42,7 +45,7 @@ class EmailQueueWorker:
             try:
                 self._process_job(outbox_id)
             except Exception as e:
-                print(f"[EmailWorker] Job {outbox_id} failed: {e}")
+                logger.exception("EmailWorker job %s failed", outbox_id)
 
     def _process_job(self, outbox_id: int):
         conn = self.get_db_connection()
@@ -128,6 +131,6 @@ class EmailQueueWorker:
                 (attempts, retry_next_at, outbox_id),
             )
             conn.commit()
-            print(f"[EmailWorker] Job {outbox_id} error: {e}")
+            logger.warning("EmailWorker job %s error: %s", outbox_id, e)
         finally:
             conn.close()

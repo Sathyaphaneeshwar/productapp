@@ -1,6 +1,8 @@
 """
 Google AI Studio (Gemini) Provider Implementation.
 """
+import logging
+
 try:
     from google import genai
     from google.genai import types
@@ -11,6 +13,8 @@ except ImportError:
 
 from typing import List
 from .base_provider import BaseLLMProvider, LLMResponse, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 class GoogleAIProvider(BaseLLMProvider):
     """Google AI Studio provider for Gemini models."""
@@ -195,7 +199,7 @@ class GoogleAIProvider(BaseLLMProvider):
             return models
             
         except Exception as e:
-            print(f"Error fetching Google AI models: {e}")
+            logger.warning("Error fetching Google AI models: %s", e)
             # Fallback to known models if list fails or returns empty
             return [
                 ModelInfo(
@@ -227,5 +231,5 @@ class GoogleAIProvider(BaseLLMProvider):
             list(genai.list_models())
             return True
         except Exception as e:
-            print(f"Google AI API key validation failed: {e}")
+            logger.warning("Google AI API key validation failed: %s", e)
             return False

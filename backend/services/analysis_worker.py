@@ -14,6 +14,10 @@ from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
 from services.email_service import EmailService
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 class AnalysisWorker:
     def __init__(self):
         self.prompt_service = PromptService()
@@ -73,7 +77,7 @@ class AnalysisWorker:
         """
         Internal method running in background thread.
         """
-        print(f"[{job_id}] Starting analysis for stock {stock_id}")
+        logger.info("[%s] Starting analysis for stock %s", job_id, stock_id)
         conn = self.get_db_connection()
         cursor = conn.cursor()
         
@@ -82,24 +86,24 @@ class AnalysisWorker:
             cursor.execute("SELECT stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
             stock = cursor.fetchone()
             if not stock:
-                print(f"[{job_id}] Stock not found!")
+                logger.warning("[%s] Stock not found", job_id)
                 return
 
             # Only analyze stocks that are currently in the watchlist
             cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
             if cursor.fetchone() is None:
-                print(f"[{job_id}] Stock {stock_id} not in watchlist; skipping analysis job.")
+                logger.info("[%s] Stock %s not in watchlist; skipping analysis job", job_id, stock_id)
                 return
 
             if self._is_in_active_group(cursor, stock_id):
-                print(f"[{job_id}] Stock {stock_id} is in an active group; skipping analysis job.")
+                logger.info("[%s] Stock %s is in an active group; skipping analysis job", job_id, stock_id)
                 return
             
             symbol = stock['stock_symbol'] or stock['bse_code']
             if not symbol:
-                print(f"[{job_id}] No symbol/bse_code found for stock {stock_id}")
+                logger.warning("[%s] No symbol/bse_code found for stock %s", job_id, stock_id)
                 return
-            print(f"[{job_id}] Processing symbol: {symbol}")
+            logger.info("[%s] Processing symbol: %s", job_id, symbol)
 
             # 2. Resolve which transcript to analyze
             transcript_id = None
@@ -118,7 +122,7 @@ class AnalysisWorker:
                     analysis_started = True
 
             if quarter and year:
-                print(f"[{job_id}] Using requested quarter/year: {quarter} {year}")
+                logger.info("[%s] Using requested quarter/year: %s %s", job_id, quarter, year)
                 cursor.execute("""
                     SELECT id, quarter, year, source_url, status 
                     FROM transcripts 
@@ -128,19 +132,19 @@ class AnalysisWorker:
                 transcript_row = cursor.fetchone()
 
                 if not transcript_row:
-                    print(f"[{job_id}] Transcript not found for {symbol} {quarter} {year}")
+                    logger.warning("[%s] Transcript not found for %s %s %s", job_id, symbol, quarter, year)
                     return
 
                 if transcript_row['status'] != 'available':
-                    print(f"[{job_id}] Transcript not available (status={transcript_row['status']}) for {symbol} {quarter} {year}")
+                    logger.warning("[%s] Transcript not available (status=%s) for %s %s %s", job_id, transcript_row['status'], symbol, quarter, year)
                     return
 
                 if not transcript_row['source_url']:
-                    print(f"[{job_id}] Transcript has no source_url for {symbol} {quarter} {year}")
+                    logger.warning("[%s] Transcript has no source_url for %s %s %s", job_id, symbol, quarter, year)
                     return
 
                 if not force and self._analysis_exists_for_quarter(cursor, stock_id, transcript_row['quarter'], transcript_row['year']):
-                    print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
+                    logger.debug("[%s] Analysis already exists for %s %s %s; skipping", job_id, symbol, quarter, year)
                     return
 
                 transcript_id = transcript_row['id']
@@ -153,30 +157,30 @@ class AnalysisWorker:
                     SELECT id FROM transcript_analyses WHERE transcript_id = ?
                 """, (transcript_id,))
                 if cursor.fetchone() and not force:
-                    print(f"[{job_id}] Analysis already exists for {symbol} {quarter} {year}, skipping to prevent duplicate email")
+                    logger.debug("[%s] Analysis already exists for %s %s %s; skipping", job_id, symbol, quarter, year)
                     return
 
                 mark_analysis_in_progress()
-                print(f"[{job_id}] Downloading and extracting text...")
+                logger.info("[%s] Downloading and extracting text...", job_id)
                 transcript_text = self.transcript_service.download_and_extract(transcript_row['source_url'])
 
             else:
                 # Fallback to latest transcript from provider
-                print(f"[{job_id}] Fetching transcripts for {symbol}...")
+                logger.info("[%s] Fetching transcripts for %s...", job_id, symbol)
                 transcripts = self.transcript_service.fetch_available_transcripts(symbol)
                 
                 if not transcripts:
-                    print(f"[{job_id}] No transcripts found for {symbol}")
+                    logger.warning("[%s] No transcripts found for %s", job_id, symbol)
                     return
 
                 latest_transcript = transcripts[0]
                 target_quarter = latest_transcript.quarter
                 target_year = latest_transcript.year
                 transcript_source_url = latest_transcript.source_url
-                print(f"[{job_id}] Found transcript: {latest_transcript.title}")
+                logger.info("[%s] Found transcript: %s", job_id, latest_transcript.title)
 
                 if not force and self._analysis_exists_for_quarter(cursor, stock_id, target_quarter, target_year):
-                    print(f"[{job_id}] Analysis already exists for {symbol} {target_quarter} {target_year}, skipping to prevent duplicate email")
+                    logger.debug("[%s] Analysis already exists for %s %s %s; skipping", job_id, symbol, target_quarter, target_year)
                     return
 
                 # Check if we already have a transcript for this quarter/year combination
@@ -189,9 +193,9 @@ class AnalysisWorker:
                 transcript_row = cursor.fetchone()
                 
                 if not transcript_row:
-                    print(f"[{job_id}] Downloading and extracting text...")
+                    logger.info("[%s] Downloading and extracting text...", job_id)
                     transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
-                    
+
                     # Save to DB - set status to 'available' since we have a valid source_url
                     cursor.execute("""
                         INSERT INTO transcripts (stock_id, quarter, year, source_url, status, content_path)
@@ -201,7 +205,7 @@ class AnalysisWorker:
                     transcript_id = cursor.lastrowid
                     mark_analysis_in_progress()
                 else:
-                    print(f"[{job_id}] Using existing transcript record.")
+                    logger.info("[%s] Using existing transcript record", job_id)
                     transcript_id = transcript_row['id']
                     
                     # Check if analysis already exists for this transcript (prevents duplicate emails)
@@ -209,14 +213,14 @@ class AnalysisWorker:
                         SELECT id FROM transcript_analyses WHERE transcript_id = ?
                     """, (transcript_id,))
                     if cursor.fetchone() and not force:
-                        print(f"[{job_id}] Analysis already exists for {symbol} {latest_transcript.quarter} {latest_transcript.year}, skipping to prevent duplicate email")
+                        logger.debug("[%s] Analysis already exists for %s %s %s; skipping", job_id, symbol, latest_transcript.quarter, latest_transcript.year)
                         return
                     
                     mark_analysis_in_progress()
                     # Update source_url if it changed (API might return new URL for same quarter)
                     # Also ensure status is 'available' since we have a valid transcript URL
                     if transcript_row['source_url'] != latest_transcript.source_url:
-                        print(f"[{job_id}] Updating transcript URL and status (changed from API)...")
+                        logger.info("[%s] Updating transcript URL and status (changed from API)...", job_id)
                         cursor.execute("""
                         UPDATE transcripts SET source_url = ?, status = 'available' WHERE id = ?
                     """, (latest_transcript.source_url, transcript_id))
@@ -230,16 +234,16 @@ class AnalysisWorker:
                     transcript_source_url = latest_transcript.source_url
                     
                     # Re-download text for analysis
-                    print(f"[{job_id}] Downloading text for analysis...")
+                    logger.info("[%s] Downloading text for analysis...", job_id)
                     transcript_text = self.transcript_service.download_and_extract(latest_transcript.source_url)
 
             # 3. Resolve Prompt
-            print(f"[{job_id}] Resolving prompt...")
+            logger.info("[%s] Resolving prompt...", job_id)
             system_prompt = self.prompt_service.resolve_prompt(stock_id)
-            print(f"[{job_id}] Prompt resolved: {system_prompt[:50]}...")
+            logger.debug("[%s] Prompt resolved (length=%d)", job_id, len(system_prompt))
 
             # 4. Call LLM
-            print(f"[{job_id}] Calling LLM...")
+            logger.info("[%s] Calling LLM...", job_id)
             
             try:
                 llm_response = self.llm_service.generate(
@@ -253,11 +257,11 @@ class AnalysisWorker:
                 provider_name = llm_response.provider_name
                 
             except Exception as e:
-                print(f"[{job_id}] LLM generation failed: {e}")
+                logger.exception("[%s] LLM generation failed", job_id)
                 raise e
 
             # 5. Save Results
-            print(f"[{job_id}] Saving results...")
+            logger.info("[%s] Saving results...", job_id)
             cursor.execute("""
                 INSERT INTO transcript_analyses (transcript_id, prompt_snapshot, llm_output, model_provider)
                 VALUES (?, ?, ?, ?)
@@ -277,12 +281,12 @@ class AnalysisWorker:
                 conn.commit()
             
             # 6. Send Email
-            print(f"[{job_id}] Sending emails...")
+            logger.info("[%s] Sending emails...", job_id)
             email_list = self.email_service.get_active_email_list()
             if email_list:
                 cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
                 if cursor.fetchone() is None:
-                    print(f"[{job_id}] Stock {stock_id} not in watchlist; skipping analysis emails.")
+                    logger.info("[%s] Stock %s not in watchlist; skipping analysis emails", job_id, stock_id)
                 else:
                     # Get stock name
                     cursor.execute("SELECT stock_name FROM stocks WHERE id = ?", (stock_id,))
@@ -304,17 +308,17 @@ class AnalysisWorker:
                                 model_name=model_name,
                                 transcript_url=transcript_source_url
                             )
-                            print(f"[{job_id}] Email sent to {email}")
+                            logger.info("[%s] Email sent to %s", job_id, email)
                         except Exception as e:
-                            print(f"[{job_id}] Failed to send email to {email}: {e}")
+                            logger.warning("[%s] Failed to send email to %s: %s", job_id, email, e)
             else:
-                print(f"[{job_id}] No active email recipients found.")
+                logger.info("[%s] No active email recipients found", job_id)
             conn.commit()
             
-            print(f"[{job_id}] Job complete.")
+            logger.info("[%s] Job complete", job_id)
 
         except Exception as e:
-            print(f"[{job_id}] Job failed: {e}")
+            logger.exception("[%s] Job failed", job_id)
             if transcript_id and not analysis_completed:
                 try:
                     error_message = str(e)
@@ -323,8 +327,6 @@ class AnalysisWorker:
                     self._set_analysis_status(cursor, transcript_id, 'error', error_message)
                     conn.commit()
                 except Exception as status_error:
-                    print(f"[{job_id}] Failed to record analysis error: {status_error}")
-            import traceback
-            traceback.print_exc()
+                    logger.warning("[%s] Failed to record analysis error: %s", job_id, status_error)
         finally:
             conn.close()
