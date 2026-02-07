@@ -99,6 +99,33 @@ const parseApiTimestamp = (value?: string | null): Date | null => {
     return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
+const getFallbackQuarter = (): Quarter => {
+    const now = new Date()
+    const month = now.getMonth() + 1
+    const year = now.getFullYear()
+    let quarter = 'Q3'
+    let fiscalYear = year
+    if (month >= 4 && month <= 6) {
+        quarter = 'Q4'
+        fiscalYear = year
+    } else if (month >= 7 && month <= 9) {
+        quarter = 'Q1'
+        fiscalYear = year + 1
+    } else if (month >= 10 && month <= 12) {
+        quarter = 'Q2'
+        fiscalYear = year + 1
+    } else {
+        quarter = 'Q3'
+        fiscalYear = year
+    }
+    const monthRange = { Q1: 'Apr-Jun', Q2: 'Jul-Sep', Q3: 'Oct-Dec', Q4: 'Jan-Mar' }[quarter]
+    return {
+        quarter,
+        year: fiscalYear,
+        label: `${quarter} FY${String(fiscalYear).slice(-2)} (${monthRange})`
+    }
+}
+
 export default function Watchlist() {
     const [stocks, setStocks] = useState<Stock[]>([])
     const [searchQuery, setSearchQuery] = useState('')
@@ -166,8 +193,8 @@ export default function Watchlist() {
     }
 
     const refreshWatchlist = async (quarterOverride?: string, yearOverride?: number) => {
-        const quarter = quarterOverride ?? selectedQuarterRef.current?.quarter
-        const year = yearOverride ?? selectedQuarterRef.current?.year
+        const quarter = quarterOverride ?? selectedQuarterRef.current?.quarter ?? quarters[0]?.quarter
+        const year = yearOverride ?? selectedQuarterRef.current?.year ?? quarters[0]?.year
 
         watchlistAbortRef.current?.abort()
         const controller = new AbortController()
@@ -196,21 +223,49 @@ export default function Watchlist() {
 
     // Fetch quarters on mount
     useEffect(() => {
-        const fetchQuarters = async () => {
+        let cancelled = false
+        let retryTimer: number | null = null
+
+        const applyFallbackQuarter = () => {
+            if (cancelled) return
+            const fallbackQuarter = getFallbackQuarter()
+            setQuarters(prev => (prev.length > 0 ? prev : [fallbackQuarter]))
+            setSelectedQuarter(prev => prev ?? fallbackQuarter)
+        }
+
+        const fetchQuarters = async (attempt = 0) => {
             try {
                 const response = await fetch(`${API_URL}/quarters`)
-                if (response.ok) {
-                    const data = await response.json()
-                    setQuarters(data)
-                    if (data.length > 0) {
-                        setSelectedQuarter(data[0]) // Default to first (previous quarter)
-                    }
+                if (!response.ok) {
+                    throw new Error(`Quarter API failed with status ${response.status}`)
                 }
+                const data = await response.json()
+                if (!Array.isArray(data) || data.length === 0) {
+                    throw new Error('Quarter API returned no data')
+                }
+                if (cancelled) return
+                setQuarters(data)
+                setSelectedQuarter(prev => prev ?? data[0]) // Default to first (previous quarter)
             } catch (error) {
                 console.error('Error fetching quarters:', error)
+                if (attempt < 5) {
+                    retryTimer = window.setTimeout(() => {
+                        void fetchQuarters(attempt + 1)
+                    }, 1500)
+                } else {
+                    applyFallbackQuarter()
+                }
             }
         }
-        fetchQuarters()
+
+        void fetchQuarters()
+
+        return () => {
+            cancelled = true
+            if (retryTimer) {
+                clearTimeout(retryTimer)
+            }
+        }
     }, [])
 
     // Fetch watchlist when quarter changes
@@ -346,10 +401,12 @@ export default function Watchlist() {
         if (!stock.id) return
         setReanalyzingId(stock.id)
 
+        const activeQuarter = selectedQuarterRef.current ?? selectedQuarter ?? quarters[0] ?? null
+
         // Get the current analyzed_at timestamp before triggering reanalysis
         const previousAnalyzedAt = stock.status_details?.analyzed_at
-        reanalyzeContextRef.current = selectedQuarter
-            ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year }
+        reanalyzeContextRef.current = activeQuarter
+            ? { quarter: activeQuarter.quarter, year: activeQuarter.year }
             : null
 
         // Optimistically update status to 'analyzing'
@@ -362,7 +419,7 @@ export default function Watchlist() {
         try {
             const payload = {
                 force: true,
-                ...(selectedQuarter ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year } : {})
+                ...(activeQuarter ? { quarter: activeQuarter.quarter, year: activeQuarter.year } : {})
             }
 
             const response = await fetch(`${API_URL}/analyze/${stock.id}`, {

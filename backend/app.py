@@ -1491,20 +1491,43 @@ def trigger_analysis(stock_id):
         transcript_id = transcript['id']
     else:
         cursor.execute("""
-            SELECT id, status, source_url
+            SELECT id, quarter, year, status, source_url
             FROM transcripts
             WHERE stock_id = ? AND status = 'available'
             ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
             LIMIT 1
         """, (stock_id,))
         transcript = cursor.fetchone()
-        if not transcript:
+        if transcript and transcript['source_url']:
+            transcript_id = transcript['id']
+        else:
+            cursor.execute("""
+                SELECT quarter, year, status
+                FROM transcripts
+                WHERE stock_id = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                LIMIT 1
+            """, (stock_id,))
+            latest = cursor.fetchone()
+            if latest:
+                target_quarter = latest['quarter']
+                target_year = latest['year']
+                transcript_status = latest['status'] or 'none'
+            else:
+                target_quarter, target_year = get_previous_fy_quarter()
+                transcript_status = 'none'
             conn.close()
-            return jsonify({'error': 'No available transcript found to analyze'}), 404
-        if not transcript['source_url']:
-            conn.close()
-            return jsonify({'error': 'Transcript has no source_url to analyze'}), 422
-        transcript_id = transcript['id']
+            try:
+                queue_scheduler.trigger_for_stock(stock_id, quarter=target_quarter, year=target_year)
+            except Exception as e:
+                return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
+            return jsonify({
+                'message': f'Transcript check triggered for {target_quarter} {target_year}',
+                'status': 'fetching_transcript',
+                'quarter': target_quarter,
+                'year': target_year,
+                'transcript_status': transcript_status
+            }), 202
 
     conn.close()
     
