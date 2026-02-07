@@ -25,11 +25,12 @@ class AnalysisJobService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT source_url FROM transcripts WHERE id = ?", (transcript_id,))
+            cursor.execute("SELECT source_url, status FROM transcripts WHERE id = ?", (transcript_id,))
             row = cursor.fetchone()
             if not row:
                 return None
             source_url = row["source_url"]
+            transcript_status = row["status"]
 
             if not force:
                 cursor.execute(
@@ -70,9 +71,20 @@ class AnalysisJobService:
                     recover_legacy_group_block = "active group" in analysis_error
 
                 allowed_statuses = ["pending", "retrying"]
+                recover_error_for_available = False
+                if existing_status == "error" and transcript_status == "available" and source_url and not force:
+                    cursor.execute(
+                        "SELECT 1 FROM transcript_analyses WHERE transcript_id = ? LIMIT 1",
+                        (transcript_id,),
+                    )
+                    recover_error_for_available = cursor.fetchone() is None
+
                 if recover_legacy_group_block:
                     # Legacy group-blocked/error jobs should be runnable now.
                     allowed_statuses.extend(["blocked_group", "error"])
+                elif recover_error_for_available:
+                    # Allow old terminal errors to recover when transcript is now available.
+                    allowed_statuses.append("error")
                 status_placeholders = ",".join("?" for _ in allowed_statuses)
                 update_result = cursor.execute(
                     f"""

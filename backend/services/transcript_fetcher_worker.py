@@ -56,7 +56,14 @@ class TranscriptFetcherWorker:
             (stock_id, status),
         )
 
-    def _compute_next_check(self, status: str, event_date: str, attempts: int) -> datetime:
+    def _compute_next_check(
+        self,
+        status: str,
+        event_date: str,
+        attempts: int,
+        *,
+        is_watchlist_stock: bool = False,
+    ) -> datetime:
         now = datetime.now(timezone.utc)
 
         def as_utc_naive(value: datetime) -> datetime:
@@ -81,6 +88,9 @@ class TranscriptFetcherWorker:
                     return as_utc_naive(now + timedelta(minutes=60))
         if status == "error":
             backoff = compute_backoff_seconds(attempts)
+            # Keep watchlist retries responsive even when transient errors occur.
+            if is_watchlist_stock:
+                backoff = min(backoff, 10 * 60)
             return as_utc_naive(now + timedelta(seconds=backoff))
         return as_utc_naive(now + timedelta(hours=4))
 
@@ -244,6 +254,8 @@ class TranscriptFetcherWorker:
             conn.commit()
 
         except Exception as e:
+            cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+            is_watchlist_stock = cursor.fetchone() is not None
             cursor.execute(
                 """
                 SELECT attempts FROM transcript_fetch_schedule
@@ -253,7 +265,12 @@ class TranscriptFetcherWorker:
             )
             sched = cursor.fetchone()
             attempts = (sched["attempts"] if sched else 0) + 1
-            next_check_at = self._compute_next_check("error", None, attempts)
+            next_check_at = self._compute_next_check(
+                "error",
+                None,
+                attempts,
+                is_watchlist_stock=is_watchlist_stock,
+            )
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
