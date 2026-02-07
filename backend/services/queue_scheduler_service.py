@@ -8,6 +8,7 @@ from config import DATABASE_PATH
 from db import get_db_connection
 from services.queue_service import QueueService
 from services.group_research_service import GroupResearchService
+from services.analysis_job_service import AnalysisJobService
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class QueueSchedulerService:
     def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 5, group_check_seconds: int = 300):
         self.queue = QueueService()
         self.group_research_service = GroupResearchService()
+        self.analysis_job_service = AnalysisJobService()
         self.running = False
         self.thread = None
         self.schedule_sync_seconds = schedule_sync_seconds
@@ -272,6 +274,48 @@ class QueueSchedulerService:
             except Exception as e:
                 logger.warning("Failed to enqueue email job %s: %s", outbox_id, e)
 
+    def _catchup_watchlist_analysis(self, quarter: str, year: int):
+        """Find watchlist stocks that have an available transcript but no
+        individual analysis and no pending analysis job, then enqueue them.
+
+        This covers edge cases where a transcript was stored (e.g. via a group
+        schedule) before the stock was added to the watchlist, so the normal
+        auto-trigger in transcript_fetcher_worker never fired.
+        """
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT t.id AS transcript_id
+                FROM watchlist_items w
+                JOIN transcripts t ON t.stock_id = w.stock_id
+                                  AND t.quarter = ? AND t.year = ?
+                                  AND t.status = 'available'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM transcript_analyses ta
+                    WHERE ta.transcript_id = t.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM analysis_jobs aj
+                    WHERE aj.transcript_id = t.id
+                      AND aj.status IN ('pending', 'queued', 'in_progress', 'retrying')
+                )
+                """,
+                (quarter, year),
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        for row in rows:
+            try:
+                self.analysis_job_service.enqueue_for_transcript(row["transcript_id"])
+                logger.info("Catchup: enqueued analysis for transcript %s", row["transcript_id"])
+            except Exception as e:
+                logger.warning("Catchup: failed to enqueue analysis for transcript %s: %s",
+                               row["transcript_id"], e)
+
     def _maybe_trigger_group_research(self, quarter: str, year: int):
         conn = self.get_db_connection()
         cursor = conn.cursor()
@@ -360,6 +404,7 @@ class QueueSchedulerService:
 
                 if now >= next_schedule_sync:
                     self._sync_schedule(quarter, year)
+                    self._catchup_watchlist_analysis(quarter, year)
                     self.last_schedule_sync = now
                     next_schedule_sync = now + timedelta(seconds=self.schedule_sync_seconds)
 

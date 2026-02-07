@@ -444,39 +444,15 @@ def get_watchlist():
                         }
                     }
                 else:
-                    # Check if this stock was analyzed via group research
-                    cursor.execute("""
-                        SELECT grr.status, grr.created_at, g.name AS group_name
-                        FROM group_research_runs grr
-                        JOIN groups g ON g.id = grr.group_id
-                        JOIN group_stocks gs ON gs.group_id = g.id
-                        WHERE gs.stock_id = ? AND grr.quarter = ? AND grr.year = ?
-                          AND grr.status = 'done'
-                        ORDER BY grr.created_at DESC
-                        LIMIT 1
-                    """, (stock_id, transcript['quarter'], transcript['year']))
-                    group_analysis = cursor.fetchone()
-                    if group_analysis:
-                        status_info = {
-                            'status': 'analyzed_by_group',
-                            'message': f"Group Analyzed ({transcript['quarter']} {transcript['year']})",
-                            'details': {
-                                'quarter': transcript['quarter'],
-                                'year': transcript['year'],
-                                'analyzed_at': group_analysis['created_at'],
-                                'group_name': group_analysis['group_name']
-                            }
+                    status_info = {
+                        'status': 'transcript_ready',
+                        'message': f"Transcript Available ({transcript['quarter']} {transcript['year']})",
+                        'details': {
+                            'quarter': transcript['quarter'],
+                            'year': transcript['year'],
+                            'transcript_date': transcript['created_at']
                         }
-                    else:
-                        status_info = {
-                            'status': 'transcript_ready',
-                            'message': f"Transcript Available ({transcript['quarter']} {transcript['year']})",
-                            'details': {
-                                'quarter': transcript['quarter'],
-                                'year': transcript['year'],
-                                'transcript_date': transcript['created_at']
-                            }
-                        }
+                    }
         elif row['transcript_check_status'] == 'checking':
             status_info = {
                 'status': 'fetching',
