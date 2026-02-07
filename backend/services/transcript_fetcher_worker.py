@@ -84,21 +84,19 @@ class TranscriptFetcherWorker:
 
         if status == "available":
             return as_utc_naive(now + timedelta(hours=12))
-        if status == "upcoming" and event_date:
-            try:
-                event_dt = datetime.fromisoformat(str(event_date).replace("Z", "+00:00"))
-            except Exception:
-                event_dt = None
-            if event_dt:
-                if event_dt.tzinfo is None:
-                    event_dt = event_dt.replace(tzinfo=timezone.utc)
-                else:
-                    event_dt = event_dt.astimezone(timezone.utc)
-                delta = event_dt - now
-                if delta.total_seconds() <= 24 * 3600:
-                    return as_utc_naive(now + timedelta(minutes=10))
-                if delta.total_seconds() <= 7 * 24 * 3600:
-                    return as_utc_naive(now + timedelta(minutes=60))
+        if status == "upcoming":
+            # Upcoming cadence rules:
+            # - Before event day: hourly checks
+            # - Event day and after scheduled time: every 10 minutes
+            # - Missing/invalid event date: stay aggressive at 10 minutes
+            event_dt = self._parse_event_dt(event_date)
+            if event_dt is None:
+                return as_utc_naive(now + timedelta(minutes=10))
+            if event_dt <= now:
+                return as_utc_naive(now + timedelta(minutes=10))
+            if event_dt.date() == now.date():
+                return as_utc_naive(now + timedelta(minutes=10))
+            return as_utc_naive(now + timedelta(hours=1))
         if status == "error":
             backoff = compute_backoff_seconds(attempts)
             # Keep watchlist retries responsive even when transient errors occur.
@@ -253,29 +251,14 @@ class TranscriptFetcherWorker:
                 )
                 conn.commit()
             else:
-                # API can temporarily return neither available nor upcoming right after a
-                # call is recorded. Keep fast rechecks for a short post-event window, then
-                # clear stale upcoming state so UI doesn't look permanently stuck.
-                fallback_event_date = existing["event_date"] if existing else None
-                fallback_event_dt = self._parse_event_dt(fallback_event_date)
-                now_utc = datetime.now(timezone.utc)
-
-                if fallback_event_dt and (now_utc - fallback_event_dt) <= timedelta(hours=24):
+                # If API temporarily returns neither list, keep an existing upcoming row
+                # in upcoming state so polling stays active until transcript appears.
+                if existing and existing["status"] == "upcoming":
                     schedule_status = "upcoming"
-                    event_date = fallback_event_date
+                    event_date = existing["event_date"]
                 else:
                     schedule_status = "none"
                     event_date = None
-                    if existing and existing["status"] == "upcoming":
-                        cursor.execute(
-                            """
-                            UPDATE transcripts
-                            SET status = 'none', updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                            """,
-                            (existing["id"],),
-                        )
-                        conn.commit()
 
                 cursor.execute(
                     """
