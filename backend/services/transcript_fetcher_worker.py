@@ -56,6 +56,19 @@ class TranscriptFetcherWorker:
             (stock_id, status),
         )
 
+    def _parse_event_dt(self, value):
+        if not value:
+            return None
+        try:
+            event_dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if event_dt.tzinfo is None:
+            event_dt = event_dt.replace(tzinfo=timezone.utc)
+        else:
+            event_dt = event_dt.astimezone(timezone.utc)
+        return event_dt
+
     def _compute_next_check(
         self,
         status: str,
@@ -113,6 +126,17 @@ class TranscriptFetcherWorker:
             if not symbol:
                 return
 
+            cursor.execute(
+                """
+                SELECT id, status, source_url, event_date
+                FROM transcripts
+                WHERE stock_id = ? AND quarter = ? AND year = ?
+                LIMIT 1
+                """,
+                (stock_id, quarter, year),
+            )
+            existing = cursor.fetchone()
+
             self._mark_check_status(cursor, stock_id, "checking")
             conn.commit()
 
@@ -128,17 +152,6 @@ class TranscriptFetcherWorker:
             if available:
                 transcript = available[0]
                 schedule_status = "available"
-
-                cursor.execute(
-                    """
-                    SELECT id, status, source_url
-                    FROM transcripts
-                    WHERE stock_id = ? AND quarter = ? AND year = ?
-                    LIMIT 1
-                    """,
-                    (stock_id, quarter, year),
-                )
-                existing = cursor.fetchone()
                 if not existing:
                     cursor.execute(
                         """
@@ -149,6 +162,12 @@ class TranscriptFetcherWorker:
                     )
                     conn.commit()
                     transcript_id = cursor.lastrowid
+                    existing = {
+                        "id": transcript_id,
+                        "status": "available",
+                        "source_url": transcript.source_url,
+                        "event_date": None,
+                    }
                 else:
                     transcript_id = existing["id"]
                     if existing["status"] != "available" or existing["source_url"] != transcript.source_url:
@@ -161,6 +180,12 @@ class TranscriptFetcherWorker:
                             (transcript.source_url, transcript_id),
                         )
                         conn.commit()
+                        existing = {
+                            "id": transcript_id,
+                            "status": "available",
+                            "source_url": transcript.source_url,
+                            "event_date": existing["event_date"],
+                        }
 
                 cursor.execute(
                     """
@@ -181,16 +206,6 @@ class TranscriptFetcherWorker:
                 call = upcoming[0]
                 schedule_status = "upcoming"
                 event_date = call.event_date
-                cursor.execute(
-                    """
-                    SELECT id, status, source_url, event_date
-                    FROM transcripts
-                    WHERE stock_id = ? AND quarter = ? AND year = ?
-                    LIMIT 1
-                    """,
-                    (stock_id, quarter, year),
-                )
-                existing = cursor.fetchone()
                 if not existing:
                     cursor.execute(
                         """
@@ -200,6 +215,12 @@ class TranscriptFetcherWorker:
                         (stock_id, quarter, year, call.event_date),
                     )
                     conn.commit()
+                    existing = {
+                        "id": cursor.lastrowid,
+                        "status": "upcoming",
+                        "source_url": None,
+                        "event_date": call.event_date,
+                    }
                 elif existing["status"] == "available" and existing["source_url"]:
                     # Keep available transcripts authoritative even if the upcoming API
                     # also returns a matching row for the same quarter/year.
@@ -216,6 +237,12 @@ class TranscriptFetcherWorker:
                             (call.event_date, existing["id"]),
                         )
                         conn.commit()
+                        existing = {
+                            "id": existing["id"],
+                            "status": "upcoming",
+                            "source_url": existing["source_url"],
+                            "event_date": call.event_date,
+                        }
 
                 cursor.execute(
                     """
@@ -223,6 +250,39 @@ class TranscriptFetcherWorker:
                     VALUES (?, ?, ?, 'upcoming', ?, 'poll')
                     """,
                     (stock_id, quarter, year, call.event_date),
+                )
+                conn.commit()
+            else:
+                # API can temporarily return neither available nor upcoming right after a
+                # call is recorded. Keep fast rechecks for a short post-event window, then
+                # clear stale upcoming state so UI doesn't look permanently stuck.
+                fallback_event_date = existing["event_date"] if existing else None
+                fallback_event_dt = self._parse_event_dt(fallback_event_date)
+                now_utc = datetime.now(timezone.utc)
+
+                if fallback_event_dt and (now_utc - fallback_event_dt) <= timedelta(hours=24):
+                    schedule_status = "upcoming"
+                    event_date = fallback_event_date
+                else:
+                    schedule_status = "none"
+                    event_date = None
+                    if existing and existing["status"] == "upcoming":
+                        cursor.execute(
+                            """
+                            UPDATE transcripts
+                            SET status = 'none', updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (existing["id"],),
+                        )
+                        conn.commit()
+
+                cursor.execute(
+                    """
+                    INSERT INTO transcript_events (stock_id, quarter, year, status, event_date, origin)
+                    VALUES (?, ?, ?, ?, ?, 'poll')
+                    """,
+                    (stock_id, quarter, year, schedule_status, event_date),
                 )
                 conn.commit()
 
