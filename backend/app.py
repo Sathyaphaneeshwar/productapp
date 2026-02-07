@@ -3,6 +3,7 @@ from flask_cors import CORS
 import sqlite3
 import os
 import sys
+import time
 from datetime import datetime, timezone
 import smtplib
 import html
@@ -90,6 +91,28 @@ def _to_utc_iso(value):
     else:
         dt = dt.astimezone(timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def _is_db_locked_error(error: Exception) -> bool:
+    return isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower()
+
+
+def _trigger_stock_fetch_with_retry(
+    stock_id: int,
+    *,
+    quarter: str = None,
+    year: int = None,
+    max_attempts: int = 5,
+):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            queue_scheduler.trigger_for_stock(stock_id, quarter=quarter, year=year)
+            return
+        except Exception as e:
+            if _is_db_locked_error(e) and attempt < max_attempts:
+                time.sleep(0.15 * attempt)
+                continue
+            raise
 
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
@@ -505,7 +528,7 @@ def add_to_watchlist():
         conn.commit()
 
         # Kick off immediate transcript check instead of waiting for the next poll
-        queue_scheduler.trigger_for_stock(stock['id'])
+        _trigger_stock_fetch_with_retry(stock['id'])
         return jsonify({'message': 'Added to watchlist'}), 201
         
     except sqlite3.IntegrityError:
@@ -517,24 +540,29 @@ def add_to_watchlist():
 
 @app.route('/api/watchlist/<symbol>', methods=['DELETE'])
 def remove_from_watchlist(symbol):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Get stock ID first - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
-        stock = cursor.fetchone()
-        
-        if stock:
-            cursor.execute("DELETE FROM watchlist_items WHERE stock_id = ?", (stock['id'],))
-            conn.commit()
-            
-        return jsonify({'message': 'Removed from watchlist'}), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    finally:
-        conn.close()
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Get stock ID first - check both NSE symbol and BSE code
+            cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+            stock = cursor.fetchone()
+
+            if stock:
+                cursor.execute("DELETE FROM watchlist_items WHERE stock_id = ?", (stock['id'],))
+                conn.commit()
+
+            return jsonify({'message': 'Removed from watchlist'}), 200
+        except Exception as e:
+            if _is_db_locked_error(e) and attempt < max_attempts:
+                time.sleep(0.15 * attempt)
+                continue
+            return jsonify({'error': str(e)}), 500
+        finally:
+            conn.close()
+
+    return jsonify({'error': 'Database is busy, please retry'}), 503
 
 # Groups API Endpoints
 
@@ -1478,7 +1506,7 @@ def trigger_analysis(stock_id):
         if needs_fetch:
             conn.close()
             try:
-                queue_scheduler.trigger_for_stock(stock_id, quarter=quarter, year=year)
+                _trigger_stock_fetch_with_retry(stock_id, quarter=quarter, year=year)
             except Exception as e:
                 return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
             return jsonify({
@@ -1518,7 +1546,7 @@ def trigger_analysis(stock_id):
                 transcript_status = 'none'
             conn.close()
             try:
-                queue_scheduler.trigger_for_stock(stock_id, quarter=target_quarter, year=target_year)
+                _trigger_stock_fetch_with_retry(stock_id, quarter=target_quarter, year=target_year)
             except Exception as e:
                 return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
             return jsonify({

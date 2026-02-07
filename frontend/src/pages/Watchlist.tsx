@@ -301,9 +301,9 @@ export default function Watchlist() {
             } catch (error) {
                 // Ignore poll status errors to avoid breaking watchlist updates
             }
-        }, 1000)
+        }, 2000)
         return () => clearInterval(interval)
-    }, [selectedQuarter])
+    }, [])
 
     // Search stocks when query changes
     useEffect(() => {

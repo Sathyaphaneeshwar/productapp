@@ -1,5 +1,6 @@
 import threading
 import time
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -124,6 +125,7 @@ class QueueSchedulerService:
             )
             rows = cursor.fetchall()
             lock_until = now + timedelta(seconds=120)
+            queue_rows = []
             for row in rows:
                 cursor.execute(
                     """
@@ -133,15 +135,27 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue(
-                    "transcript_check",
-                    {
-                        "stock_id": row["stock_id"],
-                        "priority": row["priority"],
-                        "quarter": quarter,
-                        "year": year,
-                        "reason": "scheduled",
-                    },
+                queue_rows.append(
+                    (
+                        "transcript_check",
+                        json.dumps(
+                            {
+                                "stock_id": row["stock_id"],
+                                "priority": row["priority"],
+                                "quarter": quarter,
+                                "year": year,
+                                "reason": "scheduled",
+                            }
+                        ),
+                    )
+                )
+            if queue_rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    queue_rows,
                 )
             conn.commit()
         finally:
@@ -178,6 +192,7 @@ class QueueSchedulerService:
             )
             rows = cursor.fetchall()
             lock_until = now + timedelta(seconds=900)
+            queue_rows = []
             for row in rows:
                 cursor.execute(
                     """
@@ -187,7 +202,20 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue("analysis", {"analysis_job_id": row["id"]})
+                queue_rows.append(
+                    (
+                        "analysis",
+                        json.dumps({"analysis_job_id": row["id"]}),
+                    )
+                )
+            if queue_rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    queue_rows,
+                )
             conn.commit()
         finally:
             conn.close()
@@ -223,6 +251,7 @@ class QueueSchedulerService:
             )
             rows = cursor.fetchall()
             lock_until = now + timedelta(seconds=900)
+            queue_rows = []
             for row in rows:
                 cursor.execute(
                     """
@@ -232,7 +261,20 @@ class QueueSchedulerService:
                     """,
                     (lock_until, row["id"]),
                 )
-                self.queue.enqueue("email", {"email_outbox_id": row["id"]})
+                queue_rows.append(
+                    (
+                        "email",
+                        json.dumps({"email_outbox_id": row["id"]}),
+                    )
+                )
+            if queue_rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    queue_rows,
+                )
             conn.commit()
         finally:
             conn.close()
