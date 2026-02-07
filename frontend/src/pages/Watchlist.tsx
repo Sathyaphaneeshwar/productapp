@@ -213,14 +213,20 @@ export default function Watchlist() {
 
     // Auto-refresh watchlist periodically to reflect backend progress
     useEffect(() => {
+        if (!selectedQuarter) return
+        const q = selectedQuarter.quarter
+        const y = selectedQuarter.year
         const interval = setInterval(() => {
-            refreshWatchlist()
-        }, 10000) // 10 seconds
+            refreshWatchlist(q, y)
+        }, 60000) // 60 seconds
         return () => clearInterval(interval)
     }, [selectedQuarter])
 
     // Refresh as soon as a poll cycle starts to surface fetching state
     useEffect(() => {
+        if (!selectedQuarter) return
+        const q = selectedQuarter.quarter
+        const y = selectedQuarter.year
         const interval = setInterval(async () => {
             try {
                 const response = await fetch(`${API_URL}/poll/status`)
@@ -228,13 +234,13 @@ export default function Watchlist() {
                 const data = await response.json()
                 const isPolling = Boolean(data?.is_polling)
                 if (isPolling && !pollingActiveRef.current) {
-                    refreshWatchlist()
+                    refreshWatchlist(q, y)
                 }
                 pollingActiveRef.current = isPolling
             } catch (error) {
                 // Ignore poll status errors to avoid breaking watchlist updates
             }
-        }, 1000)
+        }, 5000) // 5 seconds
         return () => clearInterval(interval)
     }, [selectedQuarter])
 
@@ -388,8 +394,9 @@ export default function Watchlist() {
                     }
                     // Include quarter params to maintain current view
                     let pollUrl = `${API_URL}/watchlist`
-                    if (selectedQuarter) {
-                        pollUrl += `?quarter=${selectedQuarter.quarter}&year=${selectedQuarter.year}`
+                    const currentQ = selectedQuarterRef.current
+                    if (currentQ) {
+                        pollUrl += `?quarter=${currentQ.quarter}&year=${currentQ.year}`
                     }
                     const watchlistResponse = await fetch(pollUrl)
                     if (watchlistResponse.ok) {
