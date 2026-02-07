@@ -41,6 +41,7 @@ class AnalysisJobService:
             idempotency_key = self._build_idempotency_key(transcript_id, source_url, force)
 
             job_id = None
+            existing_status = None
             try:
                 cursor.execute(
                     """
@@ -56,21 +57,38 @@ class AnalysisJobService:
                 existing = cursor.fetchone()
                 if existing:
                     job_id = existing["id"]
+                    existing_status = existing["status"]
                     if existing["status"] == "done" and not force:
                         return job_id
 
             if job_id:
+                recover_legacy_group_block = existing_status == "blocked_group"
+                if existing_status == "error" and not force:
+                    cursor.execute("SELECT analysis_error FROM transcripts WHERE id = ?", (transcript_id,))
+                    transcript = cursor.fetchone()
+                    analysis_error = ((transcript["analysis_error"] if transcript else "") or "").lower()
+                    recover_legacy_group_block = "active group" in analysis_error
+
+                allowed_statuses = ["pending", "retrying"]
+                if recover_legacy_group_block:
+                    # Legacy group-blocked/error jobs should be runnable now.
+                    allowed_statuses.extend(["blocked_group", "error"])
+                status_placeholders = ",".join("?" for _ in allowed_statuses)
                 update_result = cursor.execute(
-                    """
+                    f"""
                     UPDATE analysis_jobs
-                    SET status = 'queued', locked_until = DATETIME(CURRENT_TIMESTAMP, '+15 minutes'), updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND status IN ('pending', 'retrying')
+                    SET status = 'queued',
+                        attempts = CASE WHEN status IN ('blocked_group', 'error') THEN 0 ELSE attempts END,
+                        retry_next_at = CASE WHEN status IN ('blocked_group', 'error') THEN NULL ELSE retry_next_at END,
+                        locked_until = DATETIME(CURRENT_TIMESTAMP, '+15 minutes'),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status IN ({status_placeholders})
                     """,
-                    (job_id,),
+                    (job_id, *allowed_statuses),
                 ).rowcount
                 conn.commit()
                 if update_result == 0:
-                    # Terminal states (done/error/blocked_group) must not be resurrected.
+                    # Terminal states generally must not be resurrected.
                     # Existing queued/in_progress jobs are already in flight.
                     return job_id
                 try:

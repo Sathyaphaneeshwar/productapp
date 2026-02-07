@@ -65,7 +65,7 @@ class AnalysisQueueWorker:
             job = cursor.fetchone()
             if not job:
                 return
-            if job["status"] in ("done", "blocked_group"):
+            if job["status"] == "done":
                 return
 
             cursor.execute(
@@ -101,22 +101,10 @@ class AnalysisQueueWorker:
             if not stock:
                 raise ValueError("Stock not found")
 
-            # Ensure stock is in watchlist and not in active group
+            # Stock-level analysis is only for watchlist stocks.
             cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
             if cursor.fetchone() is None:
                 raise ValueError("Stock not in watchlist")
-            cursor.execute(
-                """
-                SELECT 1
-                FROM group_stocks gs
-                JOIN groups g ON g.id = gs.group_id
-                WHERE gs.stock_id = ? AND g.is_active = 1
-                LIMIT 1
-                """,
-                (stock_id,),
-            )
-            if cursor.fetchone():
-                raise ValueError("Stock belongs to active group")
 
             cursor.execute(
                 """
@@ -189,10 +177,8 @@ class AnalysisQueueWorker:
 
         except Exception as e:
             message = str(e)
-            blocked_group = message == "Stock belongs to active group"
             non_retryable = message in {
                 "Stock not in watchlist",
-                "Stock belongs to active group",
                 "Transcript not available for analysis",
                 "Transcript not found",
                 "Stock not found",
@@ -202,10 +188,7 @@ class AnalysisQueueWorker:
             row = cursor.fetchone()
             attempts = (row["attempts"] if row else 0) + 1
             retry_next_at = None if non_retryable else datetime.utcnow() + timedelta(seconds=compute_backoff_seconds(attempts))
-            if blocked_group:
-                status = "blocked_group"
-            else:
-                status = "error" if non_retryable else "retrying"
+            status = "error" if non_retryable else "retrying"
 
             cursor.execute(
                 """
@@ -215,7 +198,7 @@ class AnalysisQueueWorker:
                 """,
                 (status, attempts, retry_next_at, job_id),
             )
-            if 'transcript_id' in locals() and not blocked_group:
+            if 'transcript_id' in locals():
                 cursor.execute(
                     """
                     UPDATE transcripts

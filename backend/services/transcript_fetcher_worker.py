@@ -161,22 +161,10 @@ class TranscriptFetcherWorker:
                 )
                 conn.commit()
 
-                # Auto-trigger analysis for watchlist stocks only
+                # Auto-trigger analysis for watchlist stocks only.
                 cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
                 in_watchlist = cursor.fetchone() is not None
-                cursor.execute(
-                    """
-                    SELECT 1
-                    FROM group_stocks gs
-                    JOIN groups g ON g.id = gs.group_id
-                    WHERE gs.stock_id = ? AND g.is_active = 1
-                    LIMIT 1
-                    """,
-                    (stock_id,),
-                )
-                in_active_group = cursor.fetchone() is not None
-
-                if in_watchlist and not in_active_group:
+                if in_watchlist:
                     self.analysis_job_service.enqueue_for_transcript(transcript_id)
 
             elif upcoming:

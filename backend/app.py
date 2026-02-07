@@ -258,18 +258,6 @@ def get_watchlist():
     stocks = []
     for row in cursor.fetchall():
         stock_id = row['id']
-
-        cursor.execute(
-            """
-            SELECT 1
-            FROM group_stocks gs
-            JOIN groups g ON g.id = gs.group_id
-            WHERE gs.stock_id = ? AND g.is_active = 1
-            LIMIT 1
-            """,
-            (stock_id,),
-        )
-        in_active_group = cursor.fetchone() is not None
         
         # Get transcript info for SELECTED QUARTER only
         cursor.execute("""
@@ -439,25 +427,15 @@ def get_watchlist():
                 }
             elif transcript['status'] == 'available':
                 if analysis_state == 'error' and not analysis_info:
-                    if in_active_group and analysis_error and 'active group' in analysis_error.lower():
-                        status_info = {
-                            'status': 'transcript_ready',
-                            'message': 'Managed by active group research',
-                            'details': {
-                                'quarter': transcript['quarter'],
-                                'year': transcript['year']
-                            }
+                    status_info = {
+                        'status': 'analysis_failed',
+                        'message': 'Analysis failed',
+                        'details': {
+                            'quarter': transcript['quarter'],
+                            'year': transcript['year'],
+                            'analysis_error': analysis_error
                         }
-                    else:
-                        status_info = {
-                            'status': 'analysis_failed',
-                            'message': 'Analysis failed',
-                            'details': {
-                                'quarter': transcript['quarter'],
-                                'year': transcript['year'],
-                                'analysis_error': analysis_error
-                            }
-                        }
+                    }
                 elif analysis_info:
                     status_info = {
                         'status': 'analyzed',
@@ -1480,18 +1458,6 @@ def trigger_analysis(stock_id):
     if cursor.fetchone() is None:
         conn.close()
         return jsonify({'error': 'Stock is not in watchlist; stock-level analysis is disabled'}), 409
-
-    # Skip stock-level analysis for stocks that belong to an active group
-    cursor.execute("""
-        SELECT 1
-        FROM group_stocks gs
-        JOIN groups g ON g.id = gs.group_id
-        WHERE gs.stock_id = ? AND g.is_active = 1
-        LIMIT 1
-    """, (stock_id,))
-    if cursor.fetchone():
-        conn.close()
-        return jsonify({'error': 'Stock belongs to an active group; use group research instead'}), 409
 
     transcript_id = None
     # If targeting a specific quarter/year, verify transcript is available
