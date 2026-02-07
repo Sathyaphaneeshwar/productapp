@@ -35,6 +35,12 @@ type Stock = {
     retry_attempts?: number
     retry_next_at?: string
     retry_scope?: 'transcript_fetch' | 'analysis' | 'email'
+    schedule?: {
+        next_check_at?: string | null
+        last_checked_at?: string | null
+        last_status?: string | null
+        attempts?: number
+    } | null
 }
 
 type Quarter = {
@@ -102,7 +108,6 @@ export default function Watchlist() {
     const reanalyzeIntervalRef = useRef<number | null>(null)
     const reanalyzeTimeoutRef = useRef<number | null>(null)
     const searchContainerRef = useRef<HTMLDivElement>(null)
-    const pollingActiveRef = useRef(false)
     const selectedQuarterRef = useRef<Quarter | null>(null)
     const watchlistRequestIdRef = useRef(0)
     const watchlistAbortRef = useRef<AbortController | null>(null)
@@ -204,7 +209,6 @@ export default function Watchlist() {
     // Fetch watchlist when quarter changes
     useEffect(() => {
         selectedQuarterRef.current = selectedQuarter
-        pollingActiveRef.current = false
         stopReanalyzePolling()
         if (selectedQuarter) {
             refreshWatchlist(selectedQuarter.quarter, selectedQuarter.year)
@@ -219,28 +223,6 @@ export default function Watchlist() {
         const interval = setInterval(() => {
             refreshWatchlist(q, y)
         }, 60000) // 60 seconds
-        return () => clearInterval(interval)
-    }, [selectedQuarter])
-
-    // Refresh as soon as a poll cycle starts to surface fetching state
-    useEffect(() => {
-        if (!selectedQuarter) return
-        const q = selectedQuarter.quarter
-        const y = selectedQuarter.year
-        const interval = setInterval(async () => {
-            try {
-                const response = await fetch(`${API_URL}/poll/status`)
-                if (!response.ok) return
-                const data = await response.json()
-                const isPolling = Boolean(data?.is_polling)
-                if (isPolling && !pollingActiveRef.current) {
-                    refreshWatchlist(q, y)
-                }
-                pollingActiveRef.current = isPolling
-            } catch (error) {
-                // Ignore poll status errors to avoid breaking watchlist updates
-            }
-        }, 5000) // 5 seconds
         return () => clearInterval(interval)
     }, [selectedQuarter])
 
@@ -571,6 +553,51 @@ export default function Watchlist() {
         }
     }
 
+    const getScheduleLabel = (stock: Stock): string | null => {
+        // Only show for statuses where the user is waiting for transcript
+        if (!['no_transcript', 'upcoming'].includes(stock.status)) return null
+        if (!stock.schedule) return null
+
+        const { next_check_at, last_checked_at, last_status, attempts } = stock.schedule
+
+        // Error with retries — show attempt count and next retry time
+        if (last_status === 'error' && attempts && attempts > 0 && next_check_at) {
+            const nextDate = new Date(next_check_at)
+            const diffMs = nextDate.getTime() - Date.now()
+            const diffLabel = formatTimeDiff(diffMs)
+            return `Check failed (attempt ${attempts}) · Retry ${diffLabel}`
+        }
+
+        // Normal case — show last checked + next check
+        const parts: string[] = []
+        if (last_checked_at) {
+            const ago = Date.now() - new Date(last_checked_at).getTime()
+            parts.push(`Checked ${formatTimeDiff(-ago)}`)
+        }
+        if (next_check_at) {
+            const diffMs = new Date(next_check_at).getTime() - Date.now()
+            parts.push(`Next ${formatTimeDiff(diffMs)}`)
+        }
+        return parts.length > 0 ? parts.join(' · ') : null
+    }
+
+    const formatTimeDiff = (diffMs: number): string => {
+        const abs = Math.abs(diffMs)
+        const inPast = diffMs < 0
+        const minutes = Math.round(abs / 60000)
+        const hours = Math.round(abs / 3600000)
+        const days = Math.round(abs / 86400000)
+
+        let label: string
+        if (minutes < 1) label = 'now'
+        else if (minutes < 60) label = `${minutes}m`
+        else if (hours < 24) label = `${hours}h`
+        else label = `${days}d`
+
+        if (label === 'now') return inPast ? 'just now' : 'now'
+        return inPast ? `${label} ago` : `in ${label}`
+    }
+
     const displayStocks = useMemo(() => {
         if (stocks.length === 0) return []
         if (statusFilters.size === 0) return []
@@ -800,6 +827,14 @@ export default function Watchlist() {
                                                             {getRetryLabel(stock)}
                                                         </span>
                                                     )}
+                                                    {(() => {
+                                                        const schedLabel = getScheduleLabel(stock)
+                                                        return schedLabel ? (
+                                                            <span className={`text-xs ${stock.schedule?.last_status === 'error' ? 'text-red-400' : 'text-muted-foreground'}`}>
+                                                                {schedLabel}
+                                                            </span>
+                                                        ) : null
+                                                    })()}
                                                 </div>
                                             </TableCell>
                                             <TableCell className="text-right">

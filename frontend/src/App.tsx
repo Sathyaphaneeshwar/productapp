@@ -6,7 +6,6 @@ import Groups from './pages/Groups'
 import Research from './pages/Research'
 import Settings from './pages/Settings'
 import UpdateButton from './components/UpdateButton'
-import PollStatusButton from './components/PollStatusButton'
 
 type Theme = 'light' | 'dark' | 'system'
 type Page = 'watchlist' | 'groups' | 'research' | 'settings'
@@ -105,7 +104,6 @@ function App() {
             <h1 className="text-4xl font-bold text-foreground text-center">BLOOMira</h1>
             <div className="flex-1 flex justify-end gap-2">
               <UpdateButton />
-              <PollStatusButton />
               <Button
                 variant="ghost"
                 size="icon"

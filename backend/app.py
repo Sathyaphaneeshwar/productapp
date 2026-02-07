@@ -460,6 +460,23 @@ def get_watchlist():
                 'details': None
             }
         
+        # Fetch per-stock schedule timing for the frontend
+        schedule_info = None
+        cursor.execute("""
+            SELECT next_check_at, last_checked_at, last_status, attempts
+            FROM transcript_fetch_schedule
+            WHERE stock_id = ? AND quarter = ? AND year = ?
+            LIMIT 1
+        """, (stock_id, quarter, year))
+        sched_row = cursor.fetchone()
+        if sched_row:
+            schedule_info = {
+                'next_check_at': sched_row['next_check_at'],
+                'last_checked_at': sched_row['last_checked_at'],
+                'last_status': sched_row['last_status'],
+                'attempts': sched_row['attempts']
+            }
+
         stocks.append({
             'id': stock_id,
             'symbol': row['symbol'],
@@ -471,7 +488,8 @@ def get_watchlist():
             'retrying': retry_info['retrying'],
             'retry_attempts': retry_info['retry_attempts'],
             'retry_next_at': retry_info['retry_next_at'],
-            'retry_scope': retry_info['retry_scope']
+            'retry_scope': retry_info['retry_scope'],
+            'schedule': schedule_info
         })
     
     conn.close()
