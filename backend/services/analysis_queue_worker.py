@@ -65,7 +65,7 @@ class AnalysisQueueWorker:
             job = cursor.fetchone()
             if not job:
                 return
-            if job["status"] in ("done",):
+            if job["status"] in ("done", "blocked_group"):
                 return
 
             cursor.execute(
@@ -74,7 +74,7 @@ class AnalysisQueueWorker:
                 SET status = 'in_progress', locked_until = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (datetime.now() + timedelta(hours=2), job_id),
+                (datetime.utcnow() + timedelta(hours=2), job_id),
             )
             conn.commit()
 
@@ -189,6 +189,7 @@ class AnalysisQueueWorker:
 
         except Exception as e:
             message = str(e)
+            blocked_group = message == "Stock belongs to active group"
             non_retryable = message in {
                 "Stock not in watchlist",
                 "Stock belongs to active group",
@@ -200,8 +201,11 @@ class AnalysisQueueWorker:
             cursor.execute("SELECT attempts FROM analysis_jobs WHERE id = ?", (job_id,))
             row = cursor.fetchone()
             attempts = (row["attempts"] if row else 0) + 1
-            retry_next_at = None if non_retryable else datetime.now() + timedelta(seconds=compute_backoff_seconds(attempts))
-            status = "error" if non_retryable else "retrying"
+            retry_next_at = None if non_retryable else datetime.utcnow() + timedelta(seconds=compute_backoff_seconds(attempts))
+            if blocked_group:
+                status = "blocked_group"
+            else:
+                status = "error" if non_retryable else "retrying"
 
             cursor.execute(
                 """
@@ -211,7 +215,7 @@ class AnalysisQueueWorker:
                 """,
                 (status, attempts, retry_next_at, job_id),
             )
-            if 'transcript_id' in locals():
+            if 'transcript_id' in locals() and not blocked_group:
                 cursor.execute(
                     """
                     UPDATE transcripts

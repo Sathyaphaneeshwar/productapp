@@ -87,20 +87,18 @@ class QueueSchedulerService:
             else:
                 cursor.execute("DELETE FROM transcript_fetch_schedule")
 
-            now = datetime.now().isoformat(sep=" ", timespec="seconds")
             for stock_id in all_ids:
                 priority = 100 if stock_id in watchlist_ids else 50
                 cursor.execute(
                     """
                     INSERT INTO transcript_fetch_schedule (
                         stock_id, quarter, year, priority, next_check_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(stock_id, quarter, year) DO UPDATE SET
                         priority = excluded.priority,
-                        next_check_at = COALESCE(transcript_fetch_schedule.next_check_at, excluded.next_check_at),
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (stock_id, quarter, year, priority, now),
+                    (stock_id, quarter, year, priority),
                 )
 
             conn.commit()
@@ -111,7 +109,7 @@ class QueueSchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            now = datetime.now()
+            now = datetime.utcnow()
             cursor.execute(
                 """
                 SELECT id, stock_id, priority
@@ -153,7 +151,7 @@ class QueueSchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            now = datetime.now()
+            now = datetime.utcnow()
             cursor.execute(
                 """
                 UPDATE analysis_jobs
@@ -198,7 +196,7 @@ class QueueSchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            now = datetime.now()
+            now = datetime.utcnow()
             cursor.execute(
                 """
                 UPDATE email_outbox
@@ -243,7 +241,7 @@ class QueueSchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            now = datetime.now()
+            now = datetime.utcnow()
             cursor.execute(
                 """
                 SELECT 1
@@ -272,7 +270,12 @@ class QueueSchedulerService:
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
-                SET next_check_at = CURRENT_TIMESTAMP, attempts = 0, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
+                SET next_check_at = CURRENT_TIMESTAMP,
+                    attempts = 0,
+                    last_status = NULL,
+                    last_checked_at = NULL,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE stock_id = ? AND quarter = ? AND year = ?
                 """,
                 (stock_id, target_quarter, target_year),
@@ -288,6 +291,10 @@ class QueueSchedulerService:
                     ON CONFLICT(stock_id, quarter, year) DO UPDATE SET
                         priority = excluded.priority,
                         next_check_at = CURRENT_TIMESTAMP,
+                        attempts = 0,
+                        last_status = NULL,
+                        last_checked_at = NULL,
+                        locked_until = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (stock_id, target_quarter, target_year, priority),

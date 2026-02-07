@@ -3,6 +3,7 @@ from flask_cors import CORS
 import sqlite3
 import os
 import sys
+from datetime import datetime, timezone
 import smtplib
 import html
 import markdown
@@ -68,6 +69,27 @@ if _should_start_background_workers():
 
 def get_db_connection():
     return _get_db_connection(DB_PATH)
+
+
+def _to_utc_iso(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        normalized = raw.replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
 
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
@@ -236,6 +258,18 @@ def get_watchlist():
     stocks = []
     for row in cursor.fetchall():
         stock_id = row['id']
+
+        cursor.execute(
+            """
+            SELECT 1
+            FROM group_stocks gs
+            JOIN groups g ON g.id = gs.group_id
+            WHERE gs.stock_id = ? AND g.is_active = 1
+            LIMIT 1
+            """,
+            (stock_id,),
+        )
+        in_active_group = cursor.fetchone() is not None
         
         # Get transcript info for SELECTED QUARTER only
         cursor.execute("""
@@ -309,7 +343,7 @@ def get_watchlist():
                 retry_info = {
                     'retrying': True,
                     'retry_attempts': active_analysis_job['attempts'],
-                    'retry_next_at': active_analysis_job['retry_next_at'],
+                    'retry_next_at': _to_utc_iso(active_analysis_job['retry_next_at']),
                     'retry_scope': 'analysis'
                 }
 
@@ -326,7 +360,7 @@ def get_watchlist():
                 retry_info = {
                     'retrying': True,
                     'retry_attempts': retry_row['attempts'],
-                    'retry_next_at': retry_row['retry_next_at'],
+                    'retry_next_at': _to_utc_iso(retry_row['retry_next_at']),
                     'retry_scope': 'email'
                 }
 
@@ -342,7 +376,7 @@ def get_watchlist():
                 retry_info = {
                     'retrying': True,
                     'retry_attempts': retry_row['attempts'],
-                    'retry_next_at': retry_row['next_check_at'],
+                    'retry_next_at': _to_utc_iso(retry_row['next_check_at']),
                     'retry_scope': 'transcript_fetch'
                 }
         
@@ -393,26 +427,37 @@ def get_watchlist():
                     }
                 }
             elif transcript['status'] == 'upcoming':
+                event_date_iso = _to_utc_iso(transcript['event_date'])
                 status_info = {
                     'status': 'upcoming',
-                    'message': f"Upcoming: {transcript['event_date']}",
+                    'message': f"Upcoming: {event_date_iso or transcript['event_date']}",
                     'details': {
                         'quarter': transcript['quarter'],
                         'year': transcript['year'],
-                        'event_date': transcript['event_date']
+                        'event_date': event_date_iso or transcript['event_date']
                     }
                 }
             elif transcript['status'] == 'available':
                 if analysis_state == 'error' and not analysis_info:
-                    status_info = {
-                        'status': 'analysis_failed',
-                        'message': 'Analysis failed',
-                        'details': {
-                            'quarter': transcript['quarter'],
-                            'year': transcript['year'],
-                            'analysis_error': analysis_error
+                    if in_active_group and analysis_error and 'active group' in analysis_error.lower():
+                        status_info = {
+                            'status': 'transcript_ready',
+                            'message': 'Managed by active group research',
+                            'details': {
+                                'quarter': transcript['quarter'],
+                                'year': transcript['year']
+                            }
                         }
-                    }
+                    else:
+                        status_info = {
+                            'status': 'analysis_failed',
+                            'message': 'Analysis failed',
+                            'details': {
+                                'quarter': transcript['quarter'],
+                                'year': transcript['year'],
+                                'analysis_error': analysis_error
+                            }
+                        }
                 elif analysis_info:
                     status_info = {
                         'status': 'analyzed',
@@ -420,7 +465,7 @@ def get_watchlist():
                         'details': {
                             'quarter': transcript['quarter'],
                             'year': transcript['year'],
-                            'analyzed_at': analysis_info['date'],
+                            'analyzed_at': _to_utc_iso(analysis_info['date']) or analysis_info['date'],
                             'provider': analysis_info['provider']
                         }
                     }
@@ -431,7 +476,7 @@ def get_watchlist():
                         'details': {
                             'quarter': transcript['quarter'],
                             'year': transcript['year'],
-                            'transcript_date': transcript['created_at']
+                            'transcript_date': _to_utc_iso(transcript['created_at']) or transcript['created_at']
                         }
                     }
         elif row['transcript_check_status'] == 'checking':
@@ -445,7 +490,7 @@ def get_watchlist():
             'id': stock_id,
             'symbol': row['symbol'],
             'name': row['name'],
-            'added_at': row['added_at'],
+            'added_at': _to_utc_iso(row['added_at']) or row['added_at'],
             'status': status_info['status'],
             'status_message': status_info['message'],
             'status_details': status_info['details'],
@@ -1457,15 +1502,26 @@ def trigger_analysis(stock_id):
             LIMIT 1
         """, (stock_id, quarter, year))
         transcript = cursor.fetchone()
-        if not transcript:
+        transcript_status = transcript['status'] if transcript else 'none'
+        transcript_source_url = transcript['source_url'] if transcript else None
+        needs_fetch = (
+            transcript is None
+            or transcript_status != 'available'
+            or not transcript_source_url
+        )
+        if needs_fetch:
             conn.close()
-            return jsonify({'error': f'Transcript for {quarter} {year} not found'}), 404
-        if transcript['status'] != 'available':
-            conn.close()
-            return jsonify({'error': f'Transcript status is {transcript["status"]}, cannot analyze'}), 422
-        if not transcript['source_url']:
-            conn.close()
-            return jsonify({'error': f'Transcript for {quarter} {year} has no source_url to analyze'}), 422
+            try:
+                queue_scheduler.trigger_for_stock(stock_id, quarter=quarter, year=year)
+            except Exception as e:
+                return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
+            return jsonify({
+                'message': f'Transcript check triggered for {quarter} {year}',
+                'status': 'fetching_transcript',
+                'quarter': quarter,
+                'year': year,
+                'transcript_status': transcript_status
+            }), 202
         transcript_id = transcript['id']
     else:
         cursor.execute("""

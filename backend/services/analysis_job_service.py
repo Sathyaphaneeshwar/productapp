@@ -60,15 +60,19 @@ class AnalysisJobService:
                         return job_id
 
             if job_id:
-                cursor.execute(
+                update_result = cursor.execute(
                     """
                     UPDATE analysis_jobs
                     SET status = 'queued', locked_until = DATETIME(CURRENT_TIMESTAMP, '+15 minutes'), updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND status IN ('pending', 'retrying', 'error')
+                    WHERE id = ? AND status IN ('pending', 'retrying')
                     """,
                     (job_id,),
-                )
+                ).rowcount
                 conn.commit()
+                if update_result == 0:
+                    # Terminal states (done/error/blocked_group) must not be resurrected.
+                    # Existing queued/in_progress jobs are already in flight.
+                    return job_id
                 try:
                     self.queue.enqueue("analysis", {"analysis_job_id": job_id})
                 except Exception as e:

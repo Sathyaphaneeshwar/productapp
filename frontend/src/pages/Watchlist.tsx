@@ -87,6 +87,18 @@ const STATUS_RANK: Record<StockStatus, number> = STATUS_RANK_ASC.reduce((acc, st
     return acc
 }, {} as Record<StockStatus, number>)
 
+const parseApiTimestamp = (value?: string | null): Date | null => {
+    if (!value) return null
+    const raw = value.trim()
+    if (!raw) return null
+    let normalized = raw.replace(' ', 'T')
+    if (!/(Z|[+-]\d{2}:\d{2})$/i.test(normalized)) {
+        normalized = `${normalized}Z`
+    }
+    const parsed = new Date(normalized)
+    return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
 export default function Watchlist() {
     const [stocks, setStocks] = useState<Stock[]>([])
     const [searchQuery, setSearchQuery] = useState('')
@@ -502,15 +514,16 @@ export default function Watchlist() {
                         📄 Transcript Ready
                     </Badge>
                 )
-            case 'upcoming':
+            case 'upcoming': {
+                const upcomingDate = parseApiTimestamp(status_details?.event_date)
                 return (
                     <div className="flex flex-col gap-1">
                         <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/50 hover:bg-blue-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(59,130,246,0.5)] transition-all duration-200 cursor-pointer">
                             📅 Upcoming
                         </Badge>
-                        {status_details?.event_date && (
+                        {upcomingDate && (
                             <span className="text-xs text-muted-foreground">
-                                {new Date(status_details.event_date).toLocaleDateString('en-IN', {
+                                {upcomingDate.toLocaleDateString('en-IN', {
                                     month: 'short',
                                     day: 'numeric',
                                     hour: '2-digit',
@@ -520,6 +533,7 @@ export default function Watchlist() {
                         )}
                     </div>
                 )
+            }
             case 'no_transcript':
                 return (
                     <Badge className="bg-gray-500/20 text-gray-400 border-gray-500/50 hover:bg-gray-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(156,163,175,0.5)] transition-all duration-200 cursor-pointer">

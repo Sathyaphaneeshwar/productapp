@@ -1,6 +1,6 @@
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from config import DATABASE_PATH
 from db import get_db_connection
@@ -57,24 +57,32 @@ class TranscriptFetcherWorker:
         )
 
     def _compute_next_check(self, status: str, event_date: str, attempts: int) -> datetime:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
+
+        def as_utc_naive(value: datetime) -> datetime:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+
         if status == "available":
-            return now + timedelta(hours=12)
+            return as_utc_naive(now + timedelta(hours=12))
         if status == "upcoming" and event_date:
             try:
                 event_dt = datetime.fromisoformat(str(event_date).replace("Z", "+00:00"))
             except Exception:
                 event_dt = None
             if event_dt:
+                if event_dt.tzinfo is None:
+                    event_dt = event_dt.replace(tzinfo=timezone.utc)
+                else:
+                    event_dt = event_dt.astimezone(timezone.utc)
                 delta = event_dt - now
                 if delta.total_seconds() <= 24 * 3600:
-                    return now + timedelta(minutes=10)
+                    return as_utc_naive(now + timedelta(minutes=10))
                 if delta.total_seconds() <= 7 * 24 * 3600:
-                    return now + timedelta(minutes=60)
+                    return as_utc_naive(now + timedelta(minutes=60))
         if status == "error":
             backoff = compute_backoff_seconds(attempts)
-            return now + timedelta(seconds=backoff)
-        return now + timedelta(hours=4)
+            return as_utc_naive(now + timedelta(seconds=backoff))
+        return as_utc_naive(now + timedelta(hours=4))
 
     def _process_job(self, job: dict):
         stock_id = job.get("stock_id")
@@ -177,7 +185,7 @@ class TranscriptFetcherWorker:
                 event_date = call.event_date
                 cursor.execute(
                     """
-                    SELECT id, status, event_date
+                    SELECT id, status, source_url, event_date
                     FROM transcripts
                     WHERE stock_id = ? AND quarter = ? AND year = ?
                     LIMIT 1
@@ -194,6 +202,11 @@ class TranscriptFetcherWorker:
                         (stock_id, quarter, year, call.event_date),
                     )
                     conn.commit()
+                elif existing["status"] == "available" and existing["source_url"]:
+                    # Keep available transcripts authoritative even if the upcoming API
+                    # also returns a matching row for the same quarter/year.
+                    schedule_status = "available"
+                    event_date = None
                 else:
                     if existing["status"] != "upcoming" or existing["event_date"] != call.event_date:
                         cursor.execute(
