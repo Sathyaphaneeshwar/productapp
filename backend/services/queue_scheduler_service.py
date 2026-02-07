@@ -102,6 +102,34 @@ class QueueSchedulerService:
                     (stock_id, quarter, year, priority),
                 )
 
+            # Self-heal stale watchlist rows that were previously scheduled with
+            # long "none" cadence even though an upcoming event is near/past.
+            # This ensures automatic refresh kicks back in without manual trigger.
+            cursor.execute(
+                """
+                UPDATE transcript_fetch_schedule
+                SET next_check_at = CURRENT_TIMESTAMP,
+                    attempts = 0,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE quarter = ? AND year = ?
+                  AND stock_id IN (SELECT stock_id FROM watchlist_items)
+                  AND next_check_at IS NOT NULL
+                  AND datetime(next_check_at) > datetime('now', '+30 minutes')
+                  AND EXISTS (
+                        SELECT 1
+                        FROM transcripts t
+                        WHERE t.stock_id = transcript_fetch_schedule.stock_id
+                          AND t.quarter = transcript_fetch_schedule.quarter
+                          AND t.year = transcript_fetch_schedule.year
+                          AND t.status = 'upcoming'
+                          AND t.event_date IS NOT NULL
+                          AND datetime(t.event_date) <= datetime('now', '+24 hours')
+                  )
+                """,
+                (quarter, year),
+            )
+
             conn.commit()
         finally:
             conn.close()
