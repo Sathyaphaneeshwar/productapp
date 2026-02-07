@@ -1471,11 +1471,40 @@ def trigger_analysis(stock_id):
     # If targeting a specific quarter/year, verify transcript is available
     if quarter and year:
         cursor.execute("""
-            SELECT id, status, source_url FROM transcripts 
+            SELECT id, status, source_url FROM transcripts
             WHERE stock_id = ? AND quarter = ? AND year = ?
             LIMIT 1
         """, (stock_id, quarter, year))
         transcript = cursor.fetchone()
+
+        # If transcript not in local DB, try fetching on-demand from Tijori API
+        if not transcript:
+            cursor.execute("SELECT stock_symbol FROM stocks WHERE id = ?", (stock_id,))
+            stock_row = cursor.fetchone()
+            if stock_row and stock_row['stock_symbol']:
+                try:
+                    from services.transcript_service import TranscriptService
+                    ts = TranscriptService()
+                    available = ts.fetch_available_transcripts(stock_row['stock_symbol'])
+                    match = [t for t in available if t.quarter == quarter and t.year == year]
+                    if match:
+                        fetched = match[0]
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO transcripts (stock_id, quarter, year, source_url, status)
+                            VALUES (?, ?, ?, ?, 'available')
+                        """, (stock_id, quarter, year, fetched.source_url))
+                        conn.commit()
+                        # Re-query to get the id
+                        cursor.execute("""
+                            SELECT id, status, source_url FROM transcripts
+                            WHERE stock_id = ? AND quarter = ? AND year = ?
+                            LIMIT 1
+                        """, (stock_id, quarter, year))
+                        transcript = cursor.fetchone()
+                except Exception as e:
+                    logger.warning("On-demand transcript fetch failed for stock %s %s %s: %s",
+                                   stock_id, quarter, year, e)
+
         if not transcript:
             conn.close()
             return jsonify({'error': f'Transcript for {quarter} {year} not found'}), 404
