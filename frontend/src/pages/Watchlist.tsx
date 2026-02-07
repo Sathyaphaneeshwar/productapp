@@ -20,7 +20,7 @@ type Stock = {
     symbol: string
     name: string
     added_at: string
-    status: 'no_transcript' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'fetching' | 'analyzing' | 'analysis_failed'
+    status: 'no_transcript' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'analyzed_by_group' | 'fetching' | 'analyzing' | 'analysis_failed'
     status_message: string
     status_details: {
         quarter?: string
@@ -54,6 +54,7 @@ type SortSpec = {
 
 const ALL_STATUSES: StockStatus[] = [
     'analyzed',
+    'analyzed_by_group',
     'transcript_ready',
     'upcoming',
     'fetching',
@@ -64,6 +65,7 @@ const ALL_STATUSES: StockStatus[] = [
 
 const STATUS_LABELS: Record<StockStatus, string> = {
     analyzed: 'Analyzed',
+    analyzed_by_group: 'Group Analyzed',
     transcript_ready: 'Transcript Ready',
     upcoming: 'Upcoming',
     fetching: 'Fetching',
@@ -74,6 +76,7 @@ const STATUS_LABELS: Record<StockStatus, string> = {
 
 const STATUS_RANK_ASC: StockStatus[] = [
     'analyzed',
+    'analyzed_by_group',
     'transcript_ready',
     'upcoming',
     'fetching',
@@ -501,6 +504,12 @@ export default function Watchlist() {
                 return (
                     <Badge className="bg-green-500/20 text-green-400 border-green-500/50 hover:bg-green-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(34,197,94,0.5)] transition-all duration-200 cursor-pointer">
                         ✓ Analyzed
+                    </Badge>
+                )
+            case 'analyzed_by_group':
+                return (
+                    <Badge className="bg-green-500/20 text-green-400 border-green-500/50 hover:bg-green-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(34,197,94,0.5)] transition-all duration-200 cursor-pointer">
+                        ✓ Group Analyzed
                     </Badge>
                 )
             case 'transcript_ready':
