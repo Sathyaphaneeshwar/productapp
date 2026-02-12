@@ -103,7 +103,7 @@ class TranscriptFetcherWorker:
             if is_watchlist_stock:
                 backoff = min(backoff, 10 * 60)
             return as_utc_naive(now + timedelta(seconds=backoff))
-        return as_utc_naive(now + timedelta(hours=4))
+        return as_utc_naive(now + timedelta(minutes=15))
 
     def _process_job(self, job: dict):
         stock_id = job.get("stock_id")
