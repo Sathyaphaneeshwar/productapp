@@ -81,6 +81,7 @@ export default function Groups() {
     const stockSearchContainerRef = useRef<HTMLDivElement>(null)
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const selectedGroupIdRef = useRef<number | null>(null)
+    const selectedQuarterRef = useRef<Quarter | null>(null)
     const groupDetailsRequestIdRef = useRef(0)
     const articlesRequestIdRef = useRef(0)
     const articleContentRequestIdRef = useRef(0)
@@ -88,6 +89,10 @@ export default function Groups() {
     useEffect(() => {
         selectedGroupIdRef.current = selectedGroupId
     }, [selectedGroupId])
+
+    useEffect(() => {
+        selectedQuarterRef.current = selectedQuarter
+    }, [selectedQuarter])
 
     // Fetch groups and quarters on mount
     useEffect(() => {
@@ -113,7 +118,7 @@ export default function Groups() {
     useEffect(() => {
         if (selectedGroupId && selectedQuarter) {
             fetchGroupDetails(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
-            fetchArticles(selectedGroupId)
+            fetchArticles(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
         } else if (!selectedGroupId) {
             setSelectedGroup(null)
             setArticles([])
@@ -205,15 +210,31 @@ export default function Groups() {
         }
     }
 
-    const fetchArticles = async (groupId: number) => {
+    const getArticlesUrl = (groupId: number, quarter?: string, year?: number) => {
+        let url = `${API_URL}/groups/${groupId}/articles`
+        if (quarter && typeof year === 'number') {
+            url += `?quarter=${encodeURIComponent(quarter)}&year=${encodeURIComponent(String(year))}`
+        }
+        return url
+    }
+
+    const fetchArticles = async (groupId: number, quarter?: string, year?: number) => {
         const requestId = ++articlesRequestIdRef.current
         setArticlesLoading(true)
         try {
-            const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
+            const response = await fetch(getArticlesUrl(groupId, quarter, year))
             if (response.ok) {
                 const data = await response.json()
                 if (requestId !== articlesRequestIdRef.current) return
                 if (selectedGroupIdRef.current !== groupId) return
+                const currentQuarter = selectedQuarterRef.current
+                if (
+                    quarter &&
+                    typeof year === 'number' &&
+                    (!currentQuarter || currentQuarter.quarter !== quarter || currentQuarter.year !== year)
+                ) {
+                    return
+                }
                 setArticles(data)
             } else {
                 setArticles([])
@@ -337,8 +358,8 @@ export default function Groups() {
                 }
                 alert(message)
                 // Refresh articles list and start polling
-                fetchArticles(selectedGroupId)
-                startArticlePolling(selectedGroupId)
+                fetchArticles(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
+                startArticlePolling(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
             } else {
                 let errorText = 'Unknown error'
                 try {
@@ -359,7 +380,7 @@ export default function Groups() {
     }
 
     // Issue #6: Polling for article status updates
-    const startArticlePolling = (groupId: number) => {
+    const startArticlePolling = (groupId: number, quarter?: string, year?: number) => {
         // Clear any existing polling
         if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current)
@@ -374,10 +395,31 @@ export default function Groups() {
                     }
                     return
                 }
-                const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
+                const currentQuarter = selectedQuarterRef.current
+                if (
+                    quarter &&
+                    typeof year === 'number' &&
+                    (!currentQuarter || currentQuarter.quarter !== quarter || currentQuarter.year !== year)
+                ) {
+                    if (pollingIntervalRef.current) {
+                        clearInterval(pollingIntervalRef.current)
+                        pollingIntervalRef.current = null
+                    }
+                    return
+                }
+
+                const response = await fetch(getArticlesUrl(groupId, quarter, year))
                 if (response.ok) {
                     const data = await response.json()
                     if (selectedGroupIdRef.current !== groupId) return
+                    const refreshedQuarter = selectedQuarterRef.current
+                    if (
+                        quarter &&
+                        typeof year === 'number' &&
+                        (!refreshedQuarter || refreshedQuarter.quarter !== quarter || refreshedQuarter.year !== year)
+                    ) {
+                        return
+                    }
                     setArticles(data)
 
                     // Stop polling if no articles are in progress
@@ -402,17 +444,17 @@ export default function Groups() {
                 clearInterval(pollingIntervalRef.current)
             }
         }
-    }, [selectedGroupId])
+    }, [selectedGroupId, selectedQuarter])
 
     // Auto-start polling when viewing articles tab to catch scheduler-triggered runs
     useEffect(() => {
-        if (activeTab === 'articles' && selectedGroupId) {
-            startArticlePolling(selectedGroupId)
+        if (activeTab === 'articles' && selectedGroupId && selectedQuarter) {
+            startArticlePolling(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
         } else if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current)
             pollingIntervalRef.current = null
         }
-    }, [activeTab, selectedGroupId])
+    }, [activeTab, selectedGroupId, selectedQuarter])
 
     const updateGroup = async (updates: Partial<Group>, showFeedback = false) => {
         if (!selectedGroupId) return

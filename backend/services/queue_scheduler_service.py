@@ -328,7 +328,10 @@ class QueueSchedulerService:
             conn.close()
 
         if not still_processing:
-            self.group_research_service.check_and_trigger_runs()
+            self.group_research_service.check_and_trigger_runs(
+                target_quarter=quarter,
+                target_year=year,
+            )
 
     def trigger_for_stock(self, stock_id: int, quarter: Optional[str] = None, year: Optional[int] = None):
         target_quarter, target_year = _get_latest_quarter()

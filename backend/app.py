@@ -822,7 +822,18 @@ def remove_stock_from_group(group_id, symbol):
 def list_group_articles(group_id):
     """List deep-research group runs (one per quarter)."""
     try:
-        runs = group_research_service.list_runs(group_id)
+        quarter = request.args.get('quarter')
+        year = request.args.get('year', type=int)
+
+        if (quarter and year is None) or (year is not None and not quarter):
+            return jsonify({'error': 'Both quarter and year are required together'}), 400
+
+        if quarter:
+            quarter = quarter.upper()
+            if quarter not in ['Q1', 'Q2', 'Q3', 'Q4']:
+                return jsonify({'error': 'quarter must be one of Q1, Q2, Q3, Q4'}), 400
+
+        runs = group_research_service.list_runs(group_id, quarter=quarter, year=year)
         return jsonify(runs), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500

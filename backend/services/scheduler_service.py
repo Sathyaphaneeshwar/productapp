@@ -153,7 +153,11 @@ class SchedulerService:
 
         try:
             self.poll_watchlist()
-            self.group_research_service.check_and_trigger_runs()
+            latest_quarter, latest_year = _get_latest_quarter()
+            self.group_research_service.check_and_trigger_runs(
+                target_quarter=latest_quarter,
+                target_year=latest_year,
+            )
         except Exception as e:
             print(f"[Scheduler] Unexpected error: {e}")
         finally:

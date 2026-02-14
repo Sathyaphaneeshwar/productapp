@@ -4,7 +4,7 @@ import os
 import sys
 import html
 from datetime import datetime
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import markdown
 import re
 
@@ -192,11 +192,19 @@ class GroupResearchService:
         row = cursor.fetchone()
         return dict(row) if row else None
 
-    def check_and_trigger_runs(self):
+    def check_and_trigger_runs(
+        self,
+        target_quarter: Optional[str] = None,
+        target_year: Optional[int] = None,
+    ):
         """
         Scan all active groups. If every stock in a group has an available transcript
-        for the same quarter/year, trigger a deep research run (one per quarter).
+        for the same quarter/year, trigger a deep research run.
+        If target_quarter/target_year are provided, only that quarter is considered.
         """
+        if (target_quarter is None) != (target_year is None):
+            raise ValueError("target_quarter and target_year must be provided together")
+
         conn = self.get_db_connection()
         cursor = conn.cursor()
 
@@ -219,21 +227,31 @@ class GroupResearchService:
                 if not stock_ids:
                     continue
 
-                # Build intersection of available (quarter, year) across all stocks in the group
-                intersection: set[Tuple[str, int]] = set()
-                for idx, stock_id in enumerate(stock_ids):
-                    quarters = set(self._available_quarters_for_stock(cursor, stock_id))
-                    if idx == 0:
-                        intersection = quarters
-                    else:
-                        intersection &= quarters
+                quarter_candidates: List[Tuple[str, int]] = []
+                if target_quarter is not None and target_year is not None:
+                    stocks, available_transcripts, missing_stocks = self._collect_transcripts(
+                        cursor, group_id, target_quarter, int(target_year)
+                    )
+                    if not stocks or not available_transcripts or missing_stocks:
+                        continue
+                    quarter_candidates = [(target_quarter, int(target_year))]
+                else:
+                    # Backward-compatible path: trigger for every common available quarter.
+                    intersection: set[Tuple[str, int]] = set()
+                    for idx, stock_id in enumerate(stock_ids):
+                        quarters = set(self._available_quarters_for_stock(cursor, stock_id))
+                        if idx == 0:
+                            intersection = quarters
+                        else:
+                            intersection &= quarters
+                        if not intersection:
+                            break
+
                     if not intersection:
-                        break
+                        continue
+                    quarter_candidates = list(intersection)
 
-                if not intersection:
-                    continue
-
-                for quarter, year in intersection:
+                for quarter, year in quarter_candidates:
                     existing = self._existing_run(cursor, group_id, quarter, year)
                     if existing:
                         if existing["status"] in ("pending", "in_progress", "done"):
@@ -432,18 +450,28 @@ class GroupResearchService:
         finally:
             conn.close()
 
-    def list_runs(self, group_id: int) -> List[Dict]:
+    def list_runs(
+        self,
+        group_id: int,
+        quarter: Optional[str] = None,
+        year: Optional[int] = None,
+    ) -> List[Dict]:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                """
+            query = """
                 SELECT id, quarter, year, status, model_provider, model_id, error_message, created_at, updated_at
                 FROM group_research_runs
                 WHERE group_id = ?
-                ORDER BY year DESC, quarter DESC, created_at DESC
-                """,
-                (group_id,),
+            """
+            params: list = [group_id]
+            if quarter is not None and year is not None:
+                query += " AND quarter = ? AND year = ?"
+                params.extend([quarter, year])
+            query += " ORDER BY year DESC, quarter DESC, created_at DESC"
+            cursor.execute(
+                query,
+                params,
             )
             return [dict(row) for row in cursor.fetchall()]
         finally:
