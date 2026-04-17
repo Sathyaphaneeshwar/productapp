@@ -375,19 +375,26 @@ def get_watchlist():
                     'retry_scope': 'email'
                 }
 
+        fetch_schedule = None
         if not retry_info['retrying']:
             cursor.execute("""
-                SELECT attempts, next_check_at, last_status
+                SELECT attempts, next_check_at, last_status, last_checked_at,
+                       CASE
+                           WHEN locked_until IS NOT NULL
+                            AND datetime(locked_until) > datetime('now')
+                           THEN 1
+                           ELSE 0
+                       END AS is_locked
                 FROM transcript_fetch_schedule
                 WHERE stock_id = ? AND quarter = ? AND year = ?
                 LIMIT 1
             """, (stock_id, quarter, year))
-            retry_row = cursor.fetchone()
-            if retry_row and retry_row['attempts'] > 0 and retry_row['last_status'] == 'error':
+            fetch_schedule = cursor.fetchone()
+            if fetch_schedule and fetch_schedule['attempts'] > 0 and fetch_schedule['last_status'] == 'error':
                 retry_info = {
                     'retrying': True,
-                    'retry_attempts': retry_row['attempts'],
-                    'retry_next_at': _to_utc_iso(retry_row['next_check_at']),
+                    'retry_attempts': fetch_schedule['attempts'],
+                    'retry_next_at': _to_utc_iso(fetch_schedule['next_check_at']),
                     'retry_scope': 'transcript_fetch'
                 }
         
@@ -480,7 +487,13 @@ def get_watchlist():
                             'transcript_date': _to_utc_iso(transcript['created_at']) or transcript['created_at']
                         }
                     }
-        elif row['transcript_check_status'] == 'checking':
+        elif row['transcript_check_status'] == 'checking' or (
+            fetch_schedule
+            and (
+                fetch_schedule['last_checked_at'] is None
+                or fetch_schedule['is_locked']
+            )
+        ):
             status_info = {
                 'status': 'fetching',
                 'message': 'Fetching transcript...',

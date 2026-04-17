@@ -130,15 +130,106 @@ class QueueSchedulerService:
                 (quarter, year),
             )
 
+            deleted_stale, deleted_duplicates = self._cleanup_transcript_check_queue(
+                cursor,
+                quarter,
+                year,
+                all_ids,
+            )
+            if deleted_stale or deleted_duplicates:
+                print(
+                    "[QueueScheduler] Cleaned transcript_check queue: "
+                    f"{deleted_stale} stale, {deleted_duplicates} duplicate"
+                )
+
             conn.commit()
         finally:
             conn.close()
+
+    def _delete_queue_message_ids(self, cursor, message_ids):
+        if not message_ids:
+            return
+        for index in range(0, len(message_ids), 500):
+            batch = message_ids[index:index + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cursor.execute(
+                f"DELETE FROM queue_messages WHERE id IN ({placeholders})",
+                batch,
+            )
+
+    def _decode_transcript_check_payload(self, row):
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+            stock_id = int(payload.get("stock_id"))
+            payload_year = int(payload.get("year"))
+            payload_quarter = str(payload.get("quarter") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return stock_id, payload_quarter, payload_year
+
+    def _cleanup_transcript_check_queue(self, cursor, quarter: str, year: int, active_stock_ids: set[int]):
+        cursor.execute(
+            """
+            SELECT id, payload_json
+            FROM queue_messages
+            WHERE queue_name = 'transcript_check'
+            ORDER BY id ASC
+            """
+        )
+        rows = cursor.fetchall()
+        seen = set()
+        stale_ids = []
+        duplicate_ids = []
+
+        for row in rows:
+            decoded = self._decode_transcript_check_payload(row)
+            if decoded is None:
+                stale_ids.append(row["id"])
+                continue
+
+            stock_id, payload_quarter, payload_year = decoded
+            if (
+                payload_quarter != quarter
+                or payload_year != year
+                or stock_id not in active_stock_ids
+            ):
+                stale_ids.append(row["id"])
+                continue
+
+            key = (stock_id, payload_quarter, payload_year)
+            if key in seen:
+                duplicate_ids.append(row["id"])
+                continue
+            seen.add(key)
+
+        self._delete_queue_message_ids(cursor, stale_ids)
+        self._delete_queue_message_ids(cursor, duplicate_ids)
+        return len(stale_ids), len(duplicate_ids)
+
+    def _get_queued_transcript_check_stock_ids(self, cursor, quarter: str, year: int) -> set[int]:
+        cursor.execute(
+            """
+            SELECT payload_json
+            FROM queue_messages
+            WHERE queue_name = 'transcript_check'
+            """
+        )
+        queued_stock_ids = set()
+        for row in cursor.fetchall():
+            decoded = self._decode_transcript_check_payload(row)
+            if decoded is None:
+                continue
+            stock_id, payload_quarter, payload_year = decoded
+            if payload_quarter == quarter and payload_year == year:
+                queued_stock_ids.add(stock_id)
+        return queued_stock_ids
 
     def _enqueue_due_transcript_checks(self, quarter: str, year: int):
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
             now = datetime.utcnow()
+            queued_stock_ids = self._get_queued_transcript_check_stock_ids(cursor, quarter, year)
             cursor.execute(
                 """
                 SELECT id, stock_id, priority
@@ -155,6 +246,17 @@ class QueueSchedulerService:
             lock_until = now + timedelta(seconds=120)
             queue_rows = []
             for row in rows:
+                if row["stock_id"] in queued_stock_ids:
+                    cursor.execute(
+                        """
+                        UPDATE transcript_fetch_schedule
+                        SET locked_until = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (lock_until, row["id"]),
+                    )
+                    continue
+
                 cursor.execute(
                     """
                     UPDATE transcript_fetch_schedule
@@ -177,6 +279,7 @@ class QueueSchedulerService:
                         ),
                     )
                 )
+                queued_stock_ids.add(row["stock_id"])
             if queue_rows:
                 cursor.executemany(
                     """

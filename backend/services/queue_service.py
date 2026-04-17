@@ -46,16 +46,28 @@ class QueueService:
     def dequeue(self, queue_name: str, timeout: int = 5) -> Optional[dict]:
         timeout_seconds = max(float(timeout), 0.0)
         deadline = time.monotonic() + timeout_seconds
+        use_priority_order = queue_name == "transcript_check"
+        order_by = "available_at ASC, id ASC"
+        if use_priority_order:
+            order_by = """
+                    CASE
+                        WHEN json_valid(payload_json)
+                        THEN COALESCE(CAST(json_extract(payload_json, '$.priority') AS INTEGER), 0)
+                        ELSE 0
+                    END DESC,
+                    available_at ASC,
+                    id ASC
+            """
 
         while True:
             conn = self._get_connection(timeout=1.0)
             try:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT id, payload_json
                     FROM queue_messages
                     WHERE queue_name = ? AND available_at <= CURRENT_TIMESTAMP
-                    ORDER BY available_at ASC, id ASC
+                    ORDER BY {order_by}
                     LIMIT 1
                     """,
                     (queue_name,),
@@ -74,7 +86,11 @@ class QueueService:
                         return json.loads(row["payload_json"])
                     except json.JSONDecodeError:
                         return None
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                if use_priority_order and "json_" in str(e).lower():
+                    use_priority_order = False
+                    order_by = "available_at ASC, id ASC"
+                    continue
                 # Retry on transient lock errors during concurrent dequeues/writes.
                 pass
             finally:
