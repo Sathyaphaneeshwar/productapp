@@ -24,6 +24,12 @@ const parseTimestamp = (value?: string | null) => {
     return Number.isNaN(parsed) ? null : parsed
 }
 
+const formatTimerLabel = (seconds: number) => {
+    if (seconds >= 3600) return `${Math.ceil(seconds / 3600)}h`
+    if (seconds >= 60) return `${Math.ceil(seconds / 60)}m`
+    return `${Math.min(seconds, 999)}`
+}
+
 export default function PollStatusButton() {
     const [status, setStatus] = useState<PollStatusResponse | null>(null)
     const [error, setError] = useState<string | null>(null)
@@ -74,7 +80,7 @@ export default function PollStatusButton() {
 
     const schedulerRunning = status?.scheduler_running ?? status?.running ?? false
     const isPolling = status?.is_polling ?? ((status?.queues?.transcript_check ?? 0) > 0)
-    const intervalSeconds = status?.poll_interval_seconds ?? 5
+    const intervalSeconds = status?.poll_interval_seconds ?? 3600
     const lastEnqueueMs = parseTimestamp(status?.last_enqueue)
     const fallbackNextPollAtMs = lastEnqueueMs !== null
         ? lastEnqueueMs + (intervalSeconds * 1000)
@@ -84,8 +90,8 @@ export default function PollStatusButton() {
         ? Math.max(0, Math.ceil((nextPollAtMs - now) / 1000))
         : status?.next_poll_in_seconds ?? null
 
-    const displaySeconds = nextInSeconds !== null ? Math.min(nextInSeconds, 999) : null
-    const label = !error && schedulerRunning && displaySeconds !== null ? `${displaySeconds}` : '--'
+    const displaySeconds = nextInSeconds !== null ? nextInSeconds : null
+    const label = !error && schedulerRunning && displaySeconds !== null ? formatTimerLabel(displaySeconds) : '--'
 
     const progress = !error && schedulerRunning && displaySeconds !== null && intervalSeconds > 0
         ? ((intervalSeconds - Math.min(displaySeconds, intervalSeconds)) / intervalSeconds) * 100

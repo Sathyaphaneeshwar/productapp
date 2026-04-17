@@ -124,8 +124,12 @@ def get_poll_status():
 @app.route('/api/poll/trigger', methods=['POST'])
 def trigger_poll():
     try:
-        queue_scheduler.trigger_now()
-        return jsonify({'message': 'Queue scheduler trigger executed', 'started': True}), 202
+        result = queue_scheduler.trigger_now(fresh=True)
+        return jsonify({
+            'message': 'Queue scheduler restarted from a fresh queue',
+            'started': True,
+            **result
+        }), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

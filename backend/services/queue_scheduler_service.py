@@ -35,7 +35,7 @@ def _get_latest_quarter():
 
 
 class QueueSchedulerService:
-    def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 5, group_check_seconds: int = 300):
+    def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 3600, group_check_seconds: int = 300):
         self.queue = QueueService()
         self.group_research_service = GroupResearchService()
         self.running = False
@@ -239,7 +239,7 @@ class QueueSchedulerService:
                   AND (next_check_at IS NULL OR next_check_at <= ?)
                   AND (locked_until IS NULL OR locked_until < ?)
                 ORDER BY priority DESC, next_check_at ASC
-                LIMIT 100
+                LIMIT 1000
                 """,
                 (quarter, year, now, now),
             )
@@ -480,10 +480,92 @@ class QueueSchedulerService:
         finally:
             conn.close()
 
-    def trigger_now(self):
+    def _reset_queue_state_for_fresh_run(self, quarter: str, year: int) -> dict:
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM queue_messages")
+            deleted_queue_messages = cursor.rowcount
+
+            cursor.execute(
+                """
+                UPDATE transcript_fetch_schedule
+                SET next_check_at = CURRENT_TIMESTAMP,
+                    last_status = NULL,
+                    last_checked_at = NULL,
+                    attempts = 0,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE quarter = ? AND year = ?
+                """,
+                (quarter, year),
+            )
+            reset_transcript_schedules = cursor.rowcount
+
+            cursor.execute(
+                """
+                UPDATE transcript_checks
+                SET status = 'idle',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE stock_id IN (
+                    SELECT stock_id
+                    FROM transcript_fetch_schedule
+                    WHERE quarter = ? AND year = ?
+                )
+                """,
+                (quarter, year),
+            )
+            reset_transcript_checks = cursor.rowcount
+
+            cursor.execute(
+                """
+                UPDATE analysis_jobs
+                SET retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'queued', 'retrying')
+                """
+            )
+            reset_analysis_jobs = cursor.rowcount
+
+            cursor.execute(
+                """
+                UPDATE email_outbox
+                SET retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'queued', 'retrying')
+                """
+            )
+            reset_email_jobs = cursor.rowcount
+
+            conn.commit()
+            return {
+                "deleted_queue_messages": deleted_queue_messages,
+                "reset_transcript_schedules": reset_transcript_schedules,
+                "reset_transcript_checks": reset_transcript_checks,
+                "reset_analysis_jobs": reset_analysis_jobs,
+                "reset_email_jobs": reset_email_jobs,
+            }
+        finally:
+            conn.close()
+
+    def trigger_now(self, *, fresh: bool = False):
         quarter, year = _get_latest_quarter()
         self._sync_schedule(quarter, year)
+        reset_summary = None
+        if fresh:
+            reset_summary = self._reset_queue_state_for_fresh_run(quarter, year)
         self._enqueue_due_transcript_checks(quarter, year)
+        self._enqueue_due_analysis_jobs()
+        self._enqueue_due_email_jobs()
+        self.last_enqueue = datetime.now()
+        return {
+            "fresh": fresh,
+            "quarter": quarter,
+            "year": year,
+            "reset": reset_summary,
+        }
 
     def get_status(self) -> dict:
         now = datetime.now()
