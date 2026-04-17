@@ -293,7 +293,9 @@ export default function Watchlist() {
                 const response = await fetch(`${API_URL}/poll/status`)
                 if (!response.ok) return
                 const data = await response.json()
-                const isPolling = Boolean(data?.is_polling)
+                const isPolling = Boolean(
+                    data?.is_polling ?? ((data?.queues?.transcript_check ?? 0) > 0)
+                )
                 if (isPolling && !pollingActiveRef.current) {
                     refreshWatchlist()
                 }

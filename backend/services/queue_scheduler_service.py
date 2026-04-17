@@ -1,6 +1,7 @@
 import threading
 import time
 import json
+import math
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -485,14 +486,73 @@ class QueueSchedulerService:
         self._enqueue_due_transcript_checks(quarter, year)
 
     def get_status(self) -> dict:
+        now = datetime.now()
+        next_poll_at = None
+        next_poll_in_seconds = None
+        if self.running:
+            if self.last_enqueue and self.enqueue_seconds > 0:
+                elapsed_seconds = max(0, (now - self.last_enqueue).total_seconds())
+                cycles_until_next = math.floor(elapsed_seconds / self.enqueue_seconds) + 1
+                next_poll_at_dt = self.last_enqueue + timedelta(
+                    seconds=cycles_until_next * self.enqueue_seconds
+                )
+            else:
+                next_poll_at_dt = now
+            next_poll_at = next_poll_at_dt.isoformat()
+            next_poll_in_seconds = max(
+                0,
+                math.ceil((next_poll_at_dt - now).total_seconds()),
+            )
+
+        queues = {
+            "transcript_check": self.queue.length("transcript_check"),
+            "analysis": self.queue.length("analysis"),
+            "email": self.queue.length("email"),
+        }
+        active_transcript_checks = 0
+        next_transcript_check_at = None
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM transcript_fetch_schedule
+                WHERE locked_until IS NOT NULL
+                  AND datetime(locked_until) > datetime('now')
+                """
+            )
+            row = cursor.fetchone()
+            active_transcript_checks = int(row["count"]) if row else 0
+
+            cursor.execute(
+                """
+                SELECT MIN(next_check_at) AS next_check_at
+                FROM transcript_fetch_schedule
+                WHERE next_check_at IS NOT NULL
+                """
+            )
+            row = cursor.fetchone()
+            next_transcript_check_at = row["next_check_at"] if row else None
+        except Exception:
+            active_transcript_checks = 0
+            next_transcript_check_at = None
+        finally:
+            conn.close()
+
+        is_polling = queues["transcript_check"] > 0 or active_transcript_checks > 0
+
         return {
             "running": self.running,
+            "scheduler_running": self.running,
+            "is_polling": is_polling,
+            "poll_interval_seconds": self.enqueue_seconds,
+            "next_poll_at": next_poll_at,
+            "next_poll_in_seconds": next_poll_in_seconds,
             "queue_ok": self.queue.ping(),
-            "queues": {
-                "transcript_check": self.queue.length("transcript_check"),
-                "analysis": self.queue.length("analysis"),
-                "email": self.queue.length("email"),
-            },
+            "queues": queues,
+            "active_transcript_checks": active_transcript_checks,
+            "next_transcript_check_at": next_transcript_check_at,
             "last_schedule_sync": self.last_schedule_sync.isoformat() if self.last_schedule_sync else None,
             "last_enqueue": self.last_enqueue.isoformat() if self.last_enqueue else None,
             "last_group_check": self.last_group_check.isoformat() if self.last_group_check else None,

@@ -4,11 +4,24 @@ import { Button } from '@/components/ui/button'
 const API_URL = 'http://localhost:5001/api'
 
 type PollStatusResponse = {
-    scheduler_running: boolean
-    is_polling: boolean
-    poll_interval_seconds: number
+    scheduler_running?: boolean
+    running?: boolean
+    is_polling?: boolean
+    poll_interval_seconds?: number
     next_poll_at?: string | null
     next_poll_in_seconds?: number | null
+    last_enqueue?: string | null
+    queues?: {
+        transcript_check?: number
+        analysis?: number
+        email?: number
+    }
+}
+
+const parseTimestamp = (value?: string | null) => {
+    if (!value) return null
+    const parsed = Date.parse(value)
+    return Number.isNaN(parsed) ? null : parsed
 }
 
 export default function PollStatusButton() {
@@ -59,10 +72,14 @@ export default function PollStatusButton() {
         }
     }
 
-    const schedulerRunning = status?.scheduler_running ?? false
-    const isPolling = status?.is_polling ?? false
-    const intervalSeconds = status?.poll_interval_seconds ?? 120
-    const nextPollAtMs = status?.next_poll_at ? Date.parse(status.next_poll_at) : null
+    const schedulerRunning = status?.scheduler_running ?? status?.running ?? false
+    const isPolling = status?.is_polling ?? ((status?.queues?.transcript_check ?? 0) > 0)
+    const intervalSeconds = status?.poll_interval_seconds ?? 5
+    const lastEnqueueMs = parseTimestamp(status?.last_enqueue)
+    const fallbackNextPollAtMs = lastEnqueueMs !== null
+        ? lastEnqueueMs + (intervalSeconds * 1000)
+        : null
+    const nextPollAtMs = parseTimestamp(status?.next_poll_at) ?? fallbackNextPollAtMs
     const nextInSeconds = nextPollAtMs
         ? Math.max(0, Math.ceil((nextPollAtMs - now) / 1000))
         : status?.next_poll_in_seconds ?? null
