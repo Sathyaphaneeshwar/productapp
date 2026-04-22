@@ -35,7 +35,7 @@ def _get_latest_quarter():
 
 
 class QueueSchedulerService:
-    def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 3600, group_check_seconds: int = 300):
+    def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 300, group_check_seconds: int = 300):
         self.queue = QueueService()
         self.group_research_service = GroupResearchService()
         self.running = False
@@ -568,6 +568,19 @@ class QueueSchedulerService:
         }
 
     def get_status(self) -> dict:
+        def _normalize_timestamp(value):
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value.isoformat()
+            raw = str(value).strip()
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(raw.replace(" ", "T").replace("Z", "+00:00")).isoformat()
+            except ValueError:
+                return raw
+
         now = datetime.now()
         next_poll_at = None
         next_poll_in_seconds = None
@@ -634,7 +647,7 @@ class QueueSchedulerService:
             "queue_ok": self.queue.ping(),
             "queues": queues,
             "active_transcript_checks": active_transcript_checks,
-            "next_transcript_check_at": next_transcript_check_at,
+            "next_transcript_check_at": _normalize_timestamp(next_transcript_check_at),
             "last_schedule_sync": self.last_schedule_sync.isoformat() if self.last_schedule_sync else None,
             "last_enqueue": self.last_enqueue.isoformat() if self.last_enqueue else None,
             "last_group_check": self.last_group_check.isoformat() if self.last_group_check else None,

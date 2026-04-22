@@ -7,7 +7,6 @@ from db import get_db_connection
 from services.queue_service import QueueService
 from services.transcript_service import TranscriptService
 from services.analysis_job_service import AnalysisJobService
-from services.retry_utils import compute_backoff_seconds
 
 
 class TranscriptFetcherWorker:
@@ -56,19 +55,6 @@ class TranscriptFetcherWorker:
             (stock_id, status),
         )
 
-    def _parse_event_dt(self, value):
-        if not value:
-            return None
-        try:
-            event_dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except Exception:
-            return None
-        if event_dt.tzinfo is None:
-            event_dt = event_dt.replace(tzinfo=timezone.utc)
-        else:
-            event_dt = event_dt.astimezone(timezone.utc)
-        return event_dt
-
     def _compute_next_check(
         self,
         status: str,
@@ -83,27 +69,12 @@ class TranscriptFetcherWorker:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
 
         if status == "available":
-            return as_utc_naive(now + timedelta(hours=12))
+            return as_utc_naive(now + timedelta(hours=24))
         if status == "upcoming":
-            # Upcoming cadence rules:
-            # - Before event day: hourly checks
-            # - Event day and after scheduled time: every 10 minutes
-            # - Missing/invalid event date: stay aggressive at 10 minutes
-            event_dt = self._parse_event_dt(event_date)
-            if event_dt is None:
-                return as_utc_naive(now + timedelta(minutes=10))
-            if event_dt <= now:
-                return as_utc_naive(now + timedelta(minutes=10))
-            if event_dt.date() == now.date():
-                return as_utc_naive(now + timedelta(minutes=10))
-            return as_utc_naive(now + timedelta(hours=1))
+            return as_utc_naive(now + timedelta(minutes=5))
         if status == "error":
-            backoff = compute_backoff_seconds(attempts)
-            # Keep watchlist retries responsive even when transient errors occur.
-            if is_watchlist_stock:
-                backoff = min(backoff, 10 * 60)
-            return as_utc_naive(now + timedelta(seconds=backoff))
-        return as_utc_naive(now + timedelta(minutes=15))
+            return as_utc_naive(now + timedelta(minutes=5))
+        return as_utc_naive(now + timedelta(hours=1))
 
     def _process_job(self, job: dict):
         stock_id = job.get("stock_id")

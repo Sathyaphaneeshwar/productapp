@@ -10,6 +10,7 @@ type PollStatusResponse = {
     poll_interval_seconds?: number
     next_poll_at?: string | null
     next_poll_in_seconds?: number | null
+    next_transcript_check_at?: string | null
     last_enqueue?: string | null
     queues?: {
         transcript_check?: number
@@ -20,7 +21,8 @@ type PollStatusResponse = {
 
 const parseTimestamp = (value?: string | null) => {
     if (!value) return null
-    const parsed = Date.parse(value)
+    const normalized = value.includes('T') ? value : value.replace(' ', 'T')
+    const parsed = Date.parse(normalized)
     return Number.isNaN(parsed) ? null : parsed
 }
 
@@ -80,14 +82,16 @@ export default function PollStatusButton() {
 
     const schedulerRunning = status?.scheduler_running ?? status?.running ?? false
     const isPolling = status?.is_polling ?? ((status?.queues?.transcript_check ?? 0) > 0)
-    const intervalSeconds = status?.poll_interval_seconds ?? 3600
+    const intervalSeconds = status?.poll_interval_seconds ?? 300
     const lastEnqueueMs = parseTimestamp(status?.last_enqueue)
     const fallbackNextPollAtMs = lastEnqueueMs !== null
         ? lastEnqueueMs + (intervalSeconds * 1000)
         : null
     const nextPollAtMs = parseTimestamp(status?.next_poll_at) ?? fallbackNextPollAtMs
-    const nextInSeconds = nextPollAtMs
-        ? Math.max(0, Math.ceil((nextPollAtMs - now) / 1000))
+    const nextTranscriptCheckAtMs = parseTimestamp(status?.next_transcript_check_at)
+    const nextDisplayAtMs = nextTranscriptCheckAtMs ?? nextPollAtMs
+    const nextInSeconds = nextDisplayAtMs
+        ? Math.max(0, Math.ceil((nextDisplayAtMs - now) / 1000))
         : status?.next_poll_in_seconds ?? null
 
     const displaySeconds = nextInSeconds !== null ? nextInSeconds : null
