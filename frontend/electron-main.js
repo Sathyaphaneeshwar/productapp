@@ -13,7 +13,10 @@ const __dirname = path.dirname(__filename);
 let tray;
 let mainWindow;
 let backendProcess;
+let backendPid;
 let isQuitting = false;
+let allowImmediateQuit = false;
+let backendShutdownPromise = null;
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -93,14 +96,22 @@ function execAsync(command) {
 async function listPidsOnPort(port) {
   try {
     if (process.platform === 'win32') {
-      const { error, stdout } = await execAsync(`netstat -ano | findstr :${port}`);
+      const { error, stdout } = await execAsync(`netstat -ano -p tcp | findstr :${port}`);
       if (error || !stdout) return [];
 
       const pids = new Set();
       stdout.trim().split('\n').forEach((line) => {
         const parts = line.trim().split(/\s+/);
+        const localAddress = parts[1] || '';
+        const state = (parts[3] || '').toUpperCase();
         const pid = parts[parts.length - 1];
-        if (pid && !isNaN(pid)) {
+        if (
+          state === 'LISTENING'
+          && localAddress.endsWith(`:${port}`)
+          && pid
+          && !isNaN(pid)
+          && Number(pid) > 0
+        ) {
           pids.add(pid);
         }
       });
@@ -158,7 +169,7 @@ async function stopPidGracefully(pid, graceMs = 4000) {
     await sleep(200);
   }
 
-  log(`PID ${pid} did not exit after SIGTERM, forcing stop`);
+  log(`PID ${pid} did not exit after graceful stop, forcing stop`);
   try {
     if (process.platform === 'win32') {
       await execAsync(`taskkill /PID ${pid} /T /F`);
@@ -182,19 +193,39 @@ async function stopProcessesOnPort(port) {
   }
 }
 
-async function isBackendResponsive(timeoutMs = 1200) {
-  const url = `http://127.0.0.1:${BACKEND_PORT}/api/poll/status`;
+async function getBackendHealth(timeoutMs = 1200) {
+  const url = `http://127.0.0.1:${BACKEND_PORT}/api/system/health`;
   return new Promise((resolve) => {
     const req = http.get(url, (res) => {
-      res.resume();
-      resolve(res.statusCode && res.statusCode < 500);
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (body.length < 16_384) body += chunk;
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
     });
     req.setTimeout(timeoutMs, () => {
       req.destroy();
-      resolve(false);
+      resolve(null);
     });
-    req.on('error', () => resolve(false));
+    req.on('error', () => resolve(null));
   });
+}
+
+function isExpectedBackend(health) {
+  if (!health || health.service !== 'product-gemini-backend') return false;
+  if (!app.isPackaged) return true;
+  return health.app_version === app.getVersion();
 }
 
 const logPath = path.join(app.getPath('userData'), 'app.log');
@@ -274,13 +305,24 @@ function resolveBackendExecutable() {
 }
 
 async function startBackend() {
-  const existingBackendHealthy = await isBackendResponsive();
-  if (existingBackendHealthy) {
-    log('Detected healthy backend already running; skipping restart');
+  const existingHealth = await getBackendHealth();
+  if (isExpectedBackend(existingHealth)) {
+    backendPid = existingHealth.pid ? String(existingHealth.pid) : undefined;
+    log(
+      `Detected matching Product Gemini backend already running`
+      + `${backendPid ? ` with PID ${backendPid}` : ''}; reusing it`
+    );
     return true;
   }
 
-  // Only stop listeners when the backend is not healthy.
+  if (existingHealth) {
+    log(
+      `Detected stale or unexpected backend on port ${BACKEND_PORT}; `
+      + `expected app version ${app.getVersion()}`
+    );
+  }
+
+  // Stop only the process listening on the backend port before replacement.
   await stopProcessesOnPort(BACKEND_PORT);
 
   const BACKEND_EXE = resolveBackendExecutable();
@@ -299,7 +341,8 @@ async function startBackend() {
     // Ensure proper environment for macOS
     const spawnEnv = {
       ...process.env,
-      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+      PRODUCT_GEMINI_APP_VERSION: app.getVersion()
     };
 
     log(`Starting spawn with env PATH: ${spawnEnv.PATH?.substring(0, 100)}...`);
@@ -314,6 +357,7 @@ async function startBackend() {
 
     log(`Spawn called, process object created: ${!!backendProcess}`);
     log(`Backend PID: ${backendProcess?.pid || 'undefined'}`);
+    backendPid = backendProcess?.pid ? String(backendProcess.pid) : undefined;
 
     backendProcess.stdout.on('data', (data) => {
       log(`[Backend]: ${data}`);
@@ -331,6 +375,7 @@ async function startBackend() {
     backendProcess.on('close', (code, signal) => {
       log(`Backend process exited with code ${code}, signal ${signal}`);
       backendProcess = null;
+      backendPid = undefined;
     });
 
     backendProcess.on('exit', (code, signal) => {
@@ -377,6 +422,37 @@ function createWindow() {
   });
 }
 
+async function stopBackend() {
+  if (backendShutdownPromise) return backendShutdownPromise;
+
+  const pid = backendProcess?.pid ? String(backendProcess.pid) : backendPid;
+  if (!pid) return;
+
+  backendShutdownPromise = stopPidGracefully(pid)
+    .catch((err) => {
+      log(`Failed to stop backend PID ${pid}: ${err.message}`);
+    })
+    .finally(() => {
+      backendProcess = null;
+      backendPid = undefined;
+      backendShutdownPromise = null;
+    });
+
+  return backendShutdownPromise;
+}
+
+async function quitAfterBackendStops() {
+  if (allowImmediateQuit) {
+    app.quit();
+    return;
+  }
+
+  isQuitting = true;
+  await stopBackend();
+  allowImmediateQuit = true;
+  app.quit();
+}
+
 function setupTray() {
   const iconPath = path.join(__dirname, 'icon.png');
   const trayImage = nativeImage.createFromPath(iconPath);
@@ -388,8 +464,7 @@ function setupTray() {
     {
       label: 'Quit',
       click: () => {
-        isQuitting = true;
-        app.quit();
+        void quitAfterBackendStops();
       }
     }
   ]);
@@ -399,22 +474,13 @@ function setupTray() {
   tray.on('double-click', () => mainWindow?.show());
 }
 
-async function waitForBackend(retries = 20) {
-  const url = `http://127.0.0.1:${BACKEND_PORT}/api/watchlist`;
-
-  return new Promise((resolve) => {
-    const attempt = (remaining) => {
-      const req = http.get(url, () => resolve(true));
-      req.on('error', () => {
-        if (remaining <= 0) {
-          return resolve(false);
-        }
-        setTimeout(() => attempt(remaining - 1), 500);
-      });
-    };
-
-    attempt(retries);
-  });
+async function waitForBackend(retries = 120) {
+  for (let remaining = retries; remaining >= 0; remaining -= 1) {
+    const health = await getBackendHealth(1200);
+    if (isExpectedBackend(health)) return true;
+    if (remaining > 0) await sleep(500);
+  }
+  return false;
 }
 
 app.whenReady().then(async () => {
@@ -458,9 +524,11 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle('install-update', () => {
+  ipcMain.handle('install-update', async () => {
     if (updateStatus === 'ready') {
       isQuitting = true;
+      await stopBackend();
+      allowImmediateQuit = true;
       autoUpdater.quitAndInstall();
       return { status: 'installing' };
     }
@@ -477,11 +545,10 @@ app.on('window-all-closed', (event) => {
   event.preventDefault();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   isQuitting = true;
-  if (backendProcess?.pid) {
-    stopPidGracefully(String(backendProcess.pid)).catch((err) => {
-      console.error('Failed to stop backend process', err);
-    });
+  if (!allowImmediateQuit && (backendProcess?.pid || backendPid)) {
+    event.preventDefault();
+    void quitAfterBackendStops();
   }
 });

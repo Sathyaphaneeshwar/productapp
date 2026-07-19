@@ -6,6 +6,7 @@ from db import get_db_connection
 from services.analysis_job_service import AnalysisJobService
 
 DEFAULT_STALE_ANALYSIS_MINUTES = 5
+DEFAULT_STALE_GROUP_RESEARCH_MINUTES = 180
 
 
 def _get_latest_quarter():
@@ -42,12 +43,18 @@ class RecoveryService:
         self,
         analysis_job_service: AnalysisJobService,
         stale_minutes: int = DEFAULT_STALE_ANALYSIS_MINUTES,
+        stale_group_minutes: int = DEFAULT_STALE_GROUP_RESEARCH_MINUTES,
     ) -> Dict[str, int]:
         try:
             stale_minutes = int(stale_minutes)
         except (TypeError, ValueError):
             stale_minutes = DEFAULT_STALE_ANALYSIS_MINUTES
         stale_minutes = max(stale_minutes, 1)
+        try:
+            stale_group_minutes = int(stale_group_minutes)
+        except (TypeError, ValueError):
+            stale_group_minutes = DEFAULT_STALE_GROUP_RESEARCH_MINUTES
+        stale_group_minutes = max(stale_group_minutes, 30)
 
         summary = {
             "stale_transcripts_reset": 0,
@@ -56,6 +63,7 @@ class RecoveryService:
             "analysis_jobs_requeued": 0,
             "watchlist_schedule_recovered": 0,
             "watchlist_missing_analysis_requeued": 0,
+            "group_runs_recovered": 0,
         }
         stale_transcript_ids: List[int] = []
         missing_watchlist_analysis_ids: List[int] = []
@@ -64,6 +72,7 @@ class RecoveryService:
         cursor = conn.cursor()
         try:
             cutoff = datetime.now() - timedelta(minutes=stale_minutes)
+            group_cutoff = datetime.now() - timedelta(minutes=stale_group_minutes)
             latest_quarter, latest_year = _get_latest_quarter()
 
             # Recover watchlist rows that were left in error/backoff states.
@@ -151,6 +160,22 @@ class RecoveryService:
                 """
             )
             summary["email_jobs_recovered"] = cursor.rowcount
+
+            # Group research uses daemon threads. If the app exits mid-run,
+            # those rows otherwise remain in_progress forever and block all
+            # future automatic regeneration for the same group/quarter.
+            cursor.execute(
+                """
+                UPDATE group_research_runs
+                SET status = 'error',
+                    error_message = 'Recovered stale in-progress run after application restart',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'in_progress'
+                  AND COALESCE(updated_at, created_at) < ?
+                """,
+                (group_cutoff,),
+            )
+            summary["group_runs_recovered"] = cursor.rowcount
 
             # If transcript became available but no analysis was created due to
             # transient failures, requeue it automatically for watchlist stocks.

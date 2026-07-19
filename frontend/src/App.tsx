@@ -5,11 +5,12 @@ import Watchlist from './pages/Watchlist'
 import Groups from './pages/Groups'
 import Research from './pages/Research'
 import Settings from './pages/Settings'
+import Activity from './pages/Activity'
 import UpdateButton from './components/UpdateButton'
 import PollStatusButton from './components/PollStatusButton'
 
 type Theme = 'light' | 'dark' | 'system'
-type Page = 'watchlist' | 'groups' | 'research' | 'settings'
+type Page = 'watchlist' | 'groups' | 'research' | 'activity' | 'settings'
 
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>('watchlist')
@@ -147,6 +148,15 @@ function App() {
               Research
             </button>
             <button
+              onClick={() => setCurrentPage('activity')}
+              className={`text-xl font-semibold pb-2 border-b-2 transition-colors ${currentPage === 'activity'
+                ? 'border-primary text-foreground'
+                : 'border-transparent text-muted-foreground hover:text-foreground'
+                }`}
+            >
+              Activity
+            </button>
+            <button
               onClick={() => setCurrentPage('settings')}
               className={`text-xl font-semibold pb-2 border-b-2 transition-colors ${currentPage === 'settings'
                 ? 'border-primary text-foreground'
@@ -163,6 +173,7 @@ function App() {
       {currentPage === 'watchlist' && <Watchlist />}
       {currentPage === 'groups' && <Groups />}
       {currentPage === 'research' && <Research />}
+      {currentPage === 'activity' && <Activity />}
       {currentPage === 'settings' && <Settings />}
     </div>
   )

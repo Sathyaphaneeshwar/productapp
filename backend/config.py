@@ -186,6 +186,10 @@ def ensure_schema_migrations():
 
         cursor.execute("PRAGMA table_info(transcripts)")
         columns = {row[1] for row in cursor.fetchall()}
+        cursor.execute("PRAGMA table_info(transcript_analyses)")
+        analysis_columns = {row[1] for row in cursor.fetchall()}
+        cursor.execute("PRAGMA table_info(llm_providers)")
+        llm_provider_columns = {row[1] for row in cursor.fetchall()}
 
         def table_exists(name: str) -> bool:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
@@ -197,12 +201,15 @@ def ensure_schema_migrations():
         missing_analysis_error = 'analysis_error' not in columns
         missing_updated_at = 'updated_at' not in columns
         missing_transcript_checks = not transcript_checks_exists
+        missing_analysis_model_name = 'model_name' not in analysis_columns
+        missing_llm_api_key = 'api_key' not in llm_provider_columns
 
         missing_fetch_schedule = not table_exists("transcript_fetch_schedule")
         missing_transcript_events = not table_exists("transcript_events")
         missing_analysis_jobs = not table_exists("analysis_jobs")
         missing_queue_messages = not table_exists("queue_messages")
         missing_email_outbox = not table_exists("email_outbox")
+        missing_stock_activity_logs = not table_exists("stock_activity_logs")
 
         queue_index_missing = False
         if not missing_queue_messages:
@@ -215,12 +222,15 @@ def ensure_schema_migrations():
             or missing_analysis_error
             or missing_updated_at
             or missing_transcript_checks
+            or missing_analysis_model_name
+            or missing_llm_api_key
             or missing_fetch_schedule
             or missing_transcript_events
             or missing_analysis_jobs
             or missing_queue_messages
             or queue_index_missing
             or missing_email_outbox
+            or missing_stock_activity_logs
         )
 
         if not needs_migration:
@@ -242,6 +252,18 @@ def ensure_schema_migrations():
         if missing_updated_at:
             cursor.execute("ALTER TABLE transcripts ADD COLUMN updated_at TIMESTAMP")
             cursor.execute("UPDATE transcripts SET updated_at = CURRENT_TIMESTAMP")
+        if missing_analysis_model_name:
+            cursor.execute("ALTER TABLE transcript_analyses ADD COLUMN model_name TEXT")
+        if missing_llm_api_key:
+            cursor.execute("ALTER TABLE llm_providers ADD COLUMN api_key TEXT")
+            if 'api_key_encrypted' in llm_provider_columns:
+                cursor.execute("""
+                    UPDATE llm_providers
+                    SET api_key = api_key_encrypted
+                    WHERE api_key IS NULL
+                      AND api_key_encrypted IS NOT NULL
+                      AND api_key_encrypted != ''
+                """)
 
         if missing_transcript_checks:
             cursor.execute("""
@@ -357,6 +379,30 @@ def ensure_schema_migrations():
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_outbox_retry ON email_outbox(retry_next_at)")
+
+        if missing_stock_activity_logs:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stock_activity_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stock_id INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    level TEXT NOT NULL CHECK(level IN ('info', 'success', 'error')),
+                    message TEXT NOT NULL,
+                    quarter TEXT,
+                    year INTEGER,
+                    details_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stock_activity_stock_time
+                ON stock_activity_logs(stock_id, created_at DESC)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stock_activity_level_time
+                ON stock_activity_logs(level, created_at DESC)
+            """)
 
         conn.commit()
     except Exception as e:

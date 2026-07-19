@@ -7,6 +7,7 @@ from db import get_db_connection
 from services.queue_service import QueueService
 from services.transcript_service import TranscriptService
 from services.analysis_job_service import AnalysisJobService
+from services.stock_activity_service import StockActivityService
 
 
 class TranscriptFetcherWorker:
@@ -14,6 +15,7 @@ class TranscriptFetcherWorker:
         self.queue = QueueService()
         self.transcript_service = TranscriptService()
         self.analysis_job_service = AnalysisJobService()
+        self.activity_service = StockActivityService()
         self.db_path = str(DATABASE_PATH)
         self.running = False
         self.thread = None
@@ -105,6 +107,16 @@ class TranscriptFetcherWorker:
                 (stock_id, quarter, year),
             )
             existing = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT last_status
+                FROM transcript_fetch_schedule
+                WHERE stock_id = ? AND quarter = ? AND year = ?
+                """,
+                (stock_id, quarter, year),
+            )
+            schedule_before = cursor.fetchone()
+            previous_schedule_status = schedule_before["last_status"] if schedule_before else None
 
             self._mark_check_status(cursor, stock_id, "checking")
             conn.commit()
@@ -112,8 +124,12 @@ class TranscriptFetcherWorker:
             available = self.transcript_service.fetch_available_transcripts(symbol)
             available = [t for t in available if t.quarter == quarter and t.year == year]
 
-            upcoming = self.transcript_service.get_upcoming_calls(symbol)
-            upcoming = [t for t in upcoming if t.quarter == quarter and t.year == year]
+            # An available transcript is authoritative. Avoid a second network
+            # request that could fail and discard an already-successful result.
+            upcoming = []
+            if not available:
+                upcoming = self.transcript_service.get_upcoming_calls(symbol)
+                upcoming = [t for t in upcoming if t.quarter == quarter and t.year == year]
 
             schedule_status = "none"
             event_date = None
@@ -267,6 +283,30 @@ class TranscriptFetcherWorker:
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
 
+            if schedule_status != previous_schedule_status:
+                if schedule_status == "available":
+                    level = "success"
+                    message = "Transcript became available"
+                elif schedule_status == "upcoming":
+                    level = "info"
+                    message = "Earnings call detected; transcript polling is active"
+                else:
+                    level = "info"
+                    message = "Transcript check completed; no transcript found"
+                self.activity_service.safe_log_event(
+                    stock_id,
+                    "transcript",
+                    level,
+                    message,
+                    quarter=quarter,
+                    year=year,
+                    details={
+                        "status": schedule_status,
+                        "next_check_at": next_check_at,
+                        "event_date": event_date,
+                    },
+                )
+
         except Exception as e:
             cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
             is_watchlist_stock = cursor.fetchone() is not None
@@ -296,6 +336,18 @@ class TranscriptFetcherWorker:
             )
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
+            self.activity_service.safe_log_event(
+                stock_id,
+                "transcript",
+                "error",
+                f"Transcript check failed: {str(e)[:700]}",
+                quarter=quarter,
+                year=year,
+                details={
+                    "attempt": attempts,
+                    "next_check_at": next_check_at,
+                },
+            )
             print(f"[FetcherWorker] Error processing stock {stock_id}: {e}")
         finally:
             conn.close()

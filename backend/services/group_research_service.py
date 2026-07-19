@@ -1,4 +1,5 @@
 import threading
+import time
 import sqlite3
 import os
 import sys
@@ -14,6 +15,8 @@ from db import get_db_connection
 from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
 from services.email_service import EmailService
+from services.retry_utils import compute_backoff_seconds
+from services.stock_activity_service import StockActivityService
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'templates')
 
 
@@ -28,6 +31,7 @@ class GroupResearchService:
         self.transcript_service = TranscriptService()
         self.llm_service = LLMService()
         self.email_service = EmailService()
+        self.activity_service = StockActivityService()
         self.ensure_table()
 
     def get_db_connection(self):
@@ -305,6 +309,17 @@ class GroupResearchService:
                 (status, error, run_id),
             )
             conn.commit()
+            if status == "error":
+                for stock_id in self._group_stock_ids(cursor, group_id):
+                    self.activity_service.safe_log_event(
+                        stock_id,
+                        "group_research",
+                        "error",
+                        f"Group research failed: {error or 'unknown error'}",
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "group_name": group_name},
+                    )
 
         try:
             update_status("in_progress")
@@ -414,6 +429,16 @@ class GroupResearchService:
                 ),
             )
             conn.commit()
+            for item in available_transcripts:
+                self.activity_service.safe_log_event(
+                    item["stock"]["id"],
+                    "group_research",
+                    "success",
+                    f"Group research completed for {group_name}",
+                    quarter=quarter,
+                    year=year,
+                    details={"group_id": group_id, "run_id": run_id},
+                )
 
             # Render HTML once for email/export
             run_payload = {
@@ -434,16 +459,61 @@ class GroupResearchService:
             if emails:
                 stocks_list = ", ".join([item["stock"]["symbol"] for item in available_transcripts])
                 body = rendered_html.replace("{{STOCK_LIST}}", html.escape(stocks_list))
+                failed_recipients = 0
                 for email in emails:
-                    try:
-                        self.email_service.send_email(
-                            to_email=email,
-                            subject=f"Group Research: {group_name} - {quarter} {year}",
-                            body=body,
-                            is_html=True,
-                        )
-                    except Exception as e:
-                        print(f"[GroupResearch] Failed to send email to {email}: {e}")
+                    delivered = False
+                    last_error = None
+                    for attempt in range(1, 4):
+                        try:
+                            self.email_service.send_email(
+                                to_email=email,
+                                subject=f"Group Research: {group_name} - {quarter} {year}",
+                                body=body,
+                                is_html=True,
+                            )
+                            delivered = True
+                            break
+                        except Exception as error:
+                            last_error = error
+                            if attempt < 3:
+                                time.sleep(
+                                    compute_backoff_seconds(
+                                        attempt,
+                                        base_seconds=5,
+                                        max_seconds=30,
+                                    )
+                                )
+                    if not delivered:
+                        failed_recipients += 1
+                        print(f"[GroupResearch] Failed to send email to {email}: {last_error}")
+
+                email_level = "error" if failed_recipients else "success"
+                email_message = (
+                    f"Group research email failed for {failed_recipients} recipient(s)"
+                    if failed_recipients
+                    else "Group research email sent successfully"
+                )
+                for item in available_transcripts:
+                    self.activity_service.safe_log_event(
+                        item["stock"]["id"],
+                        "email",
+                        email_level,
+                        email_message,
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "run_id": run_id},
+                    )
+            else:
+                for item in available_transcripts:
+                    self.activity_service.safe_log_event(
+                        item["stock"]["id"],
+                        "email",
+                        "error",
+                        "No active email recipients; group research email was not sent",
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "run_id": run_id},
+                    )
 
         except Exception as e:
             update_status("error", f"Unexpected error: {e}")

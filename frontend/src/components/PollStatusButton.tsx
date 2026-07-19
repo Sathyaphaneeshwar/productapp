@@ -101,7 +101,7 @@ export default function PollStatusButton() {
         ? ((intervalSeconds - Math.min(displaySeconds, intervalSeconds)) / intervalSeconds) * 100
         : 0
 
-    let ringClass = 'stroke-muted-foreground opacity-60'
+    const ringClass = 'stroke-muted-foreground opacity-60'
     let progressClass = 'stroke-blue-500'
     if (error) {
         progressClass = 'stroke-red-500'

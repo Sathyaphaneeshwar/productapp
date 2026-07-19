@@ -59,6 +59,34 @@ jobs:
             exit 1
           }
         shell: pwsh
+
+      - name: Smoke test packaged backend
+        shell: pwsh
+        run: |
+          $backend = Resolve-Path "backend/dist/backend-app/backend-app.exe"
+          $process = Start-Process -FilePath $backend -PassThru -WindowStyle Hidden
+          $healthy = $false
+          try {
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
+              Start-Sleep -Seconds 1
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:5001/api/system/health" -TimeoutSec 2
+                if ($health.service -eq "product-gemini-backend" -and $health.api_version -eq 2) {
+                  $healthy = $true
+                  break
+                }
+              } catch {
+                # Backend may still be starting.
+              }
+            }
+          } finally {
+            if (!$process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+          if (!$healthy) {
+            throw "Packaged backend health check failed"
+          }
       
       # Install frontend dependencies
       - name: Install frontend dependencies
@@ -76,9 +104,7 @@ jobs:
       - name: Build Electron app
         run: |
           cd frontend
-          npm run electron:build
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm run electron:build -- --win --publish never
       
       # Upload artifact
       - name: Upload Windows installer
@@ -152,9 +178,7 @@ jobs:
       - name: Build Electron app
         run: |
           cd frontend
-          npm run electron:build -- --mac
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm run electron:build -- --mac --publish never
       
       # Upload artifact
       - name: Upload Mac installer

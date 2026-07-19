@@ -33,4 +33,6 @@ function Badge({ className, variant, ...props }: BadgeProps) {
   )
 }
 
+// Component libraries intentionally export their variant helper for composition.
+// eslint-disable-next-line react-refresh/only-export-components
 export { Badge, badgeVariants }

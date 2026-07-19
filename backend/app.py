@@ -23,6 +23,7 @@ from services.recovery_service import RecoveryService
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
+from services.stock_activity_service import StockActivityService
 
 app = Flask(__name__)
 CORS(app)
@@ -37,6 +38,7 @@ recovery_service = RecoveryService()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
+stock_activity_service = StockActivityService()
 
 DB_PATH = str(DATABASE_PATH)
 
@@ -49,9 +51,11 @@ def _should_start_background_workers() -> bool:
 
 def _run_startup_recovery():
     stale_minutes = os.environ.get("ANALYSIS_STALE_MINUTES", "5")
+    stale_group_minutes = os.environ.get("GROUP_RESEARCH_STALE_MINUTES", "180")
     summary = recovery_service.run_startup_recovery(
         analysis_job_service=analysis_job_service,
         stale_minutes=stale_minutes,
+        stale_group_minutes=stale_group_minutes,
     )
     if any(summary.values()):
         print(f"[Recovery] Startup recovery summary: {summary}")
@@ -114,6 +118,19 @@ def _trigger_stock_fetch_with_retry(
                 continue
             raise
 
+
+@app.route('/api/system/health', methods=['GET'])
+def get_system_health():
+    """Identify the packaged backend so Electron never reuses a stale process."""
+    return jsonify({
+        'status': 'ok',
+        'service': 'product-gemini-backend',
+        'api_version': 2,
+        'app_version': os.environ.get('PRODUCT_GEMINI_APP_VERSION'),
+        'pid': os.getpid(),
+    })
+
+
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
     try:
@@ -153,6 +170,45 @@ def trigger_scheduler():
         return jsonify({'message': 'Stock queued for transcript check'}), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/activity', methods=['GET'])
+def get_stock_activity():
+    stock_id = request.args.get('stock_id', type=int)
+    level = request.args.get('level')
+    limit = request.args.get('limit', default=200, type=int)
+
+    try:
+        if stock_id is not None:
+            conn = get_db_connection()
+            try:
+                stock = conn.execute(
+                    """
+                    SELECT id, COALESCE(stock_symbol, bse_code) AS symbol, stock_name AS name
+                    FROM stocks
+                    WHERE id = ?
+                    """,
+                    (stock_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if not stock:
+                return jsonify({'error': 'Stock not found'}), 404
+
+        events = stock_activity_service.get_activity(
+            stock_id=stock_id,
+            level=level,
+            limit=limit or 200,
+        )
+        return jsonify({
+            'events': events,
+            'count': len(events),
+            'stock_id': stock_id,
+        })
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
 
 def get_current_fy_quarter():
     """
@@ -1352,7 +1408,10 @@ def get_llm_providers():
     
     cursor.execute("""
         SELECT id, provider_name, display_name, is_active, 
-               (api_key_encrypted IS NOT NULL AND api_key_encrypted != '') as has_key
+               (
+                   COALESCE(NULLIF(api_key, ''), NULLIF(api_key_encrypted, ''))
+                   IS NOT NULL
+               ) as has_key
         FROM llm_providers
         ORDER BY display_name
     """)
@@ -1616,11 +1675,13 @@ def get_analyses(stock_id):
                 ta.llm_output,
                 ta.created_at,
                 ta.model_provider,
+                COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                 t.quarter,
                 t.year,
                 t.source_url
             FROM transcript_analyses ta
             JOIN transcripts t ON ta.transcript_id = t.id
+            LEFT JOIN llm_models lm ON lm.id = ta.model_id
             WHERE t.stock_id = ?
             ORDER BY ta.created_at DESC
         """, (stock_id,))
@@ -1656,7 +1717,7 @@ def download_latest_analysis(stock_id):
                 ta.llm_output,
                 ta.created_at,
                 ta.model_provider,
-                ta.model_id,
+                COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                 t.quarter,
                 t.year,
                 t.source_url,
@@ -1666,6 +1727,7 @@ def download_latest_analysis(stock_id):
             FROM transcript_analyses ta
             JOIN transcripts t ON ta.transcript_id = t.id
             JOIN stocks s ON t.stock_id = s.id
+            LEFT JOIN llm_models lm ON lm.id = ta.model_id
             WHERE s.id = ?
         """
 
@@ -1717,7 +1779,7 @@ def download_latest_analysis(stock_id):
         quarter = analysis['quarter']
         year = analysis['year']
         provider = (analysis['model_provider'] or 'LLM').upper()
-        model_name_value = str(analysis['model_id']) if analysis['model_id'] is not None else provider
+        model_name_value = analysis['model_name'] or provider
         transcript_url = analysis['source_url'] or '#'
 
         generated_at = str(analysis['created_at'])

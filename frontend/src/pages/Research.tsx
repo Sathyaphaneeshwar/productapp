@@ -246,7 +246,7 @@ export default function Research() {
 
             const blob = await response.blob()
             const disposition = response.headers.get('Content-Disposition') || ''
-            const match = disposition.match(/filename=\"?([^\"]+)\"?/)
+            const match = disposition.match(/filename="?([^"]+)"?/)
             const fileName = match?.[1] || 'research-report.pdf'
 
             const url = window.URL.createObjectURL(blob)

@@ -9,6 +9,7 @@ from .base_provider import BaseLLMProvider, LLMResponse, ModelInfo
 
 class OpenRouterProvider(BaseLLMProvider):
     """OpenRouter provider for accessing 400+ models."""
+    REQUEST_TIMEOUT = (10, 30)
     
     def __init__(self, api_key: str):
         super().__init__(api_key, 'openrouter')
@@ -99,7 +100,8 @@ class OpenRouterProvider(BaseLLMProvider):
         try:
             response = requests.get(
                 f"{self.base_url}/models",
-                headers={'Authorization': f'Bearer {self.api_key}'}
+                headers={'Authorization': f'Bearer {self.api_key}'},
+                timeout=self.REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             data = response.json()
@@ -152,7 +154,8 @@ class OpenRouterProvider(BaseLLMProvider):
             # Try to fetch models as validation
             response = requests.get(
                 f"{self.base_url}/models",
-                headers={'Authorization': f'Bearer {self.api_key}'}
+                headers={'Authorization': f'Bearer {self.api_key}'},
+                timeout=self.REQUEST_TIMEOUT,
             )
             return response.status_code == 200
         except Exception as e:

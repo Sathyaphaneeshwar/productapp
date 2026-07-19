@@ -300,7 +300,7 @@ export default function Watchlist() {
                     refreshWatchlist()
                 }
                 pollingActiveRef.current = isPolling
-            } catch (error) {
+            } catch {
                 // Ignore poll status errors to avoid breaking watchlist updates
             }
         }, 2000)
@@ -537,7 +537,7 @@ export default function Watchlist() {
 
             const blob = await response.blob()
             const disposition = response.headers.get('Content-Disposition') || ''
-            const match = disposition.match(/filename=\"?([^\";]+)\"?/i)
+            const match = disposition.match(/filename="?([^";]+)"?/i)
             const fallbackName = `${(stock.symbol || 'analysis')}-${stock.status_details?.quarter || 'latest'}-${stock.status_details?.year || ''}-analysis`.replace(/[^a-zA-Z0-9._-]+/g, '_')
             const fileName = match && match[1] ? match[1] : `${fallbackName}.pdf`
 

@@ -16,6 +16,7 @@ class LLMResponse:
     tokens_output: int
     cost_usd: float
     raw_response: dict = None  # Store full API response for debugging
+    database_model_id: Optional[int] = None
 
 @dataclass
 class ModelInfo:

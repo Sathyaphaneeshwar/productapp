@@ -9,6 +9,7 @@ from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
 from services.email_outbox_service import EmailOutboxService
 from services.retry_utils import compute_backoff_seconds
+from services.stock_activity_service import StockActivityService
 
 
 class AnalysisQueueWorker:
@@ -19,6 +20,7 @@ class AnalysisQueueWorker:
         self.transcript_service = TranscriptService()
         self.llm_service = LLMService()
         self.email_outbox_service = EmailOutboxService()
+        self.activity_service = StockActivityService()
         self.running = False
         self.thread = None
 
@@ -130,14 +132,25 @@ class AnalysisQueueWorker:
             )
             llm_output = llm_response.content
             provider_name = llm_response.provider_name
-            model_id = getattr(llm_response, "model_id", None)
+            model_name = getattr(llm_response, "model_id", None)
+            database_model_id = getattr(llm_response, "database_model_id", None)
 
             cursor.execute(
                 """
-                INSERT INTO transcript_analyses (transcript_id, prompt_snapshot, llm_output, model_provider, model_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO transcript_analyses (
+                    transcript_id, prompt_snapshot, llm_output,
+                    model_provider, model_id, model_name
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (transcript_id, system_prompt, llm_output, provider_name, model_id),
+                (
+                    transcript_id,
+                    system_prompt,
+                    llm_output,
+                    provider_name,
+                    database_model_id,
+                    model_name,
+                ),
             )
             conn.commit()
             new_analysis_id = cursor.lastrowid
@@ -173,7 +186,40 @@ class AnalysisQueueWorker:
             )
             conn.commit()
 
-            self.email_outbox_service.enqueue_for_analysis(new_analysis_id)
+            self.activity_service.safe_log_event(
+                stock_id,
+                "analysis",
+                "success",
+                "Stock analysis completed",
+                quarter=transcript["quarter"],
+                year=transcript["year"],
+                details={
+                    "provider": provider_name,
+                    "model": model_name,
+                },
+            )
+
+            try:
+                email_jobs = self.email_outbox_service.enqueue_for_analysis(new_analysis_id)
+                if email_jobs == 0:
+                    self.activity_service.safe_log_event(
+                        stock_id,
+                        "email",
+                        "error",
+                        "No active email recipients; analysis email was not queued",
+                        quarter=transcript["quarter"],
+                        year=transcript["year"],
+                    )
+            except Exception as email_error:
+                self.activity_service.safe_log_event(
+                    stock_id,
+                    "email",
+                    "error",
+                    f"Could not queue analysis email: {str(email_error)[:700]}",
+                    quarter=transcript["quarter"],
+                    year=transcript["year"],
+                )
+                print(f"[AnalysisWorker] Analysis {new_analysis_id} email enqueue failed: {email_error}")
 
         except Exception as e:
             message = str(e)
@@ -210,6 +256,20 @@ class AnalysisQueueWorker:
                     (message[:500], transcript_id),
                 )
             conn.commit()
+            if 'stock_id' in locals() and 'transcript' in locals():
+                self.activity_service.safe_log_event(
+                    stock_id,
+                    "analysis",
+                    "error",
+                    f"Stock analysis failed: {message[:700]}",
+                    quarter=transcript["quarter"],
+                    year=transcript["year"],
+                    details={
+                        "attempt": attempts,
+                        "will_retry": not non_retryable,
+                        "retry_next_at": retry_next_at,
+                    },
+                )
             print(f"[AnalysisWorker] Job {job_id} error: {e}")
         finally:
             conn.close()

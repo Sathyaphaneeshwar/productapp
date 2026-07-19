@@ -5,6 +5,27 @@ import { Loader2, CheckCircle2, XCircle, Mail, Settings as SettingsIcon } from '
 
 type SettingsTab = 'email' | 'analysis' | 'deep_research' | 'api'
 
+type LlmProvider = {
+    id: number
+    provider_name: string
+    display_name: string
+    has_key: boolean
+}
+
+type LlmModel = {
+    id: number
+    provider_name: string
+    model_id: string
+    display_name: string
+    supports_thinking: boolean
+    user_max_tokens?: number | null
+    max_output_tokens: number
+    user_thinking_enabled?: boolean
+    user_thinking_budget?: number | null
+}
+
+type LlmSettings = Record<string, string | number>
+
 const API_URL = 'http://localhost:5001/api'
 
 export default function Settings() {
@@ -110,7 +131,7 @@ export default function Settings() {
             } else {
                 setSmtpStatus('error')
             }
-        } catch (error) {
+        } catch {
             setSmtpStatus('error')
         } finally {
             setIsCheckingStatus(false)
@@ -150,7 +171,7 @@ export default function Settings() {
             } else {
                 setSaveResult({ status: 'error', message: data.message || 'Failed to save settings' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSaving(false)
@@ -198,7 +219,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to add email' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         }
     }
@@ -277,7 +298,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save API key' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingKey(false)
@@ -300,7 +321,7 @@ export default function Settings() {
             } else {
                 setTestResult({ status: 'error', message: data.message || 'Connection failed. Invalid API Key.' })
             }
-        } catch (error) {
+        } catch {
             setTestResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsTestingKey(false)
@@ -341,7 +362,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to update prompt' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingDefaultPrompt(false)
@@ -349,9 +370,9 @@ export default function Settings() {
     }
 
     // LLM Settings State
-    const [llmProviders, setLlmProviders] = useState<any[]>([])
-    const [llmSettings, setLlmSettings] = useState<any>({})
-    const [llmModels, setLlmModels] = useState<any[]>([])
+    const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([])
+    const [llmSettings, setLlmSettings] = useState<LlmSettings>({})
+    const [llmModels, setLlmModels] = useState<LlmModel[]>([])
     const [isSyncing, setIsSyncing] = useState<string | null>(null)
     const [savingKeyProvider, setSavingKeyProvider] = useState<string | null>(null)
     const [providerKeys, setProviderKeys] = useState<{ [key: string]: string }>({})
@@ -429,7 +450,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save API key' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setSavingKeyProvider(null)
@@ -453,14 +474,14 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to sync models' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSyncing(null)
         }
     }
 
-    const handleSaveDefaultModel = async (modelId: string, settingKey: string = 'default_model_id') => {
+    const handleSaveDefaultModel = async (modelId: string | number, settingKey: string = 'default_model_id') => {
         setIsSavingDefaultModel(true)
         setSaveResult(null)
 
@@ -475,19 +496,19 @@ export default function Settings() {
                 const taskLabel = settingKey === 'watchlist_model_id' ? 'Analysis' :
                     settingKey === 'group_research_model_id' ? 'Deep Research' : 'Default'
                 setSaveResult({ status: 'success', message: `${taskLabel} model updated!` })
-                setLlmSettings((prev: any) => ({ ...prev, [settingKey]: modelId }))
+                setLlmSettings((prev) => ({ ...prev, [settingKey]: modelId }))
             } else {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to update model' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingDefaultModel(false)
         }
     }
 
-    const handleOpenConfig = (model: any) => {
+    const handleOpenConfig = (model: LlmModel) => {
         setConfiguringModelId(model.id)
         setConfigMaxTokens(model.user_max_tokens || model.max_output_tokens || 4096)
         setConfigThinkingEnabled(model.user_thinking_enabled || false)
@@ -518,7 +539,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save config' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingConfig(false)
@@ -779,7 +800,7 @@ export default function Settings() {
                                 const settingKey = activeTab === 'analysis' ? 'watchlist_model_id' : 'group_research_model_id'
                                 const currentModelId = llmSettings[settingKey] || llmSettings.default_model_id
                                 // Check if any model from this provider is selected for this task
-                                const isProviderActive = providerModels.some(m => m.id == currentModelId)
+                                const isProviderActive = providerModels.some(m => m.id === Number(currentModelId))
 
                                 const handleToggleProvider = () => {
                                     if (isProviderActive) return // Already active
@@ -870,7 +891,7 @@ export default function Settings() {
                                                         </h5>
                                                     </div>
 
-                                                    {providerModels.filter(m => m.id == currentModelId).map(model => (
+                                                    {providerModels.filter(m => m.id === Number(currentModelId)).map(model => (
                                                         <div key={model.id} className="space-y-4">
                                                             <div className="grid grid-cols-2 gap-4">
                                                                 <div>
@@ -913,7 +934,7 @@ export default function Settings() {
                                                                                 </style>
                                                                                 <Input
                                                                                     type="number"
-                                                                                    value={configuringModelId === model.id ? (configThinkingBudget === 0 ? '' : configThinkingBudget) : (model.user_thinking_budget === 0 ? '' : model.user_thinking_budget)}
+                                                                                    value={configuringModelId === model.id ? (configThinkingBudget === 0 ? '' : configThinkingBudget) : (model.user_thinking_budget === 0 ? '' : (model.user_thinking_budget ?? ''))}
                                                                                     placeholder="Auto"
                                                                                     onChange={(e) => {
                                                                                         const val = e.target.value;

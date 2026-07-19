@@ -6,6 +6,7 @@ from db import get_db_connection
 from services.queue_service import QueueService
 from services.email_service import EmailService
 from services.retry_utils import compute_backoff_seconds
+from services.stock_activity_service import StockActivityService
 
 
 class EmailQueueWorker:
@@ -13,6 +14,7 @@ class EmailQueueWorker:
         self.db_path = str(DATABASE_PATH)
         self.queue = QueueService()
         self.email_service = EmailService()
+        self.activity_service = StockActivityService()
         self.running = False
         self.thread = None
 
@@ -74,12 +76,14 @@ class EmailQueueWorker:
 
             cursor.execute(
                 """
-                SELECT ta.id as analysis_id, ta.llm_output, ta.model_provider, ta.model_id,
+                SELECT ta.id as analysis_id, ta.llm_output, ta.model_provider,
+                       COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                        t.stock_id, t.quarter, t.year, t.source_url,
                        s.stock_symbol, s.bse_code, s.stock_name
                 FROM transcript_analyses ta
                 JOIN transcripts t ON t.id = ta.transcript_id
                 JOIN stocks s ON s.id = t.stock_id
+                LEFT JOIN llm_models lm ON lm.id = ta.model_id
                 WHERE ta.id = ?
                 """,
                 (outbox["analysis_id"],),
@@ -89,7 +93,7 @@ class EmailQueueWorker:
                 raise ValueError("Analysis not found for email")
 
             symbol = analysis["stock_symbol"] or analysis["bse_code"]
-            model_name = analysis["model_id"] if analysis["model_id"] else analysis["model_provider"]
+            model_name = analysis["model_name"] or analysis["model_provider"]
 
             self.email_service.send_analysis_email(
                 to_email=outbox["recipient"],
@@ -112,6 +116,14 @@ class EmailQueueWorker:
                 (outbox_id,),
             )
             conn.commit()
+            self.activity_service.safe_log_event(
+                analysis["stock_id"],
+                "email",
+                "success",
+                "Analysis email sent successfully",
+                quarter=analysis["quarter"],
+                year=analysis["year"],
+            )
 
         except Exception as e:
             cursor.execute("SELECT attempts FROM email_outbox WHERE id = ?", (outbox_id,))
@@ -128,6 +140,19 @@ class EmailQueueWorker:
                 (attempts, retry_next_at, outbox_id),
             )
             conn.commit()
+            if 'analysis' in locals() and analysis:
+                self.activity_service.safe_log_event(
+                    analysis["stock_id"],
+                    "email",
+                    "error",
+                    f"Email delivery failed: {str(e)[:700]}",
+                    quarter=analysis["quarter"],
+                    year=analysis["year"],
+                    details={
+                        "attempt": attempts,
+                        "retry_next_at": retry_next_at,
+                    },
+                )
             print(f"[EmailWorker] Job {outbox_id} error: {e}")
         finally:
             conn.close()

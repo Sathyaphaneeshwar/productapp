@@ -27,13 +27,11 @@ export default function UpdateButton() {
     const [status, setStatus] = useState<UpdateStatus>('idle')
     const [info, setInfo] = useState<UpdateInfo | null>(null)
     const [version, setVersion] = useState<string>('')
-    const [isElectron, setIsElectron] = useState(false)
+    const [isElectron] = useState(() => Boolean(window.electronUpdater?.isElectron))
 
     useEffect(() => {
         // Check if running in Electron
         if (window.electronUpdater?.isElectron) {
-            setIsElectron(true)
-
             // Get app version
             window.electronUpdater.getVersion().then((v) => setVersion(v))
 

@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS transcript_analyses (
     llm_output TEXT,                    -- The AI generated summary/analysis
     model_provider TEXT,                -- e.g., 'gemini', 'openai' (deprecated, use model_id)
     model_id INTEGER,                   -- FK to llm_models
+    model_name TEXT,                    -- Provider-facing model identifier
     thinking_mode_used BOOLEAN DEFAULT 0,
     tokens_used_input INTEGER,
     tokens_used_output INTEGER,
@@ -231,6 +232,24 @@ CREATE TABLE IF NOT EXISTS email_outbox (
 CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
 CREATE INDEX IF NOT EXISTS idx_email_outbox_retry ON email_outbox(retry_next_at);
 
+-- Stock Activity Logs (user-visible operational history)
+CREATE TABLE IF NOT EXISTS stock_activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    level TEXT NOT NULL CHECK(level IN ('info', 'success', 'error')),
+    message TEXT NOT NULL,
+    quarter TEXT,
+    year INTEGER,
+    details_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_stock_activity_stock_time
+ON stock_activity_logs(stock_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_activity_level_time
+ON stock_activity_logs(level, created_at DESC);
+
 -- Group Deep Research Runs (per group, per quarter)
 CREATE TABLE IF NOT EXISTS group_research_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,6 +285,7 @@ CREATE TABLE IF NOT EXISTS llm_providers (
     provider_name TEXT UNIQUE NOT NULL, -- 'google_ai', 'openai', 'anthropic', 'openrouter'
     display_name TEXT NOT NULL, -- 'Google AI Studio', 'OpenAI', etc.
     api_key_encrypted TEXT, -- Encrypted API key
+    api_key TEXT, -- Current provider integrations use the locally stored plain-text key
     is_active BOOLEAN DEFAULT 1,
     base_url TEXT, -- For OpenRouter or custom endpoints
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

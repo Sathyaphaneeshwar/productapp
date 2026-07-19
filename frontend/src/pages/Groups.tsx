@@ -54,6 +54,12 @@ type Quarter = {
     label: string
 }
 
+type StockSearchResult = {
+    id: number
+    symbol: string
+    name: string
+}
+
 export default function Groups() {
     const [groups, setGroups] = useState<Group[]>([])
     const [selectedGroupId, setSelectedGroupId] = useState<number | null>(null)
@@ -63,7 +69,7 @@ export default function Groups() {
     const [isCreating, setIsCreating] = useState(false)
     const [newGroupName, setNewGroupName] = useState('')
     const [stockSearchQuery, setStockSearchQuery] = useState('')
-    const [searchResults, setSearchResults] = useState<any[]>([])
+    const [searchResults, setSearchResults] = useState<StockSearchResult[]>([])
     const [isSearching, setIsSearching] = useState(false)
     const [deletingGroupId, setDeletingGroupId] = useState<number | null>(null)
     const [renamingGroupId, setRenamingGroupId] = useState<number | null>(null)
@@ -371,9 +377,10 @@ export default function Groups() {
                 console.error('Force generate failed', errorText)
                 alert(`Failed to generate article: ${errorText || 'Unknown error'}`)
             }
-        } catch (e: any) {
-            console.error('Force generate failed', e)
-            alert(`Failed to generate article: ${e.message || 'Network error'}`)
+        } catch (error: unknown) {
+            console.error('Force generate failed', error)
+            const message = error instanceof Error ? error.message : 'Network error'
+            alert(`Failed to generate article: ${message}`)
         } finally {
             setForcingRun(false)
         }
