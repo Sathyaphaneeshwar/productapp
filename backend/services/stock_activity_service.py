@@ -176,7 +176,7 @@ class StockActivityService:
                 )
                 SELECT
                     activity.*,
-                    COALESCE(s.stock_symbol, s.bse_code) AS symbol,
+                    COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
                     s.stock_name AS stock_name
                 FROM activity
                 JOIN stocks s ON s.id = activity.stock_id

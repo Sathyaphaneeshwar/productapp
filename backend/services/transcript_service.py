@@ -51,10 +51,12 @@ class TranscriptService:
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT isin_number FROM stocks 
-                WHERE UPPER(stock_symbol) = UPPER(?) OR bse_code = ?
+                SELECT isin_number FROM stocks
+                WHERE UPPER(stock_symbol) = UPPER(?)
+                   OR bse_code = ?
+                   OR UPPER(isin_number) = UPPER(?)
                 LIMIT 1
-            """, (stock_symbol, stock_symbol))
+            """, (stock_symbol, stock_symbol, stock_symbol))
             result = cursor.fetchone()
             return result['isin_number'] if result else None
         finally:

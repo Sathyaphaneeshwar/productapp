@@ -26,15 +26,18 @@ def get_user_data_dir():
             # macOS: ~/Library/Application Support/ProductGemini
             app_data = Path.home() / 'Library' / 'Application Support' / 'ProductGemini'
         elif sys.platform == 'win32':
-            # Windows: %APPDATA%\ProductGemini
-            app_data = Path(os.environ.get('APPDATA', Path.home())) / 'ProductGemini'
+            # Windows: keep the WAL database out of roaming-profile sync.
+            # Existing %APPDATA% databases are migrated by _legacy_db_candidates.
+            windows_base = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+            app_data = Path(windows_base or Path.home()) / 'ProductGemini'
         else:
             # Linux: ~/.local/share/ProductGemini
             app_data = Path.home() / '.local' / 'share' / 'ProductGemini'
         return app_data
     else:
-        # Running in development - use project root
-        return Path(__file__).parent.parent
+        # Keep developer/user state separate from the tracked, sanitized seed
+        # database that is bundled into installers.
+        return Path(__file__).parent.parent / '.local-data'
 
 BASE_DIR = get_base_dir()
 USER_DATA_DIR = get_user_data_dir()
@@ -90,7 +93,12 @@ def _legacy_db_candidates() -> list[Path]:
         for name in names:
             candidates.append(base / name / 'database' / 'stocks.db')
     elif sys.platform == 'win32':
-        base = Path(os.environ.get('APPDATA', home))
+        roaming_base = Path(os.environ.get('APPDATA', home))
+        local_base = Path(
+            os.environ.get('LOCALAPPDATA')
+            or os.environ.get('APPDATA')
+            or home
+        )
         names = [
             'ProductGemini',
             'Product Gemini',
@@ -99,8 +107,11 @@ def _legacy_db_candidates() -> list[Path]:
             'StockDiscovery',
             'stockapp',
         ]
-        for name in names:
-            candidates.append(base / name / 'database' / 'stocks.db')
+        # Roaming comes first so the pre-v1.2.27 ProductGemini database is
+        # found during the one-time move to %LOCALAPPDATA%.
+        for base in (roaming_base, local_base):
+            for name in names:
+                candidates.append(base / name / 'database' / 'stocks.db')
     else:
         base = home / '.local' / 'share'
         names = [
@@ -124,19 +135,60 @@ def _find_legacy_db() -> Optional[Path]:
     valid.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return valid[0]
 
+
+def _copy_sqlite_database(source: Path, destination: Path):
+    """Copy a SQLite database through its backup API so WAL data is included."""
+    source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
+    destination_conn = sqlite3.connect(destination, timeout=30)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+
+
 def _clear_seeded_data():
     try:
         if not DATABASE_PATH.exists():
             return
         conn = sqlite3.connect(DATABASE_PATH)
-        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA foreign_keys = OFF")
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM watchlist_items")
-        cursor.execute("DELETE FROM group_stocks")
-        cursor.execute("UPDATE groups SET is_active = 0")
+        private_tables = (
+            "queue_messages",
+            "email_outbox",
+            "analysis_jobs",
+            "stock_activity_logs",
+            "transcript_events",
+            "transcript_checks",
+            "transcript_fetch_schedule",
+            "transcript_analyses",
+            "transcripts",
+            "group_research_runs",
+            "document_research_runs",
+            "watchlist_items",
+            "group_stocks",
+            "groups",
+            "email_list",
+            "smtp_settings",
+            "api_keys",
+            "llm_settings",
+        )
+        for table_name in private_tables:
+            cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            if cursor.fetchone():
+                cursor.execute(f'DELETE FROM "{table_name}"')
+
+        cursor.execute("PRAGMA table_info(llm_providers)")
+        provider_columns = {row[1] for row in cursor.fetchall()}
+        for column_name in provider_columns & {"api_key", "api_key_encrypted"}:
+            cursor.execute(f'UPDATE llm_providers SET "{column_name}" = NULL')
         conn.commit()
         conn.close()
-        print("[Config] Cleared seeded watchlist/groups from bundled DB")
+        print("[Config] Cleared user state from bundled seed database")
     except Exception as e:
         print(f"[Config] Seed cleanup failed: {e}")
 
@@ -151,7 +203,7 @@ def initialize_user_data():
         legacy_db = _find_legacy_db()
         if legacy_db:
             print(f"[Config] Migrating legacy database from {legacy_db}")
-            shutil.copy2(legacy_db, DATABASE_PATH)
+            _copy_sqlite_database(legacy_db, DATABASE_PATH)
         elif BUNDLED_DATABASE_PATH.exists():
             print(f"[Config] Copying database to {DATABASE_PATH}")
             shutil.copy2(BUNDLED_DATABASE_PATH, DATABASE_PATH)
@@ -190,6 +242,10 @@ def ensure_schema_migrations():
         analysis_columns = {row[1] for row in cursor.fetchall()}
         cursor.execute("PRAGMA table_info(llm_providers)")
         llm_provider_columns = {row[1] for row in cursor.fetchall()}
+        cursor.execute("PRAGMA table_info(smtp_settings)")
+        smtp_columns = {row[1] for row in cursor.fetchall()}
+        cursor.execute("PRAGMA table_info(stocks)")
+        stock_columns = {row[1] for row in cursor.fetchall()}
 
         def table_exists(name: str) -> bool:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
@@ -210,12 +266,34 @@ def ensure_schema_migrations():
         missing_queue_messages = not table_exists("queue_messages")
         missing_email_outbox = not table_exists("email_outbox")
         missing_stock_activity_logs = not table_exists("stock_activity_logs")
+        missing_smtp_security = 'smtp_security' not in smtp_columns
+        missing_stock_source = 'source' not in stock_columns
+        missing_stock_extra_code = 'extra_code' not in stock_columns
+        missing_stock_is_active = 'is_active' not in stock_columns
+        missing_stock_import_batches = not table_exists("stock_import_batches")
 
         queue_index_missing = False
+        queue_claim_columns_missing = False
         if not missing_queue_messages:
+            cursor.execute("PRAGMA table_info(queue_messages)")
+            queue_columns = {row[1] for row in cursor.fetchall()}
+            required_queue_columns = {
+                "status",
+                "locked_until",
+                "worker_id",
+                "delivery_attempts",
+                "last_error",
+                "dedupe_key",
+                "updated_at",
+            }
+            queue_claim_columns_missing = not required_queue_columns.issubset(queue_columns)
             cursor.execute("PRAGMA index_list(queue_messages)")
             queue_indexes = {row[1] for row in cursor.fetchall()}
-            queue_index_missing = "idx_queue_messages_due" not in queue_indexes
+            queue_index_missing = not {
+                "idx_queue_messages_due",
+                "idx_queue_messages_dedupe",
+                "idx_queue_messages_claim",
+            }.issubset(queue_indexes)
 
         needs_migration = (
             missing_analysis_status
@@ -228,9 +306,15 @@ def ensure_schema_migrations():
             or missing_transcript_events
             or missing_analysis_jobs
             or missing_queue_messages
+            or queue_claim_columns_missing
             or queue_index_missing
             or missing_email_outbox
             or missing_stock_activity_logs
+            or missing_smtp_security
+            or missing_stock_source
+            or missing_stock_extra_code
+            or missing_stock_is_active
+            or missing_stock_import_batches
         )
 
         if not needs_migration:
@@ -241,7 +325,7 @@ def ensure_schema_migrations():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = backup_dir / f"stocks_backup_{timestamp}.db"
         try:
-            shutil.copy2(DATABASE_PATH, backup_path)
+            _copy_sqlite_database(DATABASE_PATH, backup_path)
         except Exception as backup_error:
             print(f"[Config] Backup failed before migration: {backup_error}")
 
@@ -264,6 +348,59 @@ def ensure_schema_migrations():
                       AND api_key_encrypted IS NOT NULL
                       AND api_key_encrypted != ''
                 """)
+        if missing_smtp_security:
+            cursor.execute(
+                "ALTER TABLE smtp_settings ADD COLUMN smtp_security TEXT NOT NULL DEFAULT 'auto'"
+            )
+        if missing_stock_source:
+            cursor.execute(
+                "ALTER TABLE stocks ADD COLUMN source TEXT NOT NULL DEFAULT 'master'"
+            )
+        if missing_stock_extra_code:
+            cursor.execute("ALTER TABLE stocks ADD COLUMN extra_code TEXT")
+        if missing_stock_is_active:
+            cursor.execute(
+                "ALTER TABLE stocks ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+            )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stocks_source_active
+            ON stocks(source, is_active)
+            """
+        )
+
+        if missing_stock_import_batches:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stock_import_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    uploaded_ts INTEGER NOT NULL,
+                    rows_total INTEGER NOT NULL DEFAULT 0,
+                    rows_new INTEGER NOT NULL DEFAULT 0,
+                    rows_updated INTEGER NOT NULL DEFAULT 0,
+                    rows_unchanged INTEGER NOT NULL DEFAULT 0,
+                    rows_invalid INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'previewed',
+                    payload_json TEXT NOT NULL,
+                    warnings_json TEXT,
+                    committed_ts INTEGER
+                )
+                """
+            )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stock_import_batches_status_time
+            ON stock_import_batches(status, uploaded_ts)
+            """
+        )
+        cursor.execute(
+            """
+            DELETE FROM stock_import_batches
+            WHERE status = 'previewed'
+              AND uploaded_ts < CAST(strftime('%s', 'now') AS INTEGER) - 86400
+            """
+        )
 
         if missing_transcript_checks:
             cursor.execute("""
@@ -351,14 +488,55 @@ def ensure_schema_migrations():
                     queue_name TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    locked_until TIMESTAMP,
+                    worker_id TEXT,
+                    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    dedupe_key TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-        if missing_queue_messages or queue_index_missing:
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_queue_messages_due
-                ON queue_messages(queue_name, available_at, id)
-            """)
+        else:
+            cursor.execute("PRAGMA table_info(queue_messages)")
+            queue_columns = {row[1] for row in cursor.fetchall()}
+            queue_column_definitions = {
+                "status": "TEXT NOT NULL DEFAULT 'pending'",
+                "locked_until": "TIMESTAMP",
+                "worker_id": "TEXT",
+                "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT",
+                "dedupe_key": "TEXT",
+                "updated_at": "TIMESTAMP",
+            }
+            for column_name, column_definition in queue_column_definitions.items():
+                if column_name not in queue_columns:
+                    cursor.execute(
+                        f"ALTER TABLE queue_messages ADD COLUMN {column_name} {column_definition}"
+                    )
+            cursor.execute(
+                """
+                UPDATE queue_messages
+                SET status = COALESCE(status, 'pending'),
+                    delivery_attempts = COALESCE(delivery_attempts, 0),
+                    updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+                """
+            )
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_messages_due
+            ON queue_messages(queue_name, available_at, id)
+        """)
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_messages_dedupe
+            ON queue_messages(queue_name, dedupe_key)
+            WHERE dedupe_key IS NOT NULL
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_messages_claim
+            ON queue_messages(queue_name, status, locked_until, available_at)
+        """)
 
         if missing_email_outbox:
             cursor.execute("""

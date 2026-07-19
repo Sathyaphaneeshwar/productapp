@@ -142,7 +142,9 @@ class GroupResearchService:
         """
         cursor.execute(
             """
-            SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
+            SELECT s.id,
+                   COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                   s.stock_name
             FROM stocks s
             JOIN group_stocks gs ON s.id = gs.stock_id
             WHERE gs.group_id = ?
@@ -569,7 +571,9 @@ class GroupResearchService:
             # Get stocks for this group (and attach symbols for display)
             cursor.execute(
                 """
-                SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
+                SELECT s.id,
+                       COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                       s.stock_name
                 FROM stocks s
                 JOIN group_stocks gs ON s.id = gs.stock_id
                 WHERE gs.group_id = ?

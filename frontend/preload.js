@@ -16,6 +16,11 @@ contextBridge.exposeInMainWorld('electronUpdater', {
         ipcRenderer.on('update-status', (_event, data) => callback(data));
     },
 
+    onEngineStatus: (callback) => {
+        ipcRenderer.removeAllListeners('engine-status');
+        ipcRenderer.on('engine-status', (_event, data) => callback(data));
+    },
+
     // Get current app version
     getVersion: () => ipcRenderer.invoke('get-app-version'),
 

@@ -9,7 +9,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { cn } from '@/lib/utils'
 
 
-const API_URL = 'http://localhost:5001/api'
+const API_URL = 'http://127.0.0.1:5001/api'
 
 type Group = {
     id: number
@@ -516,14 +516,17 @@ export default function Groups() {
         }
     }
 
-    const addStockToGroup = async (symbol: string) => {
+    const addStockToGroup = async (stock: StockSearchResult) => {
         if (!selectedGroupId) return
 
         try {
             const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ symbol })
+                body: JSON.stringify({
+                    stock_id: stock.id,
+                    symbol: stock.symbol,
+                })
             })
 
             if (response.ok) {
@@ -540,11 +543,11 @@ export default function Groups() {
         }
     }
 
-    const removeStockFromGroup = async (symbol: string) => {
+    const removeStockFromGroup = async (stockId: number) => {
         if (!selectedGroupId) return
 
         try {
-            const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks/${symbol}`, {
+            const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks/id/${stockId}`, {
                 method: 'DELETE'
             })
 
@@ -757,7 +760,7 @@ export default function Groups() {
                                                         <div
                                                             key={stock.symbol}
                                                             className="flex items-center justify-between p-2 hover:bg-accent cursor-pointer text-sm"
-                                                            onClick={() => addStockToGroup(stock.symbol)}
+                                                            onClick={() => addStockToGroup(stock)}
                                                         >
                                                             <span>{stock.symbol} - {stock.name}</span>
                                                             <Plus className="h-4 w-4 text-muted-foreground" />
@@ -828,7 +831,7 @@ export default function Groups() {
                                                                 size="icon"
                                                                 variant="ghost"
                                                                 className="h-8 w-8 text-muted-foreground hover:text-red-400 hover:bg-red-500/10"
-                                                                onClick={() => removeStockFromGroup(stock.symbol)}
+                                                                onClick={() => removeStockFromGroup(stock.id)}
                                                             >
                                                                 <Trash2 className="h-4 w-4" />
                                                             </Button>

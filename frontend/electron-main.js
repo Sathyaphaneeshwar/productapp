@@ -1,7 +1,17 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  nativeImage,
+  dialog,
+  ipcMain,
+  powerMonitor
+} from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { spawn, exec } from 'child_process';
+import { createHash, randomBytes } from 'crypto';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import pkg from 'electron-updater';
@@ -17,6 +27,16 @@ let backendPid;
 let isQuitting = false;
 let allowImmediateQuit = false;
 let backendShutdownPromise = null;
+let backendStopping = false;
+let backendStarting = false;
+let backendRestartTimer = null;
+let backendHealthTimer = null;
+let backendHealthFailures = 0;
+let backendRestartAttempts = [];
+const backendControlToken = randomBytes(32).toString('hex');
+const backendControlSessionId = createHash('sha256')
+  .update(backendControlToken)
+  .digest('hex');
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -225,7 +245,47 @@ async function getBackendHealth(timeoutMs = 1200) {
 function isExpectedBackend(health) {
   if (!health || health.service !== 'product-gemini-backend') return false;
   if (!app.isPackaged) return true;
-  return health.app_version === app.getVersion();
+  return (
+    health.app_version === app.getVersion()
+    && health.control_session_id === backendControlSessionId
+  );
+}
+
+function sendEngineStatus(status, info = null) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('engine-status', { status, info });
+  }
+}
+
+function postBackendEndpoint(endpoint, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port: BACKEND_PORT,
+      path: `/api/system/${endpoint}`,
+      method: 'POST',
+      timeout: timeoutMs,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Product-Gemini-Control': backendControlToken
+      }
+    }, (response) => {
+      response.resume();
+      response.on('end', () => {
+        resolve(Boolean(
+          response.statusCode
+          && response.statusCode >= 200
+          && response.statusCode < 300
+        ));
+      });
+    });
+    request.on('timeout', () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.on('error', () => resolve(false));
+    request.end('{}');
+  });
 }
 
 const logPath = path.join(app.getPath('userData'), 'app.log');
@@ -304,7 +364,7 @@ function resolveBackendExecutable() {
   return backendExe;
 }
 
-async function startBackend() {
+async function startBackendOnce() {
   const existingHealth = await getBackendHealth();
   if (isExpectedBackend(existingHealth)) {
     backendPid = existingHealth.pid ? String(existingHealth.pid) : undefined;
@@ -312,6 +372,7 @@ async function startBackend() {
       `Detected matching Product Gemini backend already running`
       + `${backendPid ? ` with PID ${backendPid}` : ''}; reusing it`
     );
+    sendEngineStatus('online');
     return true;
   }
 
@@ -342,7 +403,8 @@ async function startBackend() {
     const spawnEnv = {
       ...process.env,
       PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
-      PRODUCT_GEMINI_APP_VERSION: app.getVersion()
+      PRODUCT_GEMINI_APP_VERSION: app.getVersion(),
+      PRODUCT_GEMINI_CONTROL_TOKEN: backendControlToken
     };
 
     log(`Starting spawn with env PATH: ${spawnEnv.PATH?.substring(0, 100)}...`);
@@ -370,12 +432,18 @@ async function startBackend() {
     backendProcess.on('error', (err) => {
       log(`Failed to spawn backend: ${err.message}`);
       log(`Error stack: ${err.stack}`);
+      if (!isQuitting && !backendStopping && !backendStarting) {
+        scheduleBackendRestart(`spawn error: ${err.message}`);
+      }
     });
 
     backendProcess.on('close', (code, signal) => {
       log(`Backend process exited with code ${code}, signal ${signal}`);
       backendProcess = null;
       backendPid = undefined;
+      if (!isQuitting && !backendStopping && !backendStarting) {
+        scheduleBackendRestart(`backend exited with code ${code}, signal ${signal}`);
+      }
     });
 
     backendProcess.on('exit', (code, signal) => {
@@ -394,6 +462,70 @@ async function startBackend() {
     log(`Exception stack: ${e.stack}`);
     return false;
   }
+}
+
+async function startBackend() {
+  if (backendStarting || isQuitting) return false;
+  backendStarting = true;
+  sendEngineStatus('starting');
+  try {
+    const started = await startBackendOnce();
+    if (!started) {
+      sendEngineStatus('offline');
+    }
+    return started;
+  } finally {
+    backendStarting = false;
+  }
+}
+
+function scheduleBackendRestart(reason) {
+  if (isQuitting || backendStopping || backendRestartTimer) return;
+
+  const now = Date.now();
+  backendRestartAttempts = backendRestartAttempts.filter(
+    (attemptAt) => now - attemptAt < 10 * 60 * 1000
+  );
+  if (backendRestartAttempts.length >= 5) {
+    log(`Backend restart limit reached: ${reason}`);
+    sendEngineStatus('offline', { reason, retryLimitReached: true });
+    return;
+  }
+
+  const delayMs = Math.min(30_000, 1000 * (2 ** backendRestartAttempts.length));
+  backendRestartAttempts.push(now);
+  log(`Scheduling backend restart in ${delayMs}ms: ${reason}`);
+  sendEngineStatus('restarting', { reason, delayMs });
+
+  backendRestartTimer = setTimeout(async () => {
+    backendRestartTimer = null;
+    const started = await startBackend();
+    const healthy = started && await waitForBackend(60);
+    if (healthy) {
+      backendHealthFailures = 0;
+      sendEngineStatus('online');
+      log('Backend watchdog restart succeeded');
+    } else {
+      scheduleBackendRestart('backend did not become healthy after restart');
+    }
+  }, delayMs);
+}
+
+function startBackendHealthMonitor() {
+  if (backendHealthTimer) clearInterval(backendHealthTimer);
+  backendHealthTimer = setInterval(async () => {
+    if (isQuitting || backendStopping || backendStarting) return;
+    const health = await getBackendHealth(1500);
+    if (isExpectedBackend(health)) {
+      backendHealthFailures = 0;
+      sendEngineStatus('online');
+      return;
+    }
+    backendHealthFailures += 1;
+    if (backendHealthFailures >= 3) {
+      scheduleBackendRestart('three consecutive backend health checks failed');
+    }
+  }, 15_000);
 }
 
 function createWindow() {
@@ -428,7 +560,19 @@ async function stopBackend() {
   const pid = backendProcess?.pid ? String(backendProcess.pid) : backendPid;
   if (!pid) return;
 
-  backendShutdownPromise = stopPidGracefully(pid)
+  backendStopping = true;
+  backendShutdownPromise = (async () => {
+    const shutdownAccepted = await postBackendEndpoint('shutdown', 1500);
+    if (shutdownAccepted) {
+      const deadline = Date.now() + 5500;
+      while (Date.now() < deadline) {
+        if (!(await isPidAlive(pid))) return;
+        await sleep(200);
+      }
+      log(`Backend PID ${pid} did not exit after shutdown endpoint`);
+    }
+    await stopPidGracefully(pid, 1500);
+  })()
     .catch((err) => {
       log(`Failed to stop backend PID ${pid}: ${err.message}`);
     })
@@ -436,6 +580,7 @@ async function stopBackend() {
       backendProcess = null;
       backendPid = undefined;
       backendShutdownPromise = null;
+      backendStopping = false;
     });
 
   return backendShutdownPromise;
@@ -498,7 +643,21 @@ app.whenReady().then(async () => {
   // Start backend
   await startBackend();
 
-  await waitForBackend();
+  const backendReady = await waitForBackend();
+  if (backendReady) {
+    sendEngineStatus('online');
+  } else {
+    scheduleBackendRestart('initial backend startup health check failed');
+  }
+  startBackendHealthMonitor();
+
+  powerMonitor.on('resume', async () => {
+    log('System resumed; requesting queue catch-up');
+    const resumed = await postBackendEndpoint('resumed', 3000);
+    if (!resumed) {
+      scheduleBackendRestart('backend unavailable after system resume');
+    }
+  });
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.reloadIgnoringCache();
     mainWindow.show();

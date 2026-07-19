@@ -193,7 +193,8 @@ class DocumentResearchService:
         try:
             # Get stock info
             cursor.execute("""
-                SELECT COALESCE(stock_symbol, bse_code) as symbol, stock_name 
+                SELECT COALESCE(stock_symbol, bse_code, isin_number) as symbol,
+                       stock_name
                 FROM stocks WHERE id = ?
             """, (stock_id,))
             stock = cursor.fetchone()

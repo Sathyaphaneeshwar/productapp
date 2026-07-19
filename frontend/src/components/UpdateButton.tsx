@@ -17,6 +17,7 @@ declare global {
             checkForUpdates: () => Promise<{ status: string }>
             installUpdate: () => Promise<{ status: string }>
             onUpdateStatus: (callback: (data: { status: UpdateStatus; info?: UpdateInfo }) => void) => void
+            onEngineStatus?: (callback: (data: { status: string; info?: unknown }) => void) => void
             getVersion: () => Promise<string>
             isElectron: boolean
         }

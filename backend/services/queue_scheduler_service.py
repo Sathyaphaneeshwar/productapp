@@ -1,8 +1,7 @@
 import threading
 import time
 import json
-import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import DATABASE_PATH
@@ -46,6 +45,7 @@ class QueueSchedulerService:
         self.last_schedule_sync = None
         self.last_group_check = None
         self.last_enqueue = None
+        self.next_enqueue_at = None
 
     def get_db_connection(self):
         return get_db_connection(DATABASE_PATH)
@@ -174,6 +174,7 @@ class QueueSchedulerService:
             SELECT id, payload_json
             FROM queue_messages
             WHERE queue_name = 'transcript_check'
+              AND status IN ('pending', 'claimed')
             ORDER BY id ASC
             """
         )
@@ -213,6 +214,7 @@ class QueueSchedulerService:
             SELECT payload_json
             FROM queue_messages
             WHERE queue_name = 'transcript_check'
+              AND status IN ('pending', 'claimed')
             """
         )
         queued_stock_ids = set()
@@ -278,18 +280,24 @@ class QueueSchedulerService:
                                 "reason": "scheduled",
                             }
                         ),
+                        f"transcript:{row['stock_id']}:{quarter}:{year}",
                     )
                 )
                 queued_stock_ids.add(row["stock_id"])
             if queue_rows:
                 cursor.executemany(
                     """
-                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    INSERT OR IGNORE INTO queue_messages (
+                        queue_name, payload_json, available_at, status,
+                        dedupe_key, created_at, updated_at
+                    )
+                    VALUES (?, ?, CURRENT_TIMESTAMP, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     queue_rows,
                 )
             conn.commit()
+            if queue_rows:
+                self.queue.notify("transcript_check")
         finally:
             conn.close()
 
@@ -338,17 +346,23 @@ class QueueSchedulerService:
                     (
                         "analysis",
                         json.dumps({"analysis_job_id": row["id"]}),
+                        f"analysis:{row['id']}",
                     )
                 )
             if queue_rows:
                 cursor.executemany(
                     """
-                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    INSERT OR IGNORE INTO queue_messages (
+                        queue_name, payload_json, available_at, status,
+                        dedupe_key, created_at, updated_at
+                    )
+                    VALUES (?, ?, CURRENT_TIMESTAMP, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     queue_rows,
                 )
             conn.commit()
+            if queue_rows:
+                self.queue.notify("analysis")
         finally:
             conn.close()
 
@@ -397,17 +411,23 @@ class QueueSchedulerService:
                     (
                         "email",
                         json.dumps({"email_outbox_id": row["id"]}),
+                        f"email:{row['id']}",
                     )
                 )
             if queue_rows:
                 cursor.executemany(
                     """
-                    INSERT INTO queue_messages (queue_name, payload_json, available_at, created_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    INSERT OR IGNORE INTO queue_messages (
+                        queue_name, payload_json, available_at, status,
+                        dedupe_key, created_at, updated_at
+                    )
+                    VALUES (?, ?, CURRENT_TIMESTAMP, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     queue_rows,
                 )
             conn.commit()
+            if queue_rows:
+                self.queue.notify("email")
         finally:
             conn.close()
 
@@ -556,10 +576,28 @@ class QueueSchedulerService:
         reset_summary = None
         if fresh:
             reset_summary = self._reset_queue_state_for_fresh_run(quarter, year)
+        else:
+            conn = self.get_db_connection()
+            try:
+                conn.execute(
+                    """
+                    UPDATE transcript_fetch_schedule
+                    SET next_check_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE quarter = ? AND year = ?
+                      AND locked_until IS NULL
+                      AND COALESCE(last_status, '') != 'failed'
+                    """,
+                    (quarter, year),
+                )
+                conn.commit()
+            finally:
+                conn.close()
         self._enqueue_due_transcript_checks(quarter, year)
         self._enqueue_due_analysis_jobs()
         self._enqueue_due_email_jobs()
-        self.last_enqueue = datetime.now()
+        self.last_enqueue = datetime.utcnow()
+        self.next_enqueue_at = self.last_enqueue + timedelta(seconds=self.enqueue_seconds)
         return {
             "fresh": fresh,
             "quarter": quarter,
@@ -568,47 +606,72 @@ class QueueSchedulerService:
         }
 
     def get_status(self) -> dict:
-        def _normalize_timestamp(value):
+        def _as_utc_datetime(value):
             if value is None:
                 return None
             if isinstance(value, datetime):
-                return value.isoformat()
-            raw = str(value).strip()
-            if not raw:
-                return None
-            try:
-                return datetime.fromisoformat(raw.replace(" ", "T").replace("Z", "+00:00")).isoformat()
-            except ValueError:
-                return raw
-
-        now = datetime.now()
-        next_poll_at = None
-        next_poll_in_seconds = None
-        if self.running:
-            if self.last_enqueue and self.enqueue_seconds > 0:
-                elapsed_seconds = max(0, (now - self.last_enqueue).total_seconds())
-                cycles_until_next = math.floor(elapsed_seconds / self.enqueue_seconds) + 1
-                next_poll_at_dt = self.last_enqueue + timedelta(
-                    seconds=cycles_until_next * self.enqueue_seconds
-                )
+                parsed = value
             else:
-                next_poll_at_dt = now
-            next_poll_at = next_poll_at_dt.isoformat()
-            next_poll_in_seconds = max(
-                0,
-                math.ceil((next_poll_at_dt - now).total_seconds()),
-            )
+                raw = str(value).strip()
+                if not raw:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(
+                        raw.replace(" ", "T").replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
 
-        queues = {
-            "transcript_check": self.queue.length("transcript_check"),
-            "analysis": self.queue.length("analysis"),
-            "email": self.queue.length("email"),
-        }
+        def _iso(value):
+            parsed = _as_utc_datetime(value)
+            return parsed.isoformat().replace("+00:00", "Z") if parsed else None
+
+        def _epoch_ms(value):
+            parsed = _as_utc_datetime(value)
+            return int(parsed.timestamp() * 1000) if parsed else None
+
+        now_utc = datetime.now(timezone.utc)
+        next_tick = self.next_enqueue_at if self.running else None
+        if self.running and next_tick is None:
+            next_tick = datetime.utcnow()
+
+        queues = {"transcript_check": 0, "analysis": 0, "email": 0}
+        queue_claimed = {"transcript_check": 0, "analysis": 0, "email": 0}
         active_transcript_checks = 0
         next_transcript_check_at = None
+        waiting_analysis = 0
+        active_analysis = 0
+        failed_analysis = 0
+        waiting_email = 0
+        active_email = 0
+        failed_email = 0
+        failed_transcript_checks = 0
+        watching_count = 0
+        upcoming_count = 0
+        current_analysis = None
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
+            cursor.execute(
+                """
+                SELECT queue_name, status, COUNT(*) AS count
+                FROM queue_messages
+                WHERE status IN ('pending', 'claimed')
+                GROUP BY queue_name, status
+                """
+            )
+            for row in cursor.fetchall():
+                queue_name = row["queue_name"]
+                if queue_name not in queues:
+                    continue
+                count = int(row["count"])
+                queues[queue_name] += count
+                if row["status"] == "claimed":
+                    queue_claimed[queue_name] += count
+
             cursor.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -629,56 +692,159 @@ class QueueSchedulerService:
             )
             row = cursor.fetchone()
             next_transcript_check_at = row["next_check_at"] if row else None
-        except Exception:
-            active_transcript_checks = 0
-            next_transcript_check_at = None
+
+            cursor.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status IN ('pending', 'queued', 'retrying') THEN 1 ELSE 0 END) AS waiting,
+                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN status IN ('failed', 'error') THEN 1 ELSE 0 END) AS failed
+                FROM analysis_jobs
+                """
+            )
+            row = cursor.fetchone()
+            waiting_analysis = int(row["waiting"] or 0)
+            active_analysis = int(row["active"] or 0)
+            failed_analysis = int(row["failed"] or 0)
+
+            cursor.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status IN ('pending', 'queued', 'retrying') THEN 1 ELSE 0 END) AS waiting,
+                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+                FROM email_outbox
+                """
+            )
+            row = cursor.fetchone()
+            waiting_email = int(row["waiting"] or 0)
+            active_email = int(row["active"] or 0)
+            failed_email = int(row["failed"] or 0)
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS watching,
+                    SUM(CASE WHEN last_status = 'failed' THEN 1 ELSE 0 END) AS failed
+                FROM transcript_fetch_schedule
+                """
+            )
+            row = cursor.fetchone()
+            watching_count = int(row["watching"] or 0)
+            failed_transcript_checks = int(row["failed"] or 0)
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM transcripts WHERE status = 'upcoming'"
+            )
+            row = cursor.fetchone()
+            upcoming_count = int(row["count"] or 0)
+
+            cursor.execute(
+                """
+                SELECT COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                       t.quarter, t.year
+                FROM analysis_jobs aj
+                JOIN transcripts t ON t.id = aj.transcript_id
+                JOIN stocks s ON s.id = t.stock_id
+                WHERE aj.status = 'in_progress'
+                ORDER BY aj.updated_at ASC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if row:
+                current_analysis = f"{row['symbol']} {row['quarter']} FY{row['year']}"
+        except Exception as error:
+            print(f"[QueueScheduler] Status query failed: {error}")
         finally:
             conn.close()
 
-        is_polling = queues["transcript_check"] > 0 or active_transcript_checks > 0
+        is_polling = (
+            queues["transcript_check"] > 0
+            or active_transcript_checks > 0
+            or active_analysis > 0
+            or active_email > 0
+        )
+        failed_total = failed_transcript_checks + failed_analysis + failed_email
+        next_check_ms = _epoch_ms(next_transcript_check_at)
+        next_tick_ms = _epoch_ms(next_tick)
+        next_display_ms = next_check_ms if next_check_ms is not None else next_tick_ms
+        next_poll_in_seconds = None
+        if next_display_ms is not None:
+            next_poll_in_seconds = max(
+                0,
+                int((next_display_ms - int(now_utc.timestamp() * 1000) + 999) / 1000),
+            )
 
         return {
             "running": self.running,
             "scheduler_running": self.running,
             "is_polling": is_polling,
             "poll_interval_seconds": self.enqueue_seconds,
-            "next_poll_at": next_poll_at,
+            "server_now_ms": int(now_utc.timestamp() * 1000),
+            "next_check_at_ms": next_check_ms,
+            "next_tick_at_ms": next_tick_ms,
+            "next_poll_at": _iso(next_tick),
             "next_poll_in_seconds": next_poll_in_seconds,
             "queue_ok": self.queue.ping(),
             "queues": queues,
+            "queue_claimed": queue_claimed,
             "active_transcript_checks": active_transcript_checks,
-            "next_transcript_check_at": _normalize_timestamp(next_transcript_check_at),
-            "last_schedule_sync": self.last_schedule_sync.isoformat() if self.last_schedule_sync else None,
-            "last_enqueue": self.last_enqueue.isoformat() if self.last_enqueue else None,
-            "last_group_check": self.last_group_check.isoformat() if self.last_group_check else None,
+            "next_transcript_check_at": _iso(next_transcript_check_at),
+            "analysis": {
+                "waiting": waiting_analysis,
+                "active": active_analysis,
+                "failed": failed_analysis,
+                "current": current_analysis,
+            },
+            "email": {
+                "waiting": waiting_email,
+                "active": active_email,
+                "failed": failed_email,
+            },
+            "transcripts": {
+                "watching": watching_count,
+                "upcoming": upcoming_count,
+                "failed": failed_transcript_checks,
+            },
+            "failed_total": failed_total,
+            "workers": {
+                "scheduler": bool(self.thread and self.thread.is_alive()),
+            },
+            "last_schedule_sync": _iso(self.last_schedule_sync),
+            "last_schedule_sync_ms": _epoch_ms(self.last_schedule_sync),
+            "last_enqueue": _iso(self.last_enqueue),
+            "last_group_check": _iso(self.last_group_check),
         }
 
     def _run(self):
-        next_schedule_sync = datetime.now()
-        next_enqueue = datetime.now()
-        next_group_check = datetime.now() + timedelta(seconds=self.group_check_seconds)
+        next_schedule_sync = time.monotonic()
+        next_enqueue = time.monotonic()
+        next_group_check = time.monotonic() + self.group_check_seconds
 
         while self.running:
             try:
-                now = datetime.now()
+                now_monotonic = time.monotonic()
+                now_utc = datetime.utcnow()
                 quarter, year = _get_latest_quarter()
 
-                if now >= next_schedule_sync:
+                if now_monotonic >= next_schedule_sync:
                     self._sync_schedule(quarter, year)
-                    self.last_schedule_sync = now
-                    next_schedule_sync = now + timedelta(seconds=self.schedule_sync_seconds)
+                    self.last_schedule_sync = now_utc
+                    next_schedule_sync = now_monotonic + self.schedule_sync_seconds
 
-                if now >= next_enqueue:
+                if now_monotonic >= next_enqueue:
                     self._enqueue_due_transcript_checks(quarter, year)
                     self._enqueue_due_analysis_jobs()
                     self._enqueue_due_email_jobs()
-                    self.last_enqueue = now
-                    next_enqueue = now + timedelta(seconds=self.enqueue_seconds)
+                    self.last_enqueue = now_utc
+                    next_enqueue = now_monotonic + self.enqueue_seconds
+                    self.next_enqueue_at = now_utc + timedelta(seconds=self.enqueue_seconds)
 
-                if now >= next_group_check:
+                if now_monotonic >= next_group_check:
                     self._maybe_trigger_group_research(quarter, year)
-                    self.last_group_check = now
-                    next_group_check = now + timedelta(seconds=self.group_check_seconds)
+                    self.last_group_check = now_utc
+                    next_group_check = now_monotonic + self.group_check_seconds
             except Exception as e:
                 print(f"[QueueScheduler] Error in loop: {e}")
 

@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
@@ -10,6 +11,8 @@ from services.llm.llm_service import LLMService
 from services.email_outbox_service import EmailOutboxService
 from services.retry_utils import compute_backoff_seconds
 from services.stock_activity_service import StockActivityService
+
+MAX_ANALYSIS_ATTEMPTS = 5
 
 
 class AnalysisQueueWorker:
@@ -41,15 +44,23 @@ class AnalysisQueueWorker:
 
     def _run(self):
         while self.running:
-            job = self.queue.dequeue("analysis", timeout=5)
+            try:
+                job = self.queue.dequeue("analysis", timeout=15, lease_seconds=600)
+            except Exception as error:
+                print(f"[AnalysisWorker] Queue claim failed: {error}")
+                time.sleep(5)
+                continue
             if not job:
                 continue
             job_id = job.get("analysis_job_id")
             if not job_id:
+                self.queue.ack(job)
                 continue
             try:
                 self._process_job(job_id)
+                self.queue.ack(job)
             except Exception as e:
+                self.queue.release(job, delay_seconds=60, error=str(e))
                 print(f"[AnalysisWorker] Job {job_id} failed: {e}")
 
     def _process_job(self, job_id: int):
@@ -67,7 +78,7 @@ class AnalysisQueueWorker:
             job = cursor.fetchone()
             if not job:
                 return
-            if job["status"] == "done":
+            if job["status"] in {"done", "failed"}:
                 return
 
             cursor.execute(
@@ -152,7 +163,6 @@ class AnalysisQueueWorker:
                     model_name,
                 ),
             )
-            conn.commit()
             new_analysis_id = cursor.lastrowid
 
             if force:
@@ -163,7 +173,7 @@ class AnalysisQueueWorker:
                     """,
                     (transcript_id, new_analysis_id),
                 )
-                conn.commit()
+            conn.commit()
 
             cursor.execute(
                 """
@@ -233,8 +243,13 @@ class AnalysisQueueWorker:
             cursor.execute("SELECT attempts FROM analysis_jobs WHERE id = ?", (job_id,))
             row = cursor.fetchone()
             attempts = (row["attempts"] if row else 0) + 1
-            retry_next_at = None if non_retryable else datetime.utcnow() + timedelta(seconds=compute_backoff_seconds(attempts))
-            status = "error" if non_retryable else "retrying"
+            exhausted = attempts >= MAX_ANALYSIS_ATTEMPTS
+            retry_next_at = None
+            if not non_retryable and not exhausted:
+                retry_next_at = datetime.utcnow() + timedelta(
+                    seconds=compute_backoff_seconds(attempts)
+                )
+            status = "failed" if non_retryable or exhausted else "retrying"
 
             cursor.execute(
                 """
@@ -266,7 +281,8 @@ class AnalysisQueueWorker:
                     year=transcript["year"],
                     details={
                         "attempt": attempts,
-                        "will_retry": not non_retryable,
+                        "failed": status == "failed",
+                        "will_retry": status == "retrying",
                         "retry_next_at": retry_next_at,
                     },
                 )

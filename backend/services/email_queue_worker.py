@@ -1,12 +1,15 @@
 import threading
+import time
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
 from db import get_db_connection
 from services.queue_service import QueueService
-from services.email_service import EmailService
+from services.email_service import EmailService, PermanentEmailError
 from services.retry_utils import compute_backoff_seconds
 from services.stock_activity_service import StockActivityService
+
+MAX_EMAIL_ATTEMPTS = 6
 
 
 class EmailQueueWorker:
@@ -35,15 +38,23 @@ class EmailQueueWorker:
 
     def _run(self):
         while self.running:
-            job = self.queue.dequeue("email", timeout=5)
+            try:
+                job = self.queue.dequeue("email", timeout=15, lease_seconds=180)
+            except Exception as error:
+                print(f"[EmailWorker] Queue claim failed: {error}")
+                time.sleep(5)
+                continue
             if not job:
                 continue
             outbox_id = job.get("email_outbox_id")
             if not outbox_id:
+                self.queue.ack(job)
                 continue
             try:
                 self._process_job(outbox_id)
+                self.queue.ack(job)
             except Exception as e:
+                self.queue.release(job, delay_seconds=60, error=str(e))
                 print(f"[EmailWorker] Job {outbox_id} failed: {e}")
 
     def _process_job(self, outbox_id: int):
@@ -61,7 +72,7 @@ class EmailQueueWorker:
             outbox = cursor.fetchone()
             if not outbox:
                 return
-            if outbox["status"] == "done":
+            if outbox["status"] in {"done", "failed"}:
                 return
 
             cursor.execute(
@@ -70,7 +81,7 @@ class EmailQueueWorker:
                 SET status = 'in_progress', locked_until = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (datetime.now() + timedelta(hours=1), outbox_id),
+                (datetime.utcnow() + timedelta(minutes=3), outbox_id),
             )
             conn.commit()
 
@@ -79,7 +90,7 @@ class EmailQueueWorker:
                 SELECT ta.id as analysis_id, ta.llm_output, ta.model_provider,
                        COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                        t.stock_id, t.quarter, t.year, t.source_url,
-                       s.stock_symbol, s.bse_code, s.stock_name
+                       s.stock_symbol, s.bse_code, s.isin_number, s.stock_name
                 FROM transcript_analyses ta
                 JOIN transcripts t ON t.id = ta.transcript_id
                 JOIN stocks s ON s.id = t.stock_id
@@ -92,7 +103,11 @@ class EmailQueueWorker:
             if not analysis:
                 raise ValueError("Analysis not found for email")
 
-            symbol = analysis["stock_symbol"] or analysis["bse_code"]
+            symbol = (
+                analysis["stock_symbol"]
+                or analysis["bse_code"]
+                or analysis["isin_number"]
+            )
             model_name = analysis["model_name"] or analysis["model_provider"]
 
             self.email_service.send_analysis_email(
@@ -129,27 +144,43 @@ class EmailQueueWorker:
             cursor.execute("SELECT attempts FROM email_outbox WHERE id = ?", (outbox_id,))
             row = cursor.fetchone()
             attempts = (row["attempts"] if row else 0) + 1
-            retry_next_at = datetime.now() + timedelta(seconds=compute_backoff_seconds(attempts))
+            non_retryable = isinstance(e, PermanentEmailError) or str(e) == "Analysis not found for email"
+            exhausted = attempts >= MAX_EMAIL_ATTEMPTS
+            status = "failed" if non_retryable or exhausted else "retrying"
+            retry_next_at = None
+            if status == "retrying":
+                retry_next_at = datetime.utcnow() + timedelta(
+                    seconds=compute_backoff_seconds(attempts)
+                )
 
             cursor.execute(
                 """
                 UPDATE email_outbox
-                SET status = 'retrying', attempts = ?, retry_next_at = ?, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
+                SET status = ?, attempts = ?, retry_next_at = ?,
+                    locked_until = NULL, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (attempts, retry_next_at, outbox_id),
+                (status, attempts, retry_next_at, outbox_id),
             )
             conn.commit()
             if 'analysis' in locals() and analysis:
+                if non_retryable:
+                    failure_reason = "Email delivery needs attention; retrying cannot fix the SMTP configuration"
+                elif exhausted:
+                    failure_reason = f"Email delivery stopped after {MAX_EMAIL_ATTEMPTS} attempts"
+                else:
+                    failure_reason = f"Email delivery failed: {str(e)[:700]}"
                 self.activity_service.safe_log_event(
                     analysis["stock_id"],
                     "email",
                     "error",
-                    f"Email delivery failed: {str(e)[:700]}",
+                    failure_reason,
                     quarter=analysis["quarter"],
                     year=analysis["year"],
                     details={
                         "attempt": attempts,
+                        "failed": status == "failed",
+                        "error": str(e)[:700],
                         "retry_next_at": retry_next_at,
                     },
                 )

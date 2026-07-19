@@ -106,7 +106,7 @@ function App() {
             <h1 className="text-4xl font-bold text-foreground text-center">BLOOMira</h1>
             <div className="flex-1 flex justify-end gap-2">
               <UpdateButton />
-              <PollStatusButton />
+              <PollStatusButton onOpenActivity={() => setCurrentPage('activity')} />
               <Button
                 variant="ghost"
                 size="icon"

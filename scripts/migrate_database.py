@@ -12,7 +12,6 @@ Usage:
 import sqlite3
 import os
 import sys
-import shutil
 import re
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +51,13 @@ def create_backup(db_path: Path) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = BACKUP_DIR / f"stocks_backup_{timestamp}.db"
-    shutil.copy2(db_path, backup_path)
+    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+    destination = sqlite3.connect(backup_path, timeout=30)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
     return backup_path
 
 
@@ -160,11 +165,9 @@ def migrate_database():
         print("Step 3: Applying migrations...")
         changes_made = 0
         
-        # Execute the valid schema as a script so multi-statement triggers are
-        # never split at their internal semicolons.
-        conn.executescript(schema_sql)
-        
-        # Check for missing columns in existing tables
+        # Add missing columns before executing the schema. New indexes can
+        # reference those columns, and CREATE TABLE IF NOT EXISTS does not
+        # alter an existing table.
         for table_name, columns in schema_tables.items():
             if table_name in existing_tables:
                 existing_cols = get_existing_columns(conn, table_name)
@@ -172,13 +175,29 @@ def migrate_database():
                     if col['name'] not in existing_cols:
                         # Add missing column
                         try:
-                            alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {col['definition']}"
+                            alter_definition = re.sub(
+                                r"\s+DEFAULT\s+CURRENT_TIMESTAMP\b",
+                                "",
+                                col["definition"],
+                                flags=re.IGNORECASE,
+                            )
+                            alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {alter_definition}"
                             conn.execute(alter_sql)
+                            if alter_definition != col["definition"]:
+                                conn.execute(
+                                    f"UPDATE {table_name} "
+                                    f"SET {col['name']} = CURRENT_TIMESTAMP "
+                                    f"WHERE {col['name']} IS NULL"
+                                )
                             print(f"  ✓ Added column '{col['name']}' to table '{table_name}'")
                             changes_made += 1
                         except sqlite3.OperationalError as e:
                             if 'duplicate column' not in str(e).lower():
                                 print(f"  Note: Could not add {col['name']}: {e}")
+
+        # Execute the valid schema as a script so multi-statement triggers are
+        # never split at their internal semicolons.
+        conn.executescript(schema_sql)
         
         conn.commit()
         

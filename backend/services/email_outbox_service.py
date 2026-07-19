@@ -36,7 +36,11 @@ class EmailOutboxService:
                     )
                     conn.commit()
                     outbox_id = cursor.lastrowid
-                    self.queue.enqueue("email", {"email_outbox_id": outbox_id})
+                    self.queue.enqueue(
+                        "email",
+                        {"email_outbox_id": outbox_id},
+                        dedupe_key=f"email:{outbox_id}",
+                    )
                     created += 1
                 except sqlite3.IntegrityError:
                     # Already exists, skip
@@ -46,4 +50,8 @@ class EmailOutboxService:
         return created
 
     def enqueue_job(self, outbox_id: int) -> None:
-        self.queue.enqueue("email", {"email_outbox_id": outbox_id})
+        self.queue.enqueue(
+            "email",
+            {"email_outbox_id": outbox_id},
+            dedupe_key=f"email:{outbox_id}",
+        )

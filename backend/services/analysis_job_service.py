@@ -104,7 +104,11 @@ class AnalysisJobService:
                     # Existing queued/in_progress jobs are already in flight.
                     return job_id
                 try:
-                    self.queue.enqueue("analysis", {"analysis_job_id": job_id})
+                    self.queue.enqueue(
+                        "analysis",
+                        {"analysis_job_id": job_id},
+                        dedupe_key=f"analysis:{job_id}",
+                    )
                 except Exception as e:
                     # Fallback: allow scheduler to pick it up quickly if direct enqueue fails.
                     cursor.execute(
@@ -125,4 +129,8 @@ class AnalysisJobService:
             conn.close()
 
     def enqueue_job(self, job_id: int) -> None:
-        self.queue.enqueue("analysis", {"analysis_job_id": job_id})
+        self.queue.enqueue(
+            "analysis",
+            {"analysis_job_id": job_id},
+            dedupe_key=f"analysis:{job_id}",
+        )

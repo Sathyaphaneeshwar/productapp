@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Download, Sparkles, Trash2, Plus, Loader2, ArrowUp, ArrowDown, ArrowUpDown, ChevronDown } from 'lucide-react'
 
-const API_URL = 'http://localhost:5001/api'
+const API_URL = 'http://127.0.0.1:5001/api'
 
 type Stock = {
     id?: number
@@ -355,13 +355,18 @@ export default function Watchlist() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ symbol: stock.symbol }),
+                body: JSON.stringify({
+                    stock_id: stock.id,
+                    symbol: stock.symbol,
+                }),
             })
 
             if (response.ok) {
                 // Optimistically show fetching state while backend polls/analyzes
                 setStocks(prev => {
-                    const exists = prev.some(s => s.symbol === stock.symbol)
+                    const exists = prev.some(s =>
+                        stock.id ? s.id === stock.id : s.symbol === stock.symbol
+                    )
                     if (exists) return prev
                     return [
                         ...prev,
@@ -385,14 +390,19 @@ export default function Watchlist() {
         }
     }
 
-    const handleDeleteStock = async (symbol: string) => {
+    const handleDeleteStock = async (stock: Stock) => {
         try {
-            const response = await fetch(`${API_URL}/watchlist/${symbol}`, {
+            const endpoint = stock.id
+                ? `${API_URL}/watchlist/id/${stock.id}`
+                : `${API_URL}/watchlist/${encodeURIComponent(stock.symbol)}`
+            const response = await fetch(endpoint, {
                 method: 'DELETE',
             })
 
             if (response.ok) {
-                setStocks(stocks.filter(stock => stock.symbol !== symbol))
+                setStocks(current => current.filter(item =>
+                    stock.id ? item.id !== stock.id : item.symbol !== stock.symbol
+                ))
             }
         } catch (error) {
             console.error('Error deleting stock:', error)
@@ -696,7 +706,7 @@ export default function Watchlist() {
                                 ) : (
                                     searchResults.map((stock) => (
                                         <div
-                                            key={stock.symbol}
+                                            key={stock.id ?? stock.symbol}
                                             className="flex items-center justify-between p-3 hover:bg-accent transition-colors cursor-pointer group"
                                             onClick={() => addToWatchlist(stock)}
                                         >
@@ -898,7 +908,7 @@ export default function Watchlist() {
                                                     <Button
                                                         size="icon"
                                                         variant="ghost"
-                                                        onClick={() => handleDeleteStock(stock.symbol)}
+                                                        onClick={() => handleDeleteStock(stock)}
                                                         className="rounded-full h-9 w-9 hover:bg-red-500/20 hover:text-red-400 hover:scale-110 transition-all duration-200"
                                                     >
                                                         <Trash2 className="h-4 w-4" />

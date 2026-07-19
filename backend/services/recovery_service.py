@@ -4,6 +4,7 @@ from typing import Dict, List
 from config import DATABASE_PATH
 from db import get_db_connection
 from services.analysis_job_service import AnalysisJobService
+from services.queue_service import QueueService
 
 DEFAULT_STALE_ANALYSIS_MINUTES = 5
 DEFAULT_STALE_GROUP_RESEARCH_MINUTES = 180
@@ -35,6 +36,7 @@ def _get_latest_quarter():
 class RecoveryService:
     def __init__(self, db_path: str = None):
         self.db_path = str(db_path or DATABASE_PATH)
+        self.queue = QueueService(self.db_path)
 
     def get_db_connection(self):
         return get_db_connection(self.db_path)
@@ -64,6 +66,7 @@ class RecoveryService:
             "watchlist_schedule_recovered": 0,
             "watchlist_missing_analysis_requeued": 0,
             "group_runs_recovered": 0,
+            "queue_claims_recovered": 0,
         }
         stale_transcript_ids: List[int] = []
         missing_watchlist_analysis_ids: List[int] = []
@@ -71,42 +74,20 @@ class RecoveryService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cutoff = datetime.now() - timedelta(minutes=stale_minutes)
-            group_cutoff = datetime.now() - timedelta(minutes=stale_group_minutes)
+            cutoff = datetime.utcnow() - timedelta(minutes=stale_minutes)
+            group_cutoff = datetime.utcnow() - timedelta(minutes=stale_group_minutes)
             latest_quarter, latest_year = _get_latest_quarter()
 
-            # Recover watchlist rows that were left in error/backoff states.
+            # This is a single-process runtime: no schedule lease can still be
+            # owned after restart. Preserve retry cadence/attempts, but clear
+            # every stale lease immediately.
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
-                SET next_check_at = CURRENT_TIMESTAMP,
-                    attempts = 0,
-                    last_status = NULL,
-                    last_checked_at = NULL,
-                    locked_until = NULL,
+                SET locked_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE quarter = ? AND year = ?
-                  AND stock_id IN (SELECT stock_id FROM watchlist_items)
-                  AND (last_status = 'error' OR attempts > 0)
-                  AND (
-                        EXISTS (
-                            SELECT 1
-                            FROM transcripts t
-                            WHERE t.stock_id = transcript_fetch_schedule.stock_id
-                              AND t.quarter = transcript_fetch_schedule.quarter
-                              AND t.year = transcript_fetch_schedule.year
-                              AND t.status != 'available'
-                        )
-                        OR NOT EXISTS (
-                            SELECT 1
-                            FROM transcripts t
-                            WHERE t.stock_id = transcript_fetch_schedule.stock_id
-                              AND t.quarter = transcript_fetch_schedule.quarter
-                              AND t.year = transcript_fetch_schedule.year
-                        )
-                  )
+                WHERE locked_until IS NOT NULL
                 """,
-                (latest_quarter, latest_year),
             )
             summary["watchlist_schedule_recovered"] = cursor.rowcount
 
@@ -115,9 +96,7 @@ class RecoveryService:
                 SELECT id
                 FROM transcripts
                 WHERE analysis_status = 'in_progress'
-                  AND COALESCE(updated_at, created_at) < ?
                 """,
-                (cutoff,),
             )
             stale_transcript_ids = [row["id"] for row in cursor.fetchall()]
 
@@ -142,11 +121,19 @@ class RecoveryService:
                     retry_next_at = CURRENT_TIMESTAMP,
                     locked_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE status = 'in_progress'
-                  AND (locked_until IS NULL OR locked_until < CURRENT_TIMESTAMP)
+                WHERE status IN ('in_progress', 'queued')
                 """
             )
             summary["analysis_jobs_recovered"] = cursor.rowcount
+            cursor.execute(
+                """
+                UPDATE analysis_jobs
+                SET locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'retrying')
+                  AND locked_until IS NOT NULL
+                """
+            )
 
             cursor.execute(
                 """
@@ -155,11 +142,19 @@ class RecoveryService:
                     retry_next_at = CURRENT_TIMESTAMP,
                     locked_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE status = 'in_progress'
-                  AND (locked_until IS NULL OR locked_until < CURRENT_TIMESTAMP)
+                WHERE status IN ('in_progress', 'queued')
                 """
             )
             summary["email_jobs_recovered"] = cursor.rowcount
+            cursor.execute(
+                """
+                UPDATE email_outbox
+                SET locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'retrying')
+                  AND locked_until IS NOT NULL
+                """
+            )
 
             # Group research uses daemon threads. If the app exits mid-run,
             # those rows otherwise remain in_progress forever and block all
@@ -171,9 +166,7 @@ class RecoveryService:
                     error_message = 'Recovered stale in-progress run after application restart',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'in_progress'
-                  AND COALESCE(updated_at, created_at) < ?
                 """,
-                (group_cutoff,),
             )
             summary["group_runs_recovered"] = cursor.rowcount
 
@@ -187,7 +180,9 @@ class RecoveryService:
                 LEFT JOIN transcript_analyses ta ON ta.transcript_id = t.id
                 LEFT JOIN analysis_jobs aj
                   ON aj.transcript_id = t.id
-                 AND aj.status IN ('pending', 'queued', 'retrying', 'in_progress')
+                 AND aj.status IN (
+                     'pending', 'queued', 'retrying', 'in_progress', 'failed', 'error'
+                 )
                 WHERE t.quarter = ? AND t.year = ?
                   AND t.status = 'available'
                   AND t.source_url IS NOT NULL
@@ -201,6 +196,8 @@ class RecoveryService:
             conn.commit()
         finally:
             conn.close()
+
+        summary["queue_claims_recovered"] = self.queue.recover_claims()
 
         for transcript_id in stale_transcript_ids:
             job_id = analysis_job_service.enqueue_for_transcript(transcript_id)

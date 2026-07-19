@@ -9,6 +9,8 @@ from services.transcript_service import TranscriptService
 from services.analysis_job_service import AnalysisJobService
 from services.stock_activity_service import StockActivityService
 
+MAX_TRANSCRIPT_ERROR_ATTEMPTS = 8
+
 
 class TranscriptFetcherWorker:
     def __init__(self):
@@ -37,12 +39,19 @@ class TranscriptFetcherWorker:
 
     def _run(self):
         while self.running:
-            job = self.queue.dequeue("transcript_check", timeout=5)
+            try:
+                job = self.queue.dequeue("transcript_check", timeout=15, lease_seconds=180)
+            except Exception as error:
+                print(f"[FetcherWorker] Queue claim failed: {error}")
+                time.sleep(5)
+                continue
             if not job:
                 continue
             try:
                 self._process_job(job)
+                self.queue.ack(job)
             except Exception as e:
+                self.queue.release(job, delay_seconds=60, error=str(e))
                 print(f"[FetcherWorker] Job failed: {e}")
 
     def _mark_check_status(self, cursor, stock_id: int, status: str):
@@ -71,12 +80,50 @@ class TranscriptFetcherWorker:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
 
         if status == "available":
-            return as_utc_naive(now + timedelta(hours=24))
+            return as_utc_naive(now + timedelta(days=7))
         if status == "upcoming":
-            return as_utc_naive(now + timedelta(minutes=5))
+            parsed_event = None
+            if event_date:
+                try:
+                    parsed_event = datetime.fromisoformat(
+                        str(event_date).strip().replace("Z", "+00:00").replace(" ", "T")
+                    )
+                    if parsed_event.tzinfo is None:
+                        parsed_event = parsed_event.replace(tzinfo=timezone.utc)
+                    else:
+                        parsed_event = parsed_event.astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    parsed_event = None
+
+            if parsed_event is None:
+                return as_utc_naive(now + timedelta(hours=6))
+
+            until_event = parsed_event - now
+            if until_event > timedelta(days=7):
+                delay = timedelta(hours=24)
+            elif until_event > timedelta(days=1):
+                delay = timedelta(hours=6)
+            elif until_event.total_seconds() > 0:
+                delay = timedelta(minutes=30)
+            elif until_event >= -timedelta(hours=48):
+                delay = timedelta(minutes=15)
+            elif until_event >= -timedelta(days=7):
+                delay = timedelta(hours=1)
+            else:
+                delay = timedelta(hours=6)
+            return as_utc_naive(now + delay)
         if status == "error":
-            return as_utc_naive(now + timedelta(minutes=5))
-        return as_utc_naive(now + timedelta(hours=1))
+            retry_delays = (
+                timedelta(minutes=5),
+                timedelta(minutes=15),
+                timedelta(hours=1),
+                timedelta(hours=6),
+                timedelta(hours=12),
+                timedelta(hours=24),
+            )
+            index = min(max(attempts, 1) - 1, len(retry_delays) - 1)
+            return as_utc_naive(now + retry_delays[index])
+        return as_utc_naive(now + timedelta(hours=12))
 
     def _process_job(self, job: dict):
         stock_id = job.get("stock_id")
@@ -88,14 +135,25 @@ class TranscriptFetcherWorker:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT id, stock_symbol, bse_code FROM stocks WHERE id = ?", (stock_id,))
+            cursor.execute(
+                """
+                SELECT id, stock_symbol, bse_code, isin_number, stock_name
+                FROM stocks
+                WHERE id = ?
+                """,
+                (stock_id,),
+            )
             stock = cursor.fetchone()
             if not stock:
-                return
+                raise ValueError("Stock not found")
 
-            symbol = stock["stock_symbol"] or stock["bse_code"]
+            symbol = (
+                stock["stock_symbol"]
+                or stock["bse_code"]
+                or stock["isin_number"]
+            )
             if not symbol:
-                return
+                raise ValueError("Stock has no usable ISIN or exchange symbol")
 
             cursor.execute(
                 """
@@ -325,14 +383,25 @@ class TranscriptFetcherWorker:
                 attempts,
                 is_watchlist_stock=is_watchlist_stock,
             )
+            exhausted = attempts >= MAX_TRANSCRIPT_ERROR_ATTEMPTS
+            schedule_error_status = "failed" if exhausted else "error"
+            if exhausted:
+                next_check_at = None
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
-                SET last_status = 'error', last_checked_at = CURRENT_TIMESTAMP,
+                SET last_status = ?, last_checked_at = CURRENT_TIMESTAMP,
                     next_check_at = ?, attempts = ?, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
                 WHERE stock_id = ? AND quarter = ? AND year = ?
                 """,
-                (next_check_at, attempts, stock_id, quarter, year),
+                (
+                    schedule_error_status,
+                    next_check_at,
+                    attempts,
+                    stock_id,
+                    quarter,
+                    year,
+                ),
             )
             self._mark_check_status(cursor, stock_id, "idle")
             conn.commit()
@@ -340,11 +409,17 @@ class TranscriptFetcherWorker:
                 stock_id,
                 "transcript",
                 "error",
-                f"Transcript check failed: {str(e)[:700]}",
+                (
+                    f"Transcript checks paused after {MAX_TRANSCRIPT_ERROR_ATTEMPTS} consecutive failures"
+                    if exhausted
+                    else f"Transcript check failed: {str(e)[:700]}"
+                ),
                 quarter=quarter,
                 year=year,
                 details={
                     "attempt": attempts,
+                    "failed": exhausted,
+                    "error": str(e)[:700],
                     "next_check_at": next_check_at,
                 },
             )

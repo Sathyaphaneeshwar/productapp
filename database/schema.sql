@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS stocks (
     bse_code TEXT,                        -- BSE security code
     isin_number TEXT NOT NULL UNIQUE,     -- ISIN number (unique identifier)
     stock_name TEXT NOT NULL,             -- Company/stock name
+    source TEXT NOT NULL DEFAULT 'master', -- master | import | manual
+    extra_code TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -15,6 +18,26 @@ CREATE TABLE IF NOT EXISTS stocks (
 CREATE INDEX IF NOT EXISTS idx_stock_symbol ON stocks(stock_symbol);
 CREATE INDEX IF NOT EXISTS idx_bse_code ON stocks(bse_code);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_isin_number ON stocks(isin_number);
+CREATE INDEX IF NOT EXISTS idx_stocks_source_active ON stocks(source, is_active);
+
+-- Validated imports are stored between preview and commit so the committed
+-- rows are exactly the rows the user reviewed.
+CREATE TABLE IF NOT EXISTS stock_import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    uploaded_ts INTEGER NOT NULL,
+    rows_total INTEGER NOT NULL DEFAULT 0,
+    rows_new INTEGER NOT NULL DEFAULT 0,
+    rows_updated INTEGER NOT NULL DEFAULT 0,
+    rows_unchanged INTEGER NOT NULL DEFAULT 0,
+    rows_invalid INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'previewed',
+    payload_json TEXT NOT NULL,
+    warnings_json TEXT,
+    committed_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_stock_import_batches_status_time
+ON stock_import_batches(status, uploaded_ts);
 
 -- Watchlist Table
 CREATE TABLE IF NOT EXISTS watchlist_items (
@@ -70,6 +93,7 @@ CREATE TABLE IF NOT EXISTS smtp_settings (
     app_password TEXT NOT NULL,  -- Store encrypted in production
     smtp_server TEXT DEFAULT 'smtp.gmail.com',
     smtp_port INTEGER DEFAULT 587,
+    smtp_security TEXT NOT NULL DEFAULT 'auto',
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -210,9 +234,21 @@ CREATE TABLE IF NOT EXISTS queue_messages (
     queue_name TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    status TEXT NOT NULL DEFAULT 'pending',
+    locked_until TIMESTAMP,
+    worker_id TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    dedupe_key TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_queue_messages_due ON queue_messages(queue_name, available_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_messages_dedupe
+ON queue_messages(queue_name, dedupe_key)
+WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_queue_messages_claim
+ON queue_messages(queue_name, status, locked_until, available_at);
 
 -- Email Outbox (Queue)
 CREATE TABLE IF NOT EXISTS email_outbox (

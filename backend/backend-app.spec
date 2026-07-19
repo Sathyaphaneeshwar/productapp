@@ -12,14 +12,20 @@ a = Analysis(
     binaries=[],
     datas=[
         ('templates', 'templates'),
-        (os.path.join(PROJECT_ROOT, 'database'), 'database'),
+        (os.path.join(PROJECT_ROOT, 'database', 'stocks.db'), 'database'),
+        (os.path.join(PROJECT_ROOT, 'database', 'schema.sql'), 'database'),
         (os.path.join(PROJECT_ROOT, 'data'), 'data'),
     ],
     hiddenimports=[
         # Flask & Web
         'flask',
         'flask_cors',
-        
+        'waitress',
+
+        # XLSX stock imports
+        'openpyxl',
+        'openpyxl.cell._writer',
+
         # xhtml2pdf and dependencies
         'xhtml2pdf',
         'xhtml2pdf.files',
@@ -82,7 +88,6 @@ a = Analysis(
         # Web scraping & networking
         'requests',
         'bs4',
-        'beautifulsoup4',
         
         # Cryptography
         'cryptography',

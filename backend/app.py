@@ -4,6 +4,10 @@ import sqlite3
 import os
 import sys
 import time
+import signal
+import threading
+import hmac
+import hashlib
 from datetime import datetime, timezone
 import smtplib
 import html
@@ -24,6 +28,7 @@ from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
 from services.stock_activity_service import StockActivityService
+from services.stock_import_service import StockImportError, StockImportService
 
 app = Flask(__name__)
 CORS(app)
@@ -39,11 +44,15 @@ prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
 stock_activity_service = StockActivityService()
+_runtime_stop_lock = threading.Lock()
+_shutdown_started = threading.Event()
 
 DB_PATH = str(DATABASE_PATH)
 
 
 def _should_start_background_workers() -> bool:
+    if os.environ.get("PRODUCT_GEMINI_DISABLE_WORKERS") == "1":
+        return False
     if getattr(sys, "frozen", False):
         return True
     return not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
@@ -59,6 +68,58 @@ def _run_startup_recovery():
     )
     if any(summary.values()):
         print(f"[Recovery] Startup recovery summary: {summary}")
+    try:
+        pruned = StockImportService(DB_PATH).prune_stale_previews()
+        if pruned:
+            print(f"[Recovery] Pruned {pruned} stale stock import preview(s)")
+    except Exception as error:
+        print(f"[Recovery] Stock import preview cleanup failed: {error}")
+
+
+def _stop_background_runtime(timeout_seconds: float = 5.0):
+    """Stop queue threads together and checkpoint SQLite within one deadline."""
+    with _runtime_stop_lock:
+        services = (
+            queue_scheduler,
+            fetcher_worker,
+            analysis_queue_worker,
+            email_queue_worker,
+        )
+        for service in services:
+            service.running = False
+            queue = getattr(service, "queue", None)
+            if queue:
+                for queue_name in ("transcript_check", "analysis", "email"):
+                    queue.notify(queue_name)
+
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        for service in services:
+            thread = getattr(service, "thread", None)
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=max(0, deadline - time.monotonic()))
+
+        try:
+            conn = get_db_connection()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.close()
+        except Exception as error:
+            print(f"[Shutdown] WAL checkpoint failed: {error}")
+
+
+def _exit_after_graceful_shutdown():
+    time.sleep(0.1)
+    _stop_background_runtime(timeout_seconds=5)
+    os._exit(0)
+
+
+def _is_control_request_authorized() -> bool:
+    expected = os.environ.get("PRODUCT_GEMINI_CONTROL_TOKEN")
+    if not expected:
+        return True
+    provided = request.headers.get("X-Product-Gemini-Control", "")
+    return hmac.compare_digest(provided, expected)
 
 
 if _should_start_background_workers():
@@ -122,33 +183,156 @@ def _trigger_stock_fetch_with_retry(
 @app.route('/api/system/health', methods=['GET'])
 def get_system_health():
     """Identify the packaged backend so Electron never reuses a stale process."""
+    control_token = os.environ.get('PRODUCT_GEMINI_CONTROL_TOKEN', '')
     return jsonify({
         'status': 'ok',
         'service': 'product-gemini-backend',
         'api_version': 2,
         'app_version': os.environ.get('PRODUCT_GEMINI_APP_VERSION'),
         'pid': os.getpid(),
+        'control_session_id': (
+            hashlib.sha256(control_token.encode('utf-8')).hexdigest()
+            if control_token
+            else None
+        ),
     })
+
+
+@app.route('/api/system/shutdown', methods=['POST'])
+def shutdown_system():
+    """Allow Electron to stop workers before taskkill/SIGKILL fallback."""
+    if not _is_control_request_authorized():
+        return jsonify({'error': 'Unauthorized control request'}), 403
+    if not _shutdown_started.is_set():
+        _shutdown_started.set()
+        threading.Thread(
+            target=_exit_after_graceful_shutdown,
+            name="graceful-shutdown",
+            daemon=True,
+        ).start()
+    return jsonify({'status': 'shutting_down'}), 202
+
+
+@app.route('/api/system/resumed', methods=['POST'])
+def resume_system():
+    """Catch up promptly after laptop sleep without resetting in-flight jobs."""
+    if not _is_control_request_authorized():
+        return jsonify({'error': 'Unauthorized control request'}), 403
+    try:
+        result = queue_scheduler.trigger_now(fresh=False)
+        return jsonify({'status': 'resumed', **result}), 202
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
 
 
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
     try:
-        return jsonify(queue_scheduler.get_status())
+        status = queue_scheduler.get_status()
+        status["workers"].update({
+            "transcript": bool(fetcher_worker.thread and fetcher_worker.thread.is_alive()),
+            "analysis": bool(
+                analysis_queue_worker.thread and analysis_queue_worker.thread.is_alive()
+            ),
+            "email": bool(email_queue_worker.thread and email_queue_worker.thread.is_alive()),
+        })
+        return jsonify(status)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/queue/health', methods=['GET'])
+def get_queue_health():
+    return get_poll_status()
+
 
 @app.route('/api/poll/trigger', methods=['POST'])
 def trigger_poll():
     try:
-        result = queue_scheduler.trigger_now(fresh=True)
+        result = queue_scheduler.trigger_now(fresh=False)
         return jsonify({
-            'message': 'Queue scheduler restarted from a fresh queue',
+            'message': 'Due checks and queued work were started without resetting the queue',
             'started': True,
             **result
         }), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/queue/reset', methods=['POST'])
+def reset_queue():
+    data = request.get_json(silent=True) or {}
+    if data.get("confirm") is not True:
+        return jsonify({
+            'error': 'Queue reset requires confirm=true',
+        }), 400
+    try:
+        result = queue_scheduler.trigger_now(fresh=True)
+        return jsonify({
+            'message': 'Queue engine reset completed',
+            **result,
+        }), 202
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+
+
+@app.route('/api/queue/retry-failed', methods=['POST'])
+def retry_failed_queue_jobs():
+    data = request.get_json(silent=True) or {}
+    queue_type = str(data.get("queue") or "all").strip().lower()
+    if queue_type not in {"all", "transcript", "analysis", "email"}:
+        return jsonify({'error': 'queue must be all, transcript, analysis, or email'}), 400
+
+    conn = get_db_connection()
+    summary = {"transcript": 0, "analysis": 0, "email": 0}
+    try:
+        if queue_type in {"all", "transcript"}:
+            summary["transcript"] = conn.execute(
+                """
+                UPDATE transcript_fetch_schedule
+                SET last_status = 'error',
+                    attempts = 0,
+                    next_check_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE last_status = 'failed'
+                """
+            ).rowcount
+        if queue_type in {"all", "analysis"}:
+            summary["analysis"] = conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'retrying',
+                    attempts = 0,
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('failed', 'error')
+                """
+            ).rowcount
+        if queue_type in {"all", "email"}:
+            summary["email"] = conn.execute(
+                """
+                UPDATE email_outbox
+                SET status = 'retrying',
+                    attempts = 0,
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'failed'
+                """
+            ).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    trigger_result = queue_scheduler.trigger_now(fresh=False)
+    return jsonify({
+        'message': 'Failed jobs queued for retry',
+        'retried': summary,
+        'quarter': trigger_result["quarter"],
+        'year': trigger_result["year"],
+    }), 202
 
 @app.route('/api/scheduler/status', methods=['GET'])
 def get_scheduler_status():
@@ -184,7 +368,9 @@ def get_stock_activity():
             try:
                 stock = conn.execute(
                     """
-                    SELECT id, COALESCE(stock_symbol, bse_code) AS symbol, stock_name AS name
+                    SELECT id,
+                           COALESCE(stock_symbol, bse_code, isin_number) AS symbol,
+                           stock_name AS name
                     FROM stocks
                     WHERE id = ?
                     """,
@@ -284,25 +470,38 @@ def search_stocks():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Search by NSE symbol, BSE code, or name, limit to 10 results
-    # Use COALESCE to return NSE symbol if available, otherwise BSE code
+    # ISIN-only user stocks remain searchable and usable.
     search_term = f"%{query}%"
     cursor.execute("""
-        SELECT id, COALESCE(stock_symbol, bse_code) as symbol, stock_name as name 
-        FROM stocks 
-        WHERE stock_symbol LIKE ? OR bse_code LIKE ? OR stock_name LIKE ? 
+        SELECT id,
+               COALESCE(stock_symbol, bse_code, isin_number) as symbol,
+               isin_number AS isin,
+               stock_name as name,
+               source
+        FROM stocks
+        WHERE is_active = 1
+          AND (
+              stock_symbol LIKE ? OR bse_code LIKE ?
+              OR isin_number LIKE ? OR stock_name LIKE ?
+          )
         ORDER BY 
             CASE 
                 WHEN stock_symbol = ? THEN 1 
                 WHEN bse_code = ? THEN 2
-                WHEN stock_symbol LIKE ? THEN 3 
-                WHEN bse_code LIKE ? THEN 4
-                WHEN stock_name LIKE ? THEN 5 
-                ELSE 6 
+                WHEN isin_number = ? THEN 3
+                WHEN stock_symbol LIKE ? THEN 4
+                WHEN bse_code LIKE ? THEN 5
+                WHEN isin_number LIKE ? THEN 6
+                WHEN stock_name LIKE ? THEN 7
+                ELSE 8
             END,
-            COALESCE(stock_symbol, bse_code) ASC
+            COALESCE(stock_symbol, bse_code, isin_number) ASC
         LIMIT 10
-    """, (search_term, search_term, search_term, query, query, f"{query}%", f"{query}%", f"{query}%"))
+    """, (
+        search_term, search_term, search_term, search_term,
+        query, query, query,
+        f"{query}%", f"{query}%", f"{query}%", f"{query}%"
+    ))
     
     stocks = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -312,6 +511,240 @@ def search_stocks():
         stock['status'] = 'not-ready'
         
     return jsonify(stocks)
+
+
+def _stock_import_error_response(error: StockImportError):
+    payload = {"error": str(error)}
+    payload.update(error.details)
+    return jsonify(payload), error.status_code
+
+
+@app.route('/api/stocks/template.csv', methods=['GET'])
+def download_stock_template():
+    return Response(
+        "ISIN,CompanyName\r\nINE009A01021,Infosys Limited\r\n",
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="stock_import_template.csv"'
+        },
+    )
+
+
+@app.route('/api/stocks/import/preview', methods=['POST'])
+def preview_stock_import():
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify({"error": "Choose a CSV, TSV, or XLSX file."}), 400
+    if request.content_length and request.content_length > 5 * 1024 * 1024 + 64 * 1024:
+        return jsonify({"error": "The upload exceeds the 5 MB limit."}), 413
+    try:
+        content = upload.stream.read(5 * 1024 * 1024 + 1)
+        result = StockImportService(DB_PATH).preview(upload.filename, content)
+        return jsonify(result)
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except Exception as error:
+        return jsonify({"error": f"Could not preview stock import: {error}"}), 500
+
+
+@app.route('/api/stocks/import/commit', methods=['POST'])
+def commit_stock_import():
+    data = request.get_json(silent=True) or {}
+    batch_id = data.get("batch_id")
+    if batch_id is None:
+        return jsonify({"error": "batch_id is required."}), 400
+    try:
+        result = StockImportService(DB_PATH).commit_batch(int(batch_id))
+        return jsonify({"message": "Stock import completed.", **result})
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except (TypeError, ValueError):
+        return jsonify({"error": "batch_id must be an integer."}), 400
+    except Exception as error:
+        return jsonify({"error": f"Could not commit stock import: {error}"}), 500
+
+
+@app.route('/api/stocks/manual', methods=['POST'])
+def add_stock_manually():
+    data = request.get_json(silent=True) or {}
+    try:
+        stock = StockImportService(DB_PATH).create_manual(
+            data.get("isin") or data.get("ISIN"),
+            data.get("company_name") or data.get("CompanyName"),
+        )
+        return jsonify({"message": "Stock added.", "stock": stock}), 201
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except Exception as error:
+        return jsonify({"error": f"Could not add stock: {error}"}), 500
+
+
+@app.route('/api/stocks/admin', methods=['GET'])
+def list_admin_stocks():
+    query = (request.args.get("q") or "").strip()
+    source = (request.args.get("source") or "user").strip().lower()
+    page = max(request.args.get("page", default=1, type=int) or 1, 1)
+    per_page = min(
+        max(request.args.get("per_page", default=50, type=int) or 50, 1),
+        100,
+    )
+    filters = []
+    params = []
+    if query:
+        filters.append(
+            "(isin_number LIKE ? OR stock_name LIKE ? "
+            "OR stock_symbol LIKE ? OR bse_code LIKE ?)"
+        )
+        search_term = f"%{query}%"
+        params.extend([search_term] * 4)
+    if source == "user":
+        filters.append("source IN ('import', 'manual')")
+    elif source in {"master", "import", "manual"}:
+        filters.append("source = ?")
+        params.append(source)
+
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    connection = get_db_connection()
+    try:
+        total = connection.execute(
+            f"SELECT COUNT(*) FROM stocks {where_clause}",
+            params,
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""
+            SELECT s.id,
+                   COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                   s.stock_symbol,
+                   s.bse_code,
+                   s.isin_number AS isin,
+                   s.stock_name AS company_name,
+                   s.source,
+                   s.is_active,
+                   EXISTS(
+                       SELECT 1 FROM watchlist_items w WHERE w.stock_id = s.id
+                   ) AS in_watchlist,
+                   (
+                       SELECT COUNT(*) FROM group_stocks gs WHERE gs.stock_id = s.id
+                   ) AS group_count
+            FROM stocks s
+            {where_clause}
+            ORDER BY datetime(s.updated_at) DESC, s.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, per_page, (page - 1) * per_page),
+        ).fetchall()
+        return jsonify(
+            {
+                "stocks": [
+                    {
+                        **dict(row),
+                        "is_active": bool(row["is_active"]),
+                        "in_watchlist": bool(row["in_watchlist"]),
+                    }
+                    for row in rows
+                ],
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "pages": (total + per_page - 1) // per_page,
+            }
+        )
+    finally:
+        connection.close()
+
+
+@app.route('/api/stocks/<int:stock_id>', methods=['PUT'])
+def update_managed_stock(stock_id):
+    data = request.get_json(silent=True) or {}
+    if "isin" in data or "ISIN" in data:
+        return jsonify({"error": "A stock's ISIN cannot be changed."}), 400
+    updates = []
+    params = []
+    if "company_name" in data or "CompanyName" in data:
+        company_name = " ".join(
+            str(data.get("company_name") or data.get("CompanyName") or "").split()
+        )
+        if not company_name:
+            return jsonify({"error": "CompanyName is required."}), 400
+        updates.append("stock_name = ?")
+        params.append(company_name)
+    if "is_active" in data:
+        updates.append("is_active = ?")
+        params.append(1 if bool(data["is_active"]) else 0)
+    if not updates:
+        return jsonify({"error": "No editable fields were supplied."}), 400
+
+    connection = get_db_connection()
+    try:
+        stock = connection.execute(
+            "SELECT id FROM stocks WHERE id = ?",
+            (stock_id,),
+        ).fetchone()
+        if not stock:
+            return jsonify({"error": "Stock not found."}), 404
+        params.append(stock_id)
+        connection.execute(
+            f"""
+            UPDATE stocks
+            SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            params,
+        )
+        connection.commit()
+        return jsonify({"message": "Stock updated."})
+    finally:
+        connection.close()
+
+
+@app.route('/api/stocks/<int:stock_id>', methods=['DELETE'])
+def delete_managed_stock(stock_id):
+    connection = get_db_connection()
+    try:
+        stock = connection.execute(
+            """
+            SELECT id, source,
+                   (SELECT COUNT(*) FROM watchlist_items WHERE stock_id = stocks.id)
+                       AS watchlists,
+                   (SELECT COUNT(*) FROM group_stocks WHERE stock_id = stocks.id)
+                       AS groups,
+                   (
+                       (SELECT COUNT(*) FROM transcripts WHERE stock_id = stocks.id)
+                       + (SELECT COUNT(*) FROM transcript_fetch_schedule
+                          WHERE stock_id = stocks.id)
+                       + (SELECT COUNT(*) FROM stock_activity_logs
+                          WHERE stock_id = stocks.id
+                            AND stage != 'stock_import')
+                   ) AS history
+            FROM stocks
+            WHERE id = ?
+            """,
+            (stock_id,),
+        ).fetchone()
+        if not stock:
+            return jsonify({"error": "Stock not found."}), 404
+        if stock["watchlists"] or stock["groups"] or stock["history"]:
+            return jsonify(
+                {
+                    "error": "Stock is in use or has activity history. Deactivate it instead.",
+                    "reason": "in_use",
+                    "watchlists": stock["watchlists"],
+                    "groups": stock["groups"],
+                    "history": stock["history"],
+                }
+            ), 409
+        if stock["source"] == "master":
+            return jsonify(
+                {
+                    "error": "Bundled master stocks cannot be deleted. Deactivate it instead.",
+                    "reason": "master",
+                }
+            ), 409
+        connection.execute("DELETE FROM stocks WHERE id = ?", (stock_id,))
+        connection.commit()
+        return jsonify({"message": "Stock deleted."})
+    finally:
+        connection.close()
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():
@@ -328,7 +761,7 @@ def get_watchlist():
     cursor.execute("""
         SELECT 
             s.id,
-            COALESCE(s.stock_symbol, s.bse_code) as symbol, 
+            COALESCE(s.stock_symbol, s.bse_code, s.isin_number) as symbol,
             s.stock_name as name,
             w.added_at,
             tc.status as transcript_check_status
@@ -579,18 +1012,31 @@ def get_watchlist():
 
 @app.route('/api/watchlist', methods=['POST'])
 def add_to_watchlist():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
     symbol = data.get('symbol')
     
-    if not symbol:
-        return jsonify({'error': 'Symbol is required'}), 400
+    if stock_id is None and not symbol:
+        return jsonify({'error': 'stock_id or symbol is required'}), 400
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        if stock_id is not None:
+            cursor.execute(
+                "SELECT id FROM stocks WHERE id = ? AND is_active = 1",
+                (int(stock_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE is_active = 1
+                  AND (stock_symbol = ? OR bse_code = ? OR isin_number = ?)
+                """,
+                (symbol, symbol, symbol),
+            )
         stock = cursor.fetchone()
         
         if not stock:
@@ -619,7 +1065,13 @@ def remove_from_watchlist(symbol):
         cursor = conn.cursor()
         try:
             # Get stock ID first - check both NSE symbol and BSE code
-            cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE stock_symbol = ? OR bse_code = ? OR isin_number = ?
+                """,
+                (symbol, symbol, symbol),
+            )
             stock = cursor.fetchone()
 
             if stock:
@@ -636,6 +1088,22 @@ def remove_from_watchlist(symbol):
             conn.close()
 
     return jsonify({'error': 'Database is busy, please retry'}), 503
+
+
+@app.route('/api/watchlist/id/<int:stock_id>', methods=['DELETE'])
+def remove_from_watchlist_by_id(stock_id):
+    connection = get_db_connection()
+    try:
+        connection.execute(
+            "DELETE FROM watchlist_items WHERE stock_id = ?",
+            (stock_id,),
+        )
+        connection.commit()
+        return jsonify({'message': 'Removed from watchlist'}), 200
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+    finally:
+        connection.close()
 
 # Groups API Endpoints
 
@@ -791,7 +1259,7 @@ def get_group_details(group_id):
     cursor.execute("""
         SELECT 
             s.id,
-            COALESCE(s.stock_symbol, s.bse_code) as symbol, 
+            COALESCE(s.stock_symbol, s.bse_code, s.isin_number) as symbol,
             s.stock_name as name, 
             gs.added_at,
             t.quarter,
@@ -832,18 +1300,31 @@ def get_group_details(group_id):
 
 @app.route('/api/groups/<int:group_id>/stocks', methods=['POST'])
 def add_stock_to_group(group_id):
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
     symbol = data.get('symbol')
     
-    if not symbol:
-        return jsonify({'error': 'Symbol is required'}), 400
+    if stock_id is None and not symbol:
+        return jsonify({'error': 'stock_id or symbol is required'}), 400
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        if stock_id is not None:
+            cursor.execute(
+                "SELECT id FROM stocks WHERE id = ? AND is_active = 1",
+                (int(stock_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE is_active = 1
+                  AND (stock_symbol = ? OR bse_code = ? OR isin_number = ?)
+                """,
+                (symbol, symbol, symbol),
+            )
         stock = cursor.fetchone()
         
         if not stock:
@@ -867,6 +1348,22 @@ def add_stock_to_group(group_id):
     finally:
         conn.close()
 
+
+@app.route('/api/groups/<int:group_id>/stocks/id/<int:stock_id>', methods=['DELETE'])
+def remove_stock_from_group_by_id(group_id, stock_id):
+    connection = get_db_connection()
+    try:
+        connection.execute(
+            "DELETE FROM group_stocks WHERE group_id = ? AND stock_id = ?",
+            (group_id, stock_id),
+        )
+        connection.commit()
+        return jsonify({'message': 'Stock removed from group'}), 200
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+    finally:
+        connection.close()
+
 @app.route('/api/groups/<int:group_id>/stocks/<symbol>', methods=['DELETE'])
 def remove_stock_from_group(group_id, symbol):
     conn = get_db_connection()
@@ -874,7 +1371,13 @@ def remove_stock_from_group(group_id, symbol):
     
     try:
         # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        cursor.execute(
+            """
+            SELECT id FROM stocks
+            WHERE stock_symbol = ? OR bse_code = ? OR isin_number = ?
+            """,
+            (symbol, symbol, symbol),
+        )
         stock = cursor.fetchone()
         
         if stock:
@@ -1133,13 +1636,16 @@ def add_smtp_setting():
             cursor.execute("UPDATE smtp_settings SET is_active = 0")
             
         cursor.execute("""
-            INSERT INTO smtp_settings (email, app_password, smtp_server, smtp_port, is_active)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO smtp_settings (
+                email, app_password, smtp_server, smtp_port, smtp_security, is_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             email, 
             app_password, 
             data.get('smtp_server', 'smtp.gmail.com'),
             data.get('smtp_port', 587),
+            data.get('smtp_security', 'auto'),
             data.get('is_active', True)
         ))
         conn.commit()
@@ -1152,12 +1658,14 @@ def add_smtp_setting():
                 
             cursor.execute("""
                 UPDATE smtp_settings 
-                SET app_password = ?, smtp_server = ?, smtp_port = ?, is_active = ?
+                SET app_password = ?, smtp_server = ?, smtp_port = ?,
+                    smtp_security = ?, is_active = ?
                 WHERE email = ?
             """, (
                 app_password,
                 data.get('smtp_server', 'smtp.gmail.com'),
                 data.get('smtp_port', 587),
+                data.get('smtp_security', 'auto'),
                 data.get('is_active', True),
                 email
             ))
@@ -1205,6 +1713,10 @@ def update_smtp_setting(setting_id):
         if 'smtp_port' in data:
             fields.append("smtp_port = ?")
             values.append(data['smtp_port'])
+
+        if 'smtp_security' in data:
+            fields.append("smtp_security = ?")
+            values.append(data['smtp_security'])
             
         if 'is_active' in data:
             fields.append("is_active = ?")
@@ -1267,7 +1779,8 @@ def test_smtp():
                 'email': data['email'],
                 'app_password': data['app_password'],
                 'smtp_server': data.get('smtp_server', 'smtp.gmail.com'),
-                'smtp_port': data.get('smtp_port', 587)
+                'smtp_port': data.get('smtp_port', 587),
+                'smtp_security': data.get('smtp_security', 'auto'),
             }
             result = email_service.test_connection(smtp_config)
         else:
@@ -1723,6 +2236,7 @@ def download_latest_analysis(stock_id):
                 t.source_url,
                 s.stock_symbol,
                 s.bse_code,
+                s.isin_number,
                 s.stock_name
             FROM transcript_analyses ta
             JOIN transcripts t ON ta.transcript_id = t.id
@@ -1774,7 +2288,12 @@ def download_latest_analysis(stock_id):
         except Exception:
             rendered_content = f"<pre>{html.escape(analysis['llm_output'] or '')}</pre>"
 
-        symbol = analysis['stock_symbol'] or analysis['bse_code'] or f"stock-{stock_id}"
+        symbol = (
+            analysis['stock_symbol']
+            or analysis['bse_code']
+            or analysis['isin_number']
+            or f"stock-{stock_id}"
+        )
         stock_name = analysis['stock_name'] or symbol
         quarter = analysis['quarter']
         year = analysis['year']
@@ -2090,6 +2609,23 @@ def download_research_pdf(run_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Disable debug mode in production (PyInstaller) to prevent reloader
     is_frozen = getattr(sys, 'frozen', False)
-    app.run(debug=not is_frozen, port=5001, use_reloader=not is_frozen)
+
+    def _handle_termination(_signum, _frame):
+        _stop_background_runtime(timeout_seconds=5)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_termination)
+    if hasattr(signal, "SIGINT"):
+        signal.signal(signal.SIGINT, _handle_termination)
+
+    if is_frozen:
+        from waitress import serve
+        serve(app, host='127.0.0.1', port=5001, threads=8)
+    else:
+        app.run(
+            debug=True,
+            host='127.0.0.1',
+            port=5001,
+            use_reloader=True,
+        )
