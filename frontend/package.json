@@ -1,7 +1,7 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.1.33",
+  "version": "1.2.27",
   "description": "Product Gemini Stock Analysis App",
   "author": "Sathyaphaneeshwar",
   "type": "module",
@@ -12,7 +12,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "electron:dev": "npm run build && electron .",
-    "electron:build": "npm run build && electron-builder -w"
+    "electron:build": "npm run build && electron-builder"
   },
   "dependencies": {
     "@radix-ui/react-dropdown-menu": "^2.1.16",

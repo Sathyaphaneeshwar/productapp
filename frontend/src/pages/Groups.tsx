@@ -9,7 +9,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { cn } from '@/lib/utils'
 
 
-const API_URL = 'http://localhost:5001/api'
+const API_URL = 'http://127.0.0.1:5001/api'
 
 type Group = {
     id: number
@@ -54,6 +54,12 @@ type Quarter = {
     label: string
 }
 
+type StockSearchResult = {
+    id: number
+    symbol: string
+    name: string
+}
+
 export default function Groups() {
     const [groups, setGroups] = useState<Group[]>([])
     const [selectedGroupId, setSelectedGroupId] = useState<number | null>(null)
@@ -63,7 +69,7 @@ export default function Groups() {
     const [isCreating, setIsCreating] = useState(false)
     const [newGroupName, setNewGroupName] = useState('')
     const [stockSearchQuery, setStockSearchQuery] = useState('')
-    const [searchResults, setSearchResults] = useState<any[]>([])
+    const [searchResults, setSearchResults] = useState<StockSearchResult[]>([])
     const [isSearching, setIsSearching] = useState(false)
     const [deletingGroupId, setDeletingGroupId] = useState<number | null>(null)
     const [renamingGroupId, setRenamingGroupId] = useState<number | null>(null)
@@ -81,6 +87,7 @@ export default function Groups() {
     const stockSearchContainerRef = useRef<HTMLDivElement>(null)
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const selectedGroupIdRef = useRef<number | null>(null)
+    const selectedQuarterRef = useRef<Quarter | null>(null)
     const groupDetailsRequestIdRef = useRef(0)
     const articlesRequestIdRef = useRef(0)
     const articleContentRequestIdRef = useRef(0)
@@ -88,6 +95,10 @@ export default function Groups() {
     useEffect(() => {
         selectedGroupIdRef.current = selectedGroupId
     }, [selectedGroupId])
+
+    useEffect(() => {
+        selectedQuarterRef.current = selectedQuarter
+    }, [selectedQuarter])
 
     // Fetch groups and quarters on mount
     useEffect(() => {
@@ -113,7 +124,7 @@ export default function Groups() {
     useEffect(() => {
         if (selectedGroupId && selectedQuarter) {
             fetchGroupDetails(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
-            fetchArticles(selectedGroupId)
+            fetchArticles(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
         } else if (!selectedGroupId) {
             setSelectedGroup(null)
             setArticles([])
@@ -205,15 +216,31 @@ export default function Groups() {
         }
     }
 
-    const fetchArticles = async (groupId: number) => {
+    const getArticlesUrl = (groupId: number, quarter?: string, year?: number) => {
+        let url = `${API_URL}/groups/${groupId}/articles`
+        if (quarter && typeof year === 'number') {
+            url += `?quarter=${encodeURIComponent(quarter)}&year=${encodeURIComponent(String(year))}`
+        }
+        return url
+    }
+
+    const fetchArticles = async (groupId: number, quarter?: string, year?: number) => {
         const requestId = ++articlesRequestIdRef.current
         setArticlesLoading(true)
         try {
-            const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
+            const response = await fetch(getArticlesUrl(groupId, quarter, year))
             if (response.ok) {
                 const data = await response.json()
                 if (requestId !== articlesRequestIdRef.current) return
                 if (selectedGroupIdRef.current !== groupId) return
+                const currentQuarter = selectedQuarterRef.current
+                if (
+                    quarter &&
+                    typeof year === 'number' &&
+                    (!currentQuarter || currentQuarter.quarter !== quarter || currentQuarter.year !== year)
+                ) {
+                    return
+                }
                 setArticles(data)
             } else {
                 setArticles([])
@@ -337,8 +364,8 @@ export default function Groups() {
                 }
                 alert(message)
                 // Refresh articles list and start polling
-                fetchArticles(selectedGroupId)
-                startArticlePolling(selectedGroupId)
+                fetchArticles(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
+                startArticlePolling(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
             } else {
                 let errorText = 'Unknown error'
                 try {
@@ -350,16 +377,17 @@ export default function Groups() {
                 console.error('Force generate failed', errorText)
                 alert(`Failed to generate article: ${errorText || 'Unknown error'}`)
             }
-        } catch (e: any) {
-            console.error('Force generate failed', e)
-            alert(`Failed to generate article: ${e.message || 'Network error'}`)
+        } catch (error: unknown) {
+            console.error('Force generate failed', error)
+            const message = error instanceof Error ? error.message : 'Network error'
+            alert(`Failed to generate article: ${message}`)
         } finally {
             setForcingRun(false)
         }
     }
 
     // Issue #6: Polling for article status updates
-    const startArticlePolling = (groupId: number) => {
+    const startArticlePolling = (groupId: number, quarter?: string, year?: number) => {
         // Clear any existing polling
         if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current)
@@ -374,10 +402,31 @@ export default function Groups() {
                     }
                     return
                 }
-                const response = await fetch(`${API_URL}/groups/${groupId}/articles`)
+                const currentQuarter = selectedQuarterRef.current
+                if (
+                    quarter &&
+                    typeof year === 'number' &&
+                    (!currentQuarter || currentQuarter.quarter !== quarter || currentQuarter.year !== year)
+                ) {
+                    if (pollingIntervalRef.current) {
+                        clearInterval(pollingIntervalRef.current)
+                        pollingIntervalRef.current = null
+                    }
+                    return
+                }
+
+                const response = await fetch(getArticlesUrl(groupId, quarter, year))
                 if (response.ok) {
                     const data = await response.json()
                     if (selectedGroupIdRef.current !== groupId) return
+                    const refreshedQuarter = selectedQuarterRef.current
+                    if (
+                        quarter &&
+                        typeof year === 'number' &&
+                        (!refreshedQuarter || refreshedQuarter.quarter !== quarter || refreshedQuarter.year !== year)
+                    ) {
+                        return
+                    }
                     setArticles(data)
 
                     // Stop polling if no articles are in progress
@@ -402,17 +451,17 @@ export default function Groups() {
                 clearInterval(pollingIntervalRef.current)
             }
         }
-    }, [selectedGroupId])
+    }, [selectedGroupId, selectedQuarter])
 
     // Auto-start polling when viewing articles tab to catch scheduler-triggered runs
     useEffect(() => {
-        if (activeTab === 'articles' && selectedGroupId) {
-            startArticlePolling(selectedGroupId)
+        if (activeTab === 'articles' && selectedGroupId && selectedQuarter) {
+            startArticlePolling(selectedGroupId, selectedQuarter.quarter, selectedQuarter.year)
         } else if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current)
             pollingIntervalRef.current = null
         }
-    }, [activeTab, selectedGroupId])
+    }, [activeTab, selectedGroupId, selectedQuarter])
 
     const updateGroup = async (updates: Partial<Group>, showFeedback = false) => {
         if (!selectedGroupId) return
@@ -467,14 +516,17 @@ export default function Groups() {
         }
     }
 
-    const addStockToGroup = async (symbol: string) => {
+    const addStockToGroup = async (stock: StockSearchResult) => {
         if (!selectedGroupId) return
 
         try {
             const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ symbol })
+                body: JSON.stringify({
+                    stock_id: stock.id,
+                    symbol: stock.symbol,
+                })
             })
 
             if (response.ok) {
@@ -491,11 +543,11 @@ export default function Groups() {
         }
     }
 
-    const removeStockFromGroup = async (symbol: string) => {
+    const removeStockFromGroup = async (stockId: number) => {
         if (!selectedGroupId) return
 
         try {
-            const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks/${symbol}`, {
+            const response = await fetch(`${API_URL}/groups/${selectedGroupId}/stocks/id/${stockId}`, {
                 method: 'DELETE'
             })
 
@@ -708,7 +760,7 @@ export default function Groups() {
                                                         <div
                                                             key={stock.symbol}
                                                             className="flex items-center justify-between p-2 hover:bg-accent cursor-pointer text-sm"
-                                                            onClick={() => addStockToGroup(stock.symbol)}
+                                                            onClick={() => addStockToGroup(stock)}
                                                         >
                                                             <span>{stock.symbol} - {stock.name}</span>
                                                             <Plus className="h-4 w-4 text-muted-foreground" />
@@ -779,7 +831,7 @@ export default function Groups() {
                                                                 size="icon"
                                                                 variant="ghost"
                                                                 className="h-8 w-8 text-muted-foreground hover:text-red-400 hover:bg-red-500/10"
-                                                                onClick={() => removeStockFromGroup(stock.symbol)}
+                                                                onClick={() => removeStockFromGroup(stock.id)}
                                                             >
                                                                 <Trash2 className="h-4 w-4" />
                                                             </Button>

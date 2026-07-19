@@ -29,6 +29,15 @@ import markdown
 from config import DATABASE_PATH
 from db import get_db_connection
 
+
+class PermanentEmailError(Exception):
+    """An email configuration/content error that retrying cannot repair."""
+
+
+class EmailAuthenticationError(PermanentEmailError):
+    """SMTP rejected the configured credentials."""
+
+
 class EmailService:
     def __init__(self):
         self.db_path = str(DATABASE_PATH)
@@ -47,6 +56,52 @@ class EmailService:
         finally:
             conn.close()
 
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context()
+        if SSL_CERT_FILE:
+            context.load_verify_locations(SSL_CERT_FILE)
+        return context
+
+    def _connection_security(self, smtp_config: Dict[str, Any]) -> str:
+        raw_security = str(smtp_config.get("smtp_security") or "auto").strip().lower()
+        aliases = {
+            "tls": "starttls",
+            "implicit_ssl": "ssl",
+            "implicit-tls": "ssl",
+        }
+        security = aliases.get(raw_security, raw_security)
+        if security == "auto":
+            return "ssl" if int(smtp_config["smtp_port"]) == 465 else "starttls"
+        if security not in {"ssl", "starttls", "plain"}:
+            raise PermanentEmailError(f"Unsupported SMTP security mode: {raw_security}")
+        return security
+
+    def _open_server(self, smtp_config: Dict[str, Any]):
+        host = smtp_config["smtp_server"]
+        port = int(smtp_config["smtp_port"])
+        security = self._connection_security(smtp_config)
+        context = self._create_ssl_context()
+
+        if security == "ssl":
+            server = smtplib.SMTP_SSL(host, port, timeout=30, context=context)
+            server.ehlo()
+            return server
+
+        server = smtplib.SMTP(host, port, timeout=30)
+        server.ehlo()
+        if security == "starttls":
+            server.starttls(context=context)
+            server.ehlo()
+        return server
+
+    def _login(self, server, smtp_config: Dict[str, Any]) -> None:
+        try:
+            server.login(smtp_config["email"], smtp_config["app_password"])
+        except smtplib.SMTPAuthenticationError as error:
+            raise EmailAuthenticationError(
+                "SMTP authentication failed. Check the email address, app password, and security mode."
+            ) from error
+
     def test_connection(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Test SMTP connection with provided or stored credentials"""
         smtp_config = config
@@ -56,31 +111,21 @@ class EmailService:
                 raise ValueError("No active SMTP configuration found")
         
         try:
-            # Try to connect to SMTP server with timeout
-            server = smtplib.SMTP(smtp_config['smtp_server'], int(smtp_config['smtp_port']), timeout=30)
-            server.ehlo()
-            
-            # Use starttls with SSL context - use certifi for CA certs in bundled apps
-            context = ssl.create_default_context()
-            if SSL_CERT_FILE:
-                context.load_verify_locations(SSL_CERT_FILE)
-            server.starttls(context=context)
-            server.ehlo()
-            
-            server.login(smtp_config['email'], smtp_config['app_password'])
-            server.quit()
-            
+            with self._open_server(smtp_config) as server:
+                self._login(server, smtp_config)
             return {
                 'status': 'success',
                 'message': 'SMTP connection successful',
                 'server': smtp_config['smtp_server'],
-                'port': smtp_config['smtp_port']
+                'port': smtp_config['smtp_port'],
+                'security': self._connection_security(smtp_config),
             }
-            
-        except smtplib.SMTPAuthenticationError as e:
-            raise ValueError(f'Authentication failed. Check email and app password. Details: {str(e)}')
+        except EmailAuthenticationError as error:
+            raise ValueError(str(error)) from error
         except smtplib.SMTPException as e:
             raise Exception(f'SMTP error: {str(e)}')
+        except PermanentEmailError as error:
+            raise ValueError(str(error)) from error
         except Exception as e:
             raise Exception(f'Connection error: {str(e)}')
 
@@ -101,22 +146,13 @@ class EmailService:
             # Add body
             msg.attach(MIMEText(body, 'html' if is_html else 'plain'))
             
-            # Send email with timeout and SSL context - use certifi for CA certs
-            server = smtplib.SMTP(smtp_config['smtp_server'], int(smtp_config['smtp_port']), timeout=30)
-            server.ehlo()
-            context = ssl.create_default_context()
-            if SSL_CERT_FILE:
-                context.load_verify_locations(SSL_CERT_FILE)
-            server.starttls(context=context)
-            server.ehlo()
-            server.login(smtp_config['email'], smtp_config['app_password'])
-            server.send_message(msg)
-            server.quit()
+            with self._open_server(smtp_config) as server:
+                self._login(server, smtp_config)
+                server.send_message(msg)
             
             return True
-            
-        except smtplib.SMTPAuthenticationError as e:
-            raise Exception(f"SMTP authentication failed: {str(e)}")
+        except PermanentEmailError:
+            raise
         except Exception as e:
             raise Exception(f"Failed to send email: {str(e)}")
 
@@ -239,6 +275,8 @@ class EmailService:
                 body=html_body,
                 is_html=True
             )
+        except PermanentEmailError:
+            raise
         except Exception as e:
             raise Exception(f"Failed to send analysis email: {str(e)}")
 
@@ -285,5 +323,7 @@ class EmailService:
                 body=html_body,
                 is_html=True
             )
+        except PermanentEmailError:
+            raise
         except Exception as e:
             raise Exception(f"Failed to send document research email: {str(e)}")

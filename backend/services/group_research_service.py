@@ -1,10 +1,11 @@
 import threading
+import time
 import sqlite3
 import os
 import sys
 import html
 from datetime import datetime
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import markdown
 import re
 
@@ -14,6 +15,8 @@ from db import get_db_connection
 from services.transcript_service import TranscriptService
 from services.llm.llm_service import LLMService
 from services.email_service import EmailService
+from services.retry_utils import compute_backoff_seconds
+from services.stock_activity_service import StockActivityService
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'templates')
 
 
@@ -28,6 +31,7 @@ class GroupResearchService:
         self.transcript_service = TranscriptService()
         self.llm_service = LLMService()
         self.email_service = EmailService()
+        self.activity_service = StockActivityService()
         self.ensure_table()
 
     def get_db_connection(self):
@@ -138,7 +142,9 @@ class GroupResearchService:
         """
         cursor.execute(
             """
-            SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
+            SELECT s.id,
+                   COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                   s.stock_name
             FROM stocks s
             JOIN group_stocks gs ON s.id = gs.stock_id
             WHERE gs.group_id = ?
@@ -192,11 +198,19 @@ class GroupResearchService:
         row = cursor.fetchone()
         return dict(row) if row else None
 
-    def check_and_trigger_runs(self):
+    def check_and_trigger_runs(
+        self,
+        target_quarter: Optional[str] = None,
+        target_year: Optional[int] = None,
+    ):
         """
         Scan all active groups. If every stock in a group has an available transcript
-        for the same quarter/year, trigger a deep research run (one per quarter).
+        for the same quarter/year, trigger a deep research run.
+        If target_quarter/target_year are provided, only that quarter is considered.
         """
+        if (target_quarter is None) != (target_year is None):
+            raise ValueError("target_quarter and target_year must be provided together")
+
         conn = self.get_db_connection()
         cursor = conn.cursor()
 
@@ -219,21 +233,31 @@ class GroupResearchService:
                 if not stock_ids:
                     continue
 
-                # Build intersection of available (quarter, year) across all stocks in the group
-                intersection: set[Tuple[str, int]] = set()
-                for idx, stock_id in enumerate(stock_ids):
-                    quarters = set(self._available_quarters_for_stock(cursor, stock_id))
-                    if idx == 0:
-                        intersection = quarters
-                    else:
-                        intersection &= quarters
+                quarter_candidates: List[Tuple[str, int]] = []
+                if target_quarter is not None and target_year is not None:
+                    stocks, available_transcripts, missing_stocks = self._collect_transcripts(
+                        cursor, group_id, target_quarter, int(target_year)
+                    )
+                    if not stocks or not available_transcripts or missing_stocks:
+                        continue
+                    quarter_candidates = [(target_quarter, int(target_year))]
+                else:
+                    # Backward-compatible path: trigger for every common available quarter.
+                    intersection: set[Tuple[str, int]] = set()
+                    for idx, stock_id in enumerate(stock_ids):
+                        quarters = set(self._available_quarters_for_stock(cursor, stock_id))
+                        if idx == 0:
+                            intersection = quarters
+                        else:
+                            intersection &= quarters
+                        if not intersection:
+                            break
+
                     if not intersection:
-                        break
+                        continue
+                    quarter_candidates = list(intersection)
 
-                if not intersection:
-                    continue
-
-                for quarter, year in intersection:
+                for quarter, year in quarter_candidates:
                     existing = self._existing_run(cursor, group_id, quarter, year)
                     if existing:
                         if existing["status"] in ("pending", "in_progress", "done"):
@@ -287,6 +311,17 @@ class GroupResearchService:
                 (status, error, run_id),
             )
             conn.commit()
+            if status == "error":
+                for stock_id in self._group_stock_ids(cursor, group_id):
+                    self.activity_service.safe_log_event(
+                        stock_id,
+                        "group_research",
+                        "error",
+                        f"Group research failed: {error or 'unknown error'}",
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "group_name": group_name},
+                    )
 
         try:
             update_status("in_progress")
@@ -396,6 +431,16 @@ class GroupResearchService:
                 ),
             )
             conn.commit()
+            for item in available_transcripts:
+                self.activity_service.safe_log_event(
+                    item["stock"]["id"],
+                    "group_research",
+                    "success",
+                    f"Group research completed for {group_name}",
+                    quarter=quarter,
+                    year=year,
+                    details={"group_id": group_id, "run_id": run_id},
+                )
 
             # Render HTML once for email/export
             run_payload = {
@@ -416,34 +461,89 @@ class GroupResearchService:
             if emails:
                 stocks_list = ", ".join([item["stock"]["symbol"] for item in available_transcripts])
                 body = rendered_html.replace("{{STOCK_LIST}}", html.escape(stocks_list))
+                failed_recipients = 0
                 for email in emails:
-                    try:
-                        self.email_service.send_email(
-                            to_email=email,
-                            subject=f"Group Research: {group_name} - {quarter} {year}",
-                            body=body,
-                            is_html=True,
-                        )
-                    except Exception as e:
-                        print(f"[GroupResearch] Failed to send email to {email}: {e}")
+                    delivered = False
+                    last_error = None
+                    for attempt in range(1, 4):
+                        try:
+                            self.email_service.send_email(
+                                to_email=email,
+                                subject=f"Group Research: {group_name} - {quarter} {year}",
+                                body=body,
+                                is_html=True,
+                            )
+                            delivered = True
+                            break
+                        except Exception as error:
+                            last_error = error
+                            if attempt < 3:
+                                time.sleep(
+                                    compute_backoff_seconds(
+                                        attempt,
+                                        base_seconds=5,
+                                        max_seconds=30,
+                                    )
+                                )
+                    if not delivered:
+                        failed_recipients += 1
+                        print(f"[GroupResearch] Failed to send email to {email}: {last_error}")
+
+                email_level = "error" if failed_recipients else "success"
+                email_message = (
+                    f"Group research email failed for {failed_recipients} recipient(s)"
+                    if failed_recipients
+                    else "Group research email sent successfully"
+                )
+                for item in available_transcripts:
+                    self.activity_service.safe_log_event(
+                        item["stock"]["id"],
+                        "email",
+                        email_level,
+                        email_message,
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "run_id": run_id},
+                    )
+            else:
+                for item in available_transcripts:
+                    self.activity_service.safe_log_event(
+                        item["stock"]["id"],
+                        "email",
+                        "error",
+                        "No active email recipients; group research email was not sent",
+                        quarter=quarter,
+                        year=year,
+                        details={"group_id": group_id, "run_id": run_id},
+                    )
 
         except Exception as e:
             update_status("error", f"Unexpected error: {e}")
         finally:
             conn.close()
 
-    def list_runs(self, group_id: int) -> List[Dict]:
+    def list_runs(
+        self,
+        group_id: int,
+        quarter: Optional[str] = None,
+        year: Optional[int] = None,
+    ) -> List[Dict]:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                """
+            query = """
                 SELECT id, quarter, year, status, model_provider, model_id, error_message, created_at, updated_at
                 FROM group_research_runs
                 WHERE group_id = ?
-                ORDER BY year DESC, quarter DESC, created_at DESC
-                """,
-                (group_id,),
+            """
+            params: list = [group_id]
+            if quarter is not None and year is not None:
+                query += " AND quarter = ? AND year = ?"
+                params.extend([quarter, year])
+            query += " ORDER BY year DESC, quarter DESC, created_at DESC"
+            cursor.execute(
+                query,
+                params,
             )
             return [dict(row) for row in cursor.fetchall()]
         finally:
@@ -471,7 +571,9 @@ class GroupResearchService:
             # Get stocks for this group (and attach symbols for display)
             cursor.execute(
                 """
-                SELECT s.id, COALESCE(s.stock_symbol, s.bse_code) AS symbol, s.stock_name
+                SELECT s.id,
+                       COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                       s.stock_name
                 FROM stocks s
                 JOIN group_stocks gs ON s.id = gs.stock_id
                 WHERE gs.group_id = ?

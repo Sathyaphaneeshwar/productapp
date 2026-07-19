@@ -23,6 +23,9 @@ class TranscriptMetadata:
     event_date: str = None  # For upcoming calls
 
 class TranscriptService:
+    API_TIMEOUT = (10, 30)
+    PDF_TIMEOUT = (10, 45)
+
     def __init__(self):
         self.key_service = KeyService()
         self.base_url = "https://www.tijoristack.ai/api/v1"
@@ -48,10 +51,12 @@ class TranscriptService:
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT isin_number FROM stocks 
-                WHERE UPPER(stock_symbol) = UPPER(?) OR bse_code = ?
+                SELECT isin_number FROM stocks
+                WHERE UPPER(stock_symbol) = UPPER(?)
+                   OR bse_code = ?
+                   OR UPPER(isin_number) = UPPER(?)
                 LIMIT 1
-            """, (stock_symbol, stock_symbol))
+            """, (stock_symbol, stock_symbol, stock_symbol))
             result = cursor.fetchone()
             return result['isin_number'] if result else None
         finally:
@@ -147,7 +152,12 @@ class TranscriptService:
         }
 
         try:
-            response = requests.get(url, headers=self._get_headers(), params=params)
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                params=params,
+                timeout=self.API_TIMEOUT,
+            )
             response.raise_for_status()
             data = response.json()
             
@@ -186,9 +196,7 @@ class TranscriptService:
             return [item[1] for item in results]
 
         except Exception as e:
-            print(f"Error fetching transcripts from Tijori: {e}")
-            # Fallback to empty list or re-raise depending on requirement
-            return []
+            raise RuntimeError(f"Tijori available-transcript request failed: {e}") from e
 
     def download_and_extract(self, url: str) -> str:
         """
@@ -197,6 +205,7 @@ class TranscriptService:
         import tempfile
         from pypdf import PdfReader
         
+        tmp_path = None
         try:
             safe_url = self._sanitize_url(url)
             if safe_url != url:
@@ -209,16 +218,25 @@ class TranscriptService:
             }
             session = requests.Session()
             session.headers.update(headers)
-            response = session.get(safe_url, timeout=30)
+            response = session.get(safe_url, timeout=self.PDF_TIMEOUT)
             if response.status_code == 403:
                 # Retry once with referrer to appease some CDNs
                 session.headers.update({"Referer": safe_url.rsplit('/', 1)[0]})
-                response = session.get(safe_url, timeout=30)
+                response = session.get(safe_url, timeout=self.PDF_TIMEOUT)
             response.raise_for_status()
+
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            content = response.content
+            if not content:
+                raise ValueError("Transcript download returned an empty response")
+            if "pdf" not in content_type and not content.startswith(b"%PDF-"):
+                raise ValueError(
+                    f"Transcript URL did not return a PDF (content type: {content_type or 'unknown'})"
+                )
             
             # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-                tmp_file.write(response.content)
+                tmp_file.write(content)
                 tmp_path = tmp_file.name
             
             print(f"Extracting text from PDF...")
@@ -231,18 +249,19 @@ class TranscriptService:
                 if text:
                     text_content.append(text)
             
-            # Clean up temp file
-            import os
-            os.unlink(tmp_path)
-            
             full_text = "\n\n".join(text_content)
             print(f"Extracted {len(full_text)} characters from {len(reader.pages)} pages")
-            
+            if len(full_text.strip()) < 200:
+                raise ValueError("Transcript PDF contained too little extractable text")
             return full_text
-            
         except Exception as e:
-            print(f"Error downloading/extracting PDF: {e}")
-            return f"Error extracting text: {str(e)}"
+            raise RuntimeError(f"Transcript PDF extraction failed: {e}") from e
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def validate_api_key(self) -> bool:
         """
@@ -263,7 +282,12 @@ class TranscriptService:
                 'upcoming': 'true',
                 'page_size': 1
             }
-            response = requests.get(url, headers=self._get_headers(), params=params)
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                params=params,
+                timeout=self.API_TIMEOUT,
+            )
             response.raise_for_status()
             return True
         except Exception as e:
@@ -292,31 +316,38 @@ class TranscriptService:
             params['page_size'] = 20
 
         try:
-            response = requests.get(url, headers=self._get_headers(), params=params)
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                params=params,
+                timeout=self.API_TIMEOUT,
+            )
             response.raise_for_status()
             data = response.json()
             
             results = []
             for item in data.get('data', []):
                 status = (item.get('status') or '').strip().lower()
-                if status == 'upcoming':
-                    # For upcoming, we might not have quarter/year yet
-                    # We'll calculate from event_date
-                    event_time = item.get('concall_event_time')
-                    if event_time:
-                        quarter, fy = self._calculate_fy_quarter(event_time)
-                        
-                        results.append(TranscriptMetadata(
-                            stock_symbol=item['company_info']['name'],
-                            quarter=quarter,
-                            year=fy,
-                            source_url=None,  # Not available yet
-                            title=f"{quarter} FY{fy} Earnings Call (Upcoming)",
-                            isin=item['company_info']['isin'],
-                            event_date=event_time  # Include event date
-                        ))
+                if status and status != 'upcoming':
+                    continue
+
+                # For upcoming, we might not have quarter/year yet
+                # We'll calculate from event_date
+                event_time = item.get('concall_event_time') or item.get('event_time') or item.get('event_date')
+                if event_time:
+                    quarter, fy = self._calculate_fy_quarter(event_time)
+
+                    company_info = item.get("company_info") or {}
+                    results.append(TranscriptMetadata(
+                        stock_symbol=company_info.get("name") or stock_symbol or "Unknown",
+                        quarter=quarter,
+                        year=fy,
+                        source_url=None,  # Not available yet
+                        title=f"{quarter} FY{fy} Earnings Call (Upcoming)",
+                        isin=company_info.get("isin") or params.get("isin") or "",
+                        event_date=event_time  # Include event date
+                    ))
             return results
 
         except Exception as e:
-            print(f"Error fetching upcoming calls from Tijori: {e}")
-            return []
+            raise RuntimeError(f"Tijori upcoming-call request failed: {e}") from e

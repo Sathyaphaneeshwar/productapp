@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS stocks (
     bse_code TEXT,                        -- BSE security code
     isin_number TEXT NOT NULL UNIQUE,     -- ISIN number (unique identifier)
     stock_name TEXT NOT NULL,             -- Company/stock name
+    source TEXT NOT NULL DEFAULT 'master', -- master | import | manual
+    extra_code TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -15,6 +18,26 @@ CREATE TABLE IF NOT EXISTS stocks (
 CREATE INDEX IF NOT EXISTS idx_stock_symbol ON stocks(stock_symbol);
 CREATE INDEX IF NOT EXISTS idx_bse_code ON stocks(bse_code);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_isin_number ON stocks(isin_number);
+CREATE INDEX IF NOT EXISTS idx_stocks_source_active ON stocks(source, is_active);
+
+-- Validated imports are stored between preview and commit so the committed
+-- rows are exactly the rows the user reviewed.
+CREATE TABLE IF NOT EXISTS stock_import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    uploaded_ts INTEGER NOT NULL,
+    rows_total INTEGER NOT NULL DEFAULT 0,
+    rows_new INTEGER NOT NULL DEFAULT 0,
+    rows_updated INTEGER NOT NULL DEFAULT 0,
+    rows_unchanged INTEGER NOT NULL DEFAULT 0,
+    rows_invalid INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'previewed',
+    payload_json TEXT NOT NULL,
+    warnings_json TEXT,
+    committed_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_stock_import_batches_status_time
+ON stock_import_batches(status, uploaded_ts);
 
 -- Watchlist Table
 CREATE TABLE IF NOT EXISTS watchlist_items (
@@ -70,6 +93,7 @@ CREATE TABLE IF NOT EXISTS smtp_settings (
     app_password TEXT NOT NULL,  -- Store encrypted in production
     smtp_server TEXT DEFAULT 'smtp.gmail.com',
     smtp_port INTEGER DEFAULT 587,
+    smtp_security TEXT NOT NULL DEFAULT 'auto',
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -135,6 +159,7 @@ CREATE TABLE IF NOT EXISTS transcript_analyses (
     llm_output TEXT,                    -- The AI generated summary/analysis
     model_provider TEXT,                -- e.g., 'gemini', 'openai' (deprecated, use model_id)
     model_id INTEGER,                   -- FK to llm_models
+    model_name TEXT,                    -- Provider-facing model identifier
     thinking_mode_used BOOLEAN DEFAULT 0,
     tokens_used_input INTEGER,
     tokens_used_output INTEGER,
@@ -147,6 +172,119 @@ CREATE TABLE IF NOT EXISTS transcript_analyses (
 -- Index for transcript lookups
 CREATE INDEX IF NOT EXISTS idx_transcripts_stock ON transcripts(stock_id);
 CREATE INDEX IF NOT EXISTS idx_analyses_transcript ON transcript_analyses(transcript_id);
+
+-- Transcript Fetch Schedule (Queue-First Scheduler)
+CREATE TABLE IF NOT EXISTS transcript_fetch_schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    quarter TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    next_check_at TIMESTAMP,
+    last_status TEXT,
+    last_checked_at TIMESTAMP,
+    last_available_at TIMESTAMP,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stock_id, quarter, year),
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_fetch_schedule_next ON transcript_fetch_schedule(next_check_at);
+CREATE INDEX IF NOT EXISTS idx_fetch_schedule_priority ON transcript_fetch_schedule(priority);
+
+-- Transcript Events (Normalized)
+CREATE TABLE IF NOT EXISTS transcript_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    quarter TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    source_url TEXT,
+    event_date TIMESTAMP,
+    observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    origin TEXT,
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_events_stock ON transcript_events(stock_id);
+CREATE INDEX IF NOT EXISTS idx_transcript_events_quarter ON transcript_events(quarter, year);
+
+-- Analysis Jobs (Queue)
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transcript_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT NOT NULL,
+    force INTEGER NOT NULL DEFAULT 0,
+    retry_next_at TIMESTAMP,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(idempotency_key),
+    FOREIGN KEY (transcript_id) REFERENCES transcripts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status ON analysis_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_retry ON analysis_jobs(retry_next_at);
+
+-- Durable Queue Messages (SQLite-backed broker)
+CREATE TABLE IF NOT EXISTS queue_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'pending',
+    locked_until TIMESTAMP,
+    worker_id TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    dedupe_key TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_queue_messages_due ON queue_messages(queue_name, available_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_messages_dedupe
+ON queue_messages(queue_name, dedupe_key)
+WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_queue_messages_claim
+ON queue_messages(queue_name, status, locked_until, available_at);
+
+-- Email Outbox (Queue)
+CREATE TABLE IF NOT EXISTS email_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    retry_next_at TIMESTAMP,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(analysis_id, recipient),
+    FOREIGN KEY (analysis_id) REFERENCES transcript_analyses(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_retry ON email_outbox(retry_next_at);
+
+-- Stock Activity Logs (user-visible operational history)
+CREATE TABLE IF NOT EXISTS stock_activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    level TEXT NOT NULL CHECK(level IN ('info', 'success', 'error')),
+    message TEXT NOT NULL,
+    quarter TEXT,
+    year INTEGER,
+    details_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_stock_activity_stock_time
+ON stock_activity_logs(stock_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_activity_level_time
+ON stock_activity_logs(level, created_at DESC);
 
 -- Group Deep Research Runs (per group, per quarter)
 CREATE TABLE IF NOT EXISTS group_research_runs (
@@ -183,6 +321,7 @@ CREATE TABLE IF NOT EXISTS llm_providers (
     provider_name TEXT UNIQUE NOT NULL, -- 'google_ai', 'openai', 'anthropic', 'openrouter'
     display_name TEXT NOT NULL, -- 'Google AI Studio', 'OpenAI', etc.
     api_key_encrypted TEXT, -- Encrypted API key
+    api_key TEXT, -- Current provider integrations use the locally stored plain-text key
     is_active BOOLEAN DEFAULT 1,
     base_url TEXT, -- For OpenRouter or custom endpoints
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

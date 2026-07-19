@@ -2,10 +2,33 @@ import { useState, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Loader2, CheckCircle2, XCircle, Mail, Settings as SettingsIcon } from 'lucide-react'
+import StockManagement from '@/components/StockManagement'
 
-type SettingsTab = 'email' | 'analysis' | 'deep_research' | 'api'
+type SettingsTab = 'email' | 'analysis' | 'deep_research' | 'api' | 'stocks'
 
-const API_URL = 'http://localhost:5001/api'
+type LlmProvider = {
+    id: number
+    provider_name: string
+    display_name: string
+    has_key: boolean
+}
+
+type LlmModel = {
+    id: number
+    provider_name: string
+    model_id: string
+    display_name: string
+    supports_thinking: boolean
+    user_max_tokens?: number | null
+    max_output_tokens: number
+    user_thinking_enabled?: boolean
+    user_thinking_budget?: number | null
+}
+
+type LlmSettings = Record<string, string | number>
+type SmtpSecurity = 'auto' | 'starttls' | 'ssl'
+
+const API_URL = 'http://127.0.0.1:5001/api'
 
 export default function Settings() {
     const [activeTab, setActiveTab] = useState<SettingsTab>('email')
@@ -15,12 +38,14 @@ export default function Settings() {
     const [appPassword, setAppPassword] = useState('')
     const [smtpServer, setSmtpServer] = useState('smtp.gmail.com')
     const [smtpPort, setSmtpPort] = useState(587)
+    const [smtpSecurity, setSmtpSecurity] = useState<SmtpSecurity>('auto')
     const [isEditing, setIsEditing] = useState(false)
     const [isSaving, setIsSaving] = useState(false)
     const [isCheckingStatus, setIsCheckingStatus] = useState(false)
     const [smtpStatus, setSmtpStatus] = useState<'success' | 'error' | null>(null)
     const [testResult, setTestResult] = useState<{ status: 'success' | 'error', message: string } | null>(null)
     const [saveResult, setSaveResult] = useState<{ status: 'success' | 'error', message: string } | null>(null)
+    const [isResettingQueue, setIsResettingQueue] = useState(false)
 
     // Email List State
     type EmailListItem = { id: number; name: string; email: string; is_active: boolean }
@@ -50,7 +75,7 @@ export default function Settings() {
         if (email && appPassword && !isEditing) {
             checkSmtpStatus()
         }
-    }, [email, appPassword, isEditing])
+    }, [email, appPassword, smtpServer, smtpPort, smtpSecurity, isEditing])
 
     // Auto-dismiss notifications after 3 seconds
     useEffect(() => {
@@ -78,6 +103,7 @@ export default function Settings() {
                     setAppPassword(activeSetting.app_password || '')
                     setSmtpServer(activeSetting.smtp_server || 'smtp.gmail.com')
                     setSmtpPort(activeSetting.smtp_port || 587)
+                    setSmtpSecurity(activeSetting.smtp_security || 'auto')
                 }
             }
         } catch (error) {
@@ -102,6 +128,7 @@ export default function Settings() {
                     app_password: appPassword,
                     smtp_server: smtpServer,
                     smtp_port: smtpPort,
+                    smtp_security: smtpSecurity,
                 }),
             })
 
@@ -110,7 +137,7 @@ export default function Settings() {
             } else {
                 setSmtpStatus('error')
             }
-        } catch (error) {
+        } catch {
             setSmtpStatus('error')
         } finally {
             setIsCheckingStatus(false)
@@ -137,6 +164,7 @@ export default function Settings() {
                     app_password: appPassword,
                     smtp_server: smtpServer,
                     smtp_port: smtpPort,
+                    smtp_security: smtpSecurity,
                     is_active: true,
                 }),
             })
@@ -150,10 +178,37 @@ export default function Settings() {
             } else {
                 setSaveResult({ status: 'error', message: data.message || 'Failed to save settings' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSaving(false)
+        }
+    }
+
+    const handleResetQueue = async () => {
+        const confirmed = window.confirm(
+            'Reset the queue engine? Pending broker messages and temporary locks will be rebuilt. Completed analyses and emails are not deleted.'
+        )
+        if (!confirmed) return
+
+        setIsResettingQueue(true)
+        setSaveResult(null)
+        try {
+            const response = await fetch(`${API_URL}/queue/reset`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ confirm: true }),
+            })
+            const data = await response.json()
+            if (!response.ok) throw new Error(data.error || 'Queue reset failed')
+            setSaveResult({ status: 'success', message: 'Queue engine reset and restarted.' })
+        } catch (requestError) {
+            setSaveResult({
+                status: 'error',
+                message: requestError instanceof Error ? requestError.message : 'Queue reset failed',
+            })
+        } finally {
+            setIsResettingQueue(false)
         }
     }
 
@@ -198,7 +253,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to add email' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         }
     }
@@ -277,7 +332,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save API key' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingKey(false)
@@ -300,7 +355,7 @@ export default function Settings() {
             } else {
                 setTestResult({ status: 'error', message: data.message || 'Connection failed. Invalid API Key.' })
             }
-        } catch (error) {
+        } catch {
             setTestResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsTestingKey(false)
@@ -341,7 +396,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to update prompt' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingDefaultPrompt(false)
@@ -349,9 +404,9 @@ export default function Settings() {
     }
 
     // LLM Settings State
-    const [llmProviders, setLlmProviders] = useState<any[]>([])
-    const [llmSettings, setLlmSettings] = useState<any>({})
-    const [llmModels, setLlmModels] = useState<any[]>([])
+    const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([])
+    const [llmSettings, setLlmSettings] = useState<LlmSettings>({})
+    const [llmModels, setLlmModels] = useState<LlmModel[]>([])
     const [isSyncing, setIsSyncing] = useState<string | null>(null)
     const [savingKeyProvider, setSavingKeyProvider] = useState<string | null>(null)
     const [providerKeys, setProviderKeys] = useState<{ [key: string]: string }>({})
@@ -429,7 +484,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save API key' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setSavingKeyProvider(null)
@@ -453,14 +508,14 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to sync models' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSyncing(null)
         }
     }
 
-    const handleSaveDefaultModel = async (modelId: string, settingKey: string = 'default_model_id') => {
+    const handleSaveDefaultModel = async (modelId: string | number, settingKey: string = 'default_model_id') => {
         setIsSavingDefaultModel(true)
         setSaveResult(null)
 
@@ -475,19 +530,19 @@ export default function Settings() {
                 const taskLabel = settingKey === 'watchlist_model_id' ? 'Analysis' :
                     settingKey === 'group_research_model_id' ? 'Deep Research' : 'Default'
                 setSaveResult({ status: 'success', message: `${taskLabel} model updated!` })
-                setLlmSettings((prev: any) => ({ ...prev, [settingKey]: modelId }))
+                setLlmSettings((prev) => ({ ...prev, [settingKey]: modelId }))
             } else {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to update model' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingDefaultModel(false)
         }
     }
 
-    const handleOpenConfig = (model: any) => {
+    const handleOpenConfig = (model: LlmModel) => {
         setConfiguringModelId(model.id)
         setConfigMaxTokens(model.user_max_tokens || model.max_output_tokens || 4096)
         setConfigThinkingEnabled(model.user_thinking_enabled || false)
@@ -518,7 +573,7 @@ export default function Settings() {
                 const data = await response.json()
                 setSaveResult({ status: 'error', message: data.error || 'Failed to save config' })
             }
-        } catch (error) {
+        } catch {
             setSaveResult({ status: 'error', message: 'Failed to connect to server' })
         } finally {
             setIsSavingConfig(false)
@@ -530,7 +585,7 @@ export default function Settings() {
             {/* Sub-navigation for Settings */}
             <div className="border-b border-border">
                 <div className="max-w-7xl mx-auto px-8">
-                    <div className="flex justify-center gap-8 pt-4">
+                    <div className="flex flex-wrap justify-center gap-x-8 gap-y-2 pt-4">
                         <button
                             onClick={() => setActiveTab('email')}
                             className={`text-lg font-semibold pb-4 border-b-2 transition-colors ${activeTab === 'email'
@@ -566,6 +621,15 @@ export default function Settings() {
                                 }`}
                         >
                             API Settings
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('stocks')}
+                            className={`text-lg font-semibold pb-4 border-b-2 transition-colors ${activeTab === 'stocks'
+                                ? 'border-primary text-foreground'
+                                : 'border-transparent text-muted-foreground hover:text-foreground'
+                                }`}
+                        >
+                            Stocks
                         </button>
                     </div>
                 </div>
@@ -674,9 +738,53 @@ export default function Settings() {
                             </Button>
                         </div>
 
+                        <div className="mt-3 grid grid-cols-1 gap-3 rounded-lg border border-border bg-card p-4 md:grid-cols-[1fr_120px_180px]">
+                            <div>
+                                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                                    SMTP server
+                                </label>
+                                <Input
+                                    value={smtpServer}
+                                    onChange={(event) => setSmtpServer(event.target.value)}
+                                    disabled={!isEditing}
+                                    placeholder="smtp.gmail.com"
+                                    className="bg-secondary/50 border-border"
+                                />
+                            </div>
+                            <div>
+                                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                                    Port
+                                </label>
+                                <Input
+                                    type="number"
+                                    min={1}
+                                    max={65535}
+                                    value={smtpPort}
+                                    onChange={(event) => setSmtpPort(Number(event.target.value))}
+                                    disabled={!isEditing}
+                                    className="bg-secondary/50 border-border"
+                                />
+                            </div>
+                            <div>
+                                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                                    Connection security
+                                </label>
+                                <select
+                                    value={smtpSecurity}
+                                    onChange={(event) => setSmtpSecurity(event.target.value as SmtpSecurity)}
+                                    disabled={!isEditing}
+                                    className="h-10 w-full rounded-md border border-border bg-secondary/50 px-3 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    <option value="auto">Auto (recommended)</option>
+                                    <option value="starttls">STARTTLS</option>
+                                    <option value="ssl">Implicit SSL/TLS</option>
+                                </select>
+                            </div>
+                        </div>
+
                         {/* Helper Text */}
                         <p className="text-xs text-muted-foreground mt-4">
-                            For Gmail, generate an app password from your Google Account settings.
+                            Port 587 normally uses STARTTLS. Port 465 normally uses implicit SSL/TLS.
                         </p>
 
                         {/* Email List Section */}
@@ -779,7 +887,7 @@ export default function Settings() {
                                 const settingKey = activeTab === 'analysis' ? 'watchlist_model_id' : 'group_research_model_id'
                                 const currentModelId = llmSettings[settingKey] || llmSettings.default_model_id
                                 // Check if any model from this provider is selected for this task
-                                const isProviderActive = providerModels.some(m => m.id == currentModelId)
+                                const isProviderActive = providerModels.some(m => m.id === Number(currentModelId))
 
                                 const handleToggleProvider = () => {
                                     if (isProviderActive) return // Already active
@@ -870,7 +978,7 @@ export default function Settings() {
                                                         </h5>
                                                     </div>
 
-                                                    {providerModels.filter(m => m.id == currentModelId).map(model => (
+                                                    {providerModels.filter(m => m.id === Number(currentModelId)).map(model => (
                                                         <div key={model.id} className="space-y-4">
                                                             <div className="grid grid-cols-2 gap-4">
                                                                 <div>
@@ -913,7 +1021,7 @@ export default function Settings() {
                                                                                 </style>
                                                                                 <Input
                                                                                     type="number"
-                                                                                    value={configuringModelId === model.id ? (configThinkingBudget === 0 ? '' : configThinkingBudget) : (model.user_thinking_budget === 0 ? '' : model.user_thinking_budget)}
+                                                                                    value={configuringModelId === model.id ? (configThinkingBudget === 0 ? '' : configThinkingBudget) : (model.user_thinking_budget === 0 ? '' : (model.user_thinking_budget ?? ''))}
                                                                                     placeholder="Auto"
                                                                                     onChange={(e) => {
                                                                                         const val = e.target.value;
@@ -1103,9 +1211,30 @@ export default function Settings() {
                                     </Button>
                                 </div>
                             </div>
+
+                            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+                                <div className="flex items-center justify-between gap-6">
+                                    <div>
+                                        <h4 className="font-medium">Advanced queue recovery</h4>
+                                        <p className="mt-1 text-sm text-muted-foreground">
+                                            Use only when pending work appears stuck. This rebuilds queue messages and locks without deleting completed results.
+                                        </p>
+                                    </div>
+                                    <Button
+                                        variant="outline"
+                                        onClick={handleResetQueue}
+                                        disabled={isResettingQueue}
+                                        className="shrink-0 border-amber-500/50 text-amber-500 hover:bg-amber-500/10"
+                                    >
+                                        {isResettingQueue && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                                        Reset queue engine
+                                    </Button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 )}
+                {activeTab === 'stocks' && <StockManagement />}
             </div>
         </div>
     )

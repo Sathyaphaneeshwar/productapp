@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Download, Sparkles, Trash2, Plus, Loader2, ArrowUp, ArrowDown, ArrowUpDown, ChevronDown } from 'lucide-react'
 
-const API_URL = 'http://localhost:5001/api'
+const API_URL = 'http://127.0.0.1:5001/api'
 
 type Stock = {
     id?: number
@@ -31,6 +31,10 @@ type Stock = {
         provider?: string
         analysis_error?: string
     } | null
+    retrying?: boolean
+    retry_attempts?: number
+    retry_next_at?: string
+    retry_scope?: 'transcript_fetch' | 'analysis' | 'email'
 }
 
 type Quarter = {
@@ -82,6 +86,45 @@ const STATUS_RANK: Record<StockStatus, number> = STATUS_RANK_ASC.reduce((acc, st
     acc[status] = index
     return acc
 }, {} as Record<StockStatus, number>)
+
+const parseApiTimestamp = (value?: string | null): Date | null => {
+    if (!value) return null
+    const raw = value.trim()
+    if (!raw) return null
+    let normalized = raw.replace(' ', 'T')
+    if (!/(Z|[+-]\d{2}:\d{2})$/i.test(normalized)) {
+        normalized = `${normalized}Z`
+    }
+    const parsed = new Date(normalized)
+    return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+const getFallbackQuarter = (): Quarter => {
+    const now = new Date()
+    const month = now.getMonth() + 1
+    const year = now.getFullYear()
+    let quarter = 'Q3'
+    let fiscalYear = year
+    if (month >= 4 && month <= 6) {
+        quarter = 'Q4'
+        fiscalYear = year
+    } else if (month >= 7 && month <= 9) {
+        quarter = 'Q1'
+        fiscalYear = year + 1
+    } else if (month >= 10 && month <= 12) {
+        quarter = 'Q2'
+        fiscalYear = year + 1
+    } else {
+        quarter = 'Q3'
+        fiscalYear = year
+    }
+    const monthRange = { Q1: 'Apr-Jun', Q2: 'Jul-Sep', Q3: 'Oct-Dec', Q4: 'Jan-Mar' }[quarter]
+    return {
+        quarter,
+        year: fiscalYear,
+        label: `${quarter} FY${String(fiscalYear).slice(-2)} (${monthRange})`
+    }
+}
 
 export default function Watchlist() {
     const [stocks, setStocks] = useState<Stock[]>([])
@@ -150,8 +193,8 @@ export default function Watchlist() {
     }
 
     const refreshWatchlist = async (quarterOverride?: string, yearOverride?: number) => {
-        const quarter = quarterOverride ?? selectedQuarterRef.current?.quarter
-        const year = yearOverride ?? selectedQuarterRef.current?.year
+        const quarter = quarterOverride ?? selectedQuarterRef.current?.quarter ?? quarters[0]?.quarter
+        const year = yearOverride ?? selectedQuarterRef.current?.year ?? quarters[0]?.year
 
         watchlistAbortRef.current?.abort()
         const controller = new AbortController()
@@ -180,21 +223,49 @@ export default function Watchlist() {
 
     // Fetch quarters on mount
     useEffect(() => {
-        const fetchQuarters = async () => {
+        let cancelled = false
+        let retryTimer: number | null = null
+
+        const applyFallbackQuarter = () => {
+            if (cancelled) return
+            const fallbackQuarter = getFallbackQuarter()
+            setQuarters(prev => (prev.length > 0 ? prev : [fallbackQuarter]))
+            setSelectedQuarter(prev => prev ?? fallbackQuarter)
+        }
+
+        const fetchQuarters = async (attempt = 0) => {
             try {
                 const response = await fetch(`${API_URL}/quarters`)
-                if (response.ok) {
-                    const data = await response.json()
-                    setQuarters(data)
-                    if (data.length > 0) {
-                        setSelectedQuarter(data[0]) // Default to first (previous quarter)
-                    }
+                if (!response.ok) {
+                    throw new Error(`Quarter API failed with status ${response.status}`)
                 }
+                const data = await response.json()
+                if (!Array.isArray(data) || data.length === 0) {
+                    throw new Error('Quarter API returned no data')
+                }
+                if (cancelled) return
+                setQuarters(data)
+                setSelectedQuarter(prev => prev ?? data[0]) // Default to first (previous quarter)
             } catch (error) {
                 console.error('Error fetching quarters:', error)
+                if (attempt < 5) {
+                    retryTimer = window.setTimeout(() => {
+                        void fetchQuarters(attempt + 1)
+                    }, 1500)
+                } else {
+                    applyFallbackQuarter()
+                }
             }
         }
-        fetchQuarters()
+
+        void fetchQuarters()
+
+        return () => {
+            cancelled = true
+            if (retryTimer) {
+                clearTimeout(retryTimer)
+            }
+        }
     }, [])
 
     // Fetch watchlist when quarter changes
@@ -222,17 +293,19 @@ export default function Watchlist() {
                 const response = await fetch(`${API_URL}/poll/status`)
                 if (!response.ok) return
                 const data = await response.json()
-                const isPolling = Boolean(data?.is_polling)
+                const isPolling = Boolean(
+                    data?.is_polling ?? ((data?.queues?.transcript_check ?? 0) > 0)
+                )
                 if (isPolling && !pollingActiveRef.current) {
                     refreshWatchlist()
                 }
                 pollingActiveRef.current = isPolling
-            } catch (error) {
+            } catch {
                 // Ignore poll status errors to avoid breaking watchlist updates
             }
-        }, 1000)
+        }, 2000)
         return () => clearInterval(interval)
-    }, [selectedQuarter])
+    }, [])
 
     // Search stocks when query changes
     useEffect(() => {
@@ -282,13 +355,18 @@ export default function Watchlist() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ symbol: stock.symbol }),
+                body: JSON.stringify({
+                    stock_id: stock.id,
+                    symbol: stock.symbol,
+                }),
             })
 
             if (response.ok) {
                 // Optimistically show fetching state while backend polls/analyzes
                 setStocks(prev => {
-                    const exists = prev.some(s => s.symbol === stock.symbol)
+                    const exists = prev.some(s =>
+                        stock.id ? s.id === stock.id : s.symbol === stock.symbol
+                    )
                     if (exists) return prev
                     return [
                         ...prev,
@@ -312,14 +390,19 @@ export default function Watchlist() {
         }
     }
 
-    const handleDeleteStock = async (symbol: string) => {
+    const handleDeleteStock = async (stock: Stock) => {
         try {
-            const response = await fetch(`${API_URL}/watchlist/${symbol}`, {
+            const endpoint = stock.id
+                ? `${API_URL}/watchlist/id/${stock.id}`
+                : `${API_URL}/watchlist/${encodeURIComponent(stock.symbol)}`
+            const response = await fetch(endpoint, {
                 method: 'DELETE',
             })
 
             if (response.ok) {
-                setStocks(stocks.filter(stock => stock.symbol !== symbol))
+                setStocks(current => current.filter(item =>
+                    stock.id ? item.id !== stock.id : item.symbol !== stock.symbol
+                ))
             }
         } catch (error) {
             console.error('Error deleting stock:', error)
@@ -330,10 +413,12 @@ export default function Watchlist() {
         if (!stock.id) return
         setReanalyzingId(stock.id)
 
+        const activeQuarter = selectedQuarterRef.current ?? selectedQuarter ?? quarters[0] ?? null
+
         // Get the current analyzed_at timestamp before triggering reanalysis
         const previousAnalyzedAt = stock.status_details?.analyzed_at
-        reanalyzeContextRef.current = selectedQuarter
-            ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year }
+        reanalyzeContextRef.current = activeQuarter
+            ? { quarter: activeQuarter.quarter, year: activeQuarter.year }
             : null
 
         // Optimistically update status to 'analyzing'
@@ -346,7 +431,7 @@ export default function Watchlist() {
         try {
             const payload = {
                 force: true,
-                ...(selectedQuarter ? { quarter: selectedQuarter.quarter, year: selectedQuarter.year } : {})
+                ...(activeQuarter ? { quarter: activeQuarter.quarter, year: activeQuarter.year } : {})
             }
 
             const response = await fetch(`${API_URL}/analyze/${stock.id}`, {
@@ -357,7 +442,17 @@ export default function Watchlist() {
                 body: JSON.stringify(payload),
             })
             if (!response.ok) {
-                console.error('Failed to start analysis', await response.text())
+                let errorMessage = 'Failed to start analysis'
+                try {
+                    const errorPayload = await response.json()
+                    if (errorPayload?.error) {
+                        errorMessage = errorPayload.error
+                    }
+                } catch {
+                    // Ignore JSON parsing errors and use default message.
+                }
+                console.error('Failed to start analysis', errorMessage)
+                alert(errorMessage)
                 // Revert status on error
                 refreshWatchlist()
             } else {
@@ -452,7 +547,7 @@ export default function Watchlist() {
 
             const blob = await response.blob()
             const disposition = response.headers.get('Content-Disposition') || ''
-            const match = disposition.match(/filename=\"?([^\";]+)\"?/i)
+            const match = disposition.match(/filename="?([^";]+)"?/i)
             const fallbackName = `${(stock.symbol || 'analysis')}-${stock.status_details?.quarter || 'latest'}-${stock.status_details?.year || ''}-analysis`.replace(/[^a-zA-Z0-9._-]+/g, '_')
             const fileName = match && match[1] ? match[1] : `${fallbackName}.pdf`
 
@@ -488,15 +583,16 @@ export default function Watchlist() {
                         📄 Transcript Ready
                     </Badge>
                 )
-            case 'upcoming':
+            case 'upcoming': {
+                const upcomingDate = parseApiTimestamp(status_details?.event_date)
                 return (
                     <div className="flex flex-col gap-1">
                         <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/50 hover:bg-blue-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(59,130,246,0.5)] transition-all duration-200 cursor-pointer">
                             📅 Upcoming
                         </Badge>
-                        {status_details?.event_date && (
+                        {upcomingDate && (
                             <span className="text-xs text-muted-foreground">
-                                {new Date(status_details.event_date).toLocaleDateString('en-IN', {
+                                {upcomingDate.toLocaleDateString('en-IN', {
                                     month: 'short',
                                     day: 'numeric',
                                     hour: '2-digit',
@@ -506,6 +602,7 @@ export default function Watchlist() {
                         )}
                     </div>
                 )
+            }
             case 'no_transcript':
                 return (
                     <Badge className="bg-gray-500/20 text-gray-400 border-gray-500/50 hover:bg-gray-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(156,163,175,0.5)] transition-all duration-200 cursor-pointer">
@@ -534,6 +631,19 @@ export default function Watchlist() {
                 )
             default:
                 return <Badge variant="outline" className="text-muted-foreground">Unknown</Badge>
+        }
+    }
+
+    const getRetryLabel = (stock: Stock) => {
+        switch (stock.retry_scope) {
+            case 'transcript_fetch':
+                return 'Retrying transcript fetch...'
+            case 'analysis':
+                return 'Retrying analysis...'
+            case 'email':
+                return 'Retrying email delivery...'
+            default:
+                return 'Retrying...'
         }
     }
 
@@ -596,7 +706,7 @@ export default function Watchlist() {
                                 ) : (
                                     searchResults.map((stock) => (
                                         <div
-                                            key={stock.symbol}
+                                            key={stock.id ?? stock.symbol}
                                             className="flex items-center justify-between p-3 hover:bg-accent transition-colors cursor-pointer group"
                                             onClick={() => addToWatchlist(stock)}
                                         >
@@ -758,7 +868,16 @@ export default function Watchlist() {
                                         >
                                             <TableCell className="font-medium text-foreground">{stock.symbol}</TableCell>
                                             <TableCell className="text-foreground">{stock.name}</TableCell>
-                                            <TableCell>{getStatusBadge(stock)}</TableCell>
+                                            <TableCell>
+                                                <div className="flex flex-col gap-1">
+                                                    {getStatusBadge(stock)}
+                                                    {stock.retrying && (
+                                                        <span className="text-xs text-amber-400">
+                                                            {getRetryLabel(stock)}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </TableCell>
                                             <TableCell className="text-right">
                                                 <div className="flex items-center justify-end gap-2">
                                                     <Button
@@ -789,7 +908,7 @@ export default function Watchlist() {
                                                     <Button
                                                         size="icon"
                                                         variant="ghost"
-                                                        onClick={() => handleDeleteStock(stock.symbol)}
+                                                        onClick={() => handleDeleteStock(stock)}
                                                         className="rounded-full h-9 w-9 hover:bg-red-500/20 hover:text-red-400 hover:scale-110 transition-all duration-200"
                                                     >
                                                         <Trash2 className="h-4 w-4" />

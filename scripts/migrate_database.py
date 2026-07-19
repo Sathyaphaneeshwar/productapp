@@ -12,7 +12,7 @@ Usage:
 import sqlite3
 import os
 import sys
-import shutil
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -51,38 +51,38 @@ def create_backup(db_path: Path) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = BACKUP_DIR / f"stocks_backup_{timestamp}.db"
-    shutil.copy2(db_path, backup_path)
+    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+    destination = sqlite3.connect(backup_path, timeout=30)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
     return backup_path
 
 
 def parse_schema_tables(schema_sql: str) -> dict:
     """Parse CREATE TABLE statements from schema.sql."""
     tables = {}
-    lines = schema_sql.split('\n')
+    lines = schema_sql.splitlines()
     current_table = None
     current_columns = []
     in_table = False
     
     for line in lines:
-        line = line.strip()
+        # Inline comments are documentation, not part of an ALTER definition.
+        line = line.split('--', 1)[0].strip()
+        if not line:
+            continue
         
         # Detect CREATE TABLE
-        if line.upper().startswith('CREATE TABLE'):
-            # Extract table name
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if part.upper() in ('TABLE', 'EXISTS'):
-                    continue
-                if part.upper() == 'IF':
-                    continue
-                if part.upper() == 'NOT':
-                    continue
-                if '(' in part:
-                    current_table = part.split('(')[0]
-                    break
-                elif i > 0 and parts[i-1].upper() == 'EXISTS':
-                    current_table = part.rstrip('(')
-                    break
+        match = re.match(
+            r'^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([^\s(]+)',
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            current_table = match.group(1).strip('"`[]')
             in_table = True
             current_columns = []
             
@@ -94,7 +94,7 @@ def parse_schema_tables(schema_sql: str) -> dict:
                 in_table = False
             elif line and not line.startswith('--'):
                 # Extract column name (first word before space or type)
-                col_line = line.rstrip(',')
+                col_line = line.rstrip(',').strip()
                 if not any(col_line.upper().startswith(kw) for kw in 
                           ['PRIMARY', 'FOREIGN', 'UNIQUE', 'CHECK', 'CONSTRAINT']):
                     parts = col_line.split()
@@ -165,23 +165,9 @@ def migrate_database():
         print("Step 3: Applying migrations...")
         changes_made = 0
         
-        # Run the schema SQL - CREATE IF NOT EXISTS handles new tables
-        # Split by statement to handle errors gracefully
-        statements = schema_sql.split(';')
-        for stmt in statements:
-            stmt = stmt.strip()
-            if not stmt or stmt.startswith('--'):
-                continue
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError as e:
-                # Ignore "already exists" errors, they're expected
-                if 'already exists' not in str(e).lower():
-                    # Check if it's a column addition error
-                    if 'duplicate column' not in str(e).lower():
-                        print(f"  Note: {e}")
-        
-        # Check for missing columns in existing tables
+        # Add missing columns before executing the schema. New indexes can
+        # reference those columns, and CREATE TABLE IF NOT EXISTS does not
+        # alter an existing table.
         for table_name, columns in schema_tables.items():
             if table_name in existing_tables:
                 existing_cols = get_existing_columns(conn, table_name)
@@ -189,13 +175,29 @@ def migrate_database():
                     if col['name'] not in existing_cols:
                         # Add missing column
                         try:
-                            alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {col['definition']}"
+                            alter_definition = re.sub(
+                                r"\s+DEFAULT\s+CURRENT_TIMESTAMP\b",
+                                "",
+                                col["definition"],
+                                flags=re.IGNORECASE,
+                            )
+                            alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {alter_definition}"
                             conn.execute(alter_sql)
+                            if alter_definition != col["definition"]:
+                                conn.execute(
+                                    f"UPDATE {table_name} "
+                                    f"SET {col['name']} = CURRENT_TIMESTAMP "
+                                    f"WHERE {col['name']} IS NULL"
+                                )
                             print(f"  ✓ Added column '{col['name']}' to table '{table_name}'")
                             changes_made += 1
                         except sqlite3.OperationalError as e:
                             if 'duplicate column' not in str(e).lower():
                                 print(f"  Note: Could not add {col['name']}: {e}")
+
+        # Execute the valid schema as a script so multi-statement triggers are
+        # never split at their internal semicolons.
+        conn.executescript(schema_sql)
         
         conn.commit()
         

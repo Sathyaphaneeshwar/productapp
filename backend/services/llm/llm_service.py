@@ -32,7 +32,8 @@ class LLMService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT api_key FROM llm_providers 
+            SELECT COALESCE(NULLIF(api_key, ''), NULLIF(api_key_encrypted, '')) AS api_key
+            FROM llm_providers
             WHERE provider_name = ? AND is_active = 1
         """, (provider_name,))
         
@@ -161,6 +162,7 @@ class LLMService:
             thinking_budget=effective_thinking_budget,
             max_tokens=effective_max_tokens
         )
+        response.database_model_id = model_id
         
         # Update cost with database pricing
         response.cost_usd = (
@@ -271,17 +273,23 @@ class LLMService:
     
     def set_api_key(self, provider_name: str, api_key: str) -> bool:
         """Set API key for a provider (plain text)."""
+        api_key = (api_key or "").strip()
+        if not api_key:
+            raise ValueError("API key is required")
+
         conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE llm_providers 
-            SET api_key = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE provider_name = ?
-        """, (api_key, provider_name))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE llm_providers
+                SET api_key = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE provider_name = ?
+            """, (api_key, provider_name))
+            if cursor.rowcount == 0:
+                raise ValueError(f"Unknown LLM provider: {provider_name}")
+            conn.commit()
+        finally:
+            conn.close()
         
         # Clear cache
         if provider_name in self._provider_cache:

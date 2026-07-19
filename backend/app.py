@@ -3,6 +3,12 @@ from flask_cors import CORS
 import sqlite3
 import os
 import sys
+import time
+import signal
+import threading
+import hmac
+import hashlib
+from datetime import datetime, timezone
 import smtplib
 import html
 import markdown
@@ -12,47 +18,383 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from config import DATABASE_PATH
 from db import get_db_connection as _get_db_connection
-from services.scheduler_service import SchedulerService
+from services.queue_scheduler_service import QueueSchedulerService
+from services.transcript_fetcher_worker import TranscriptFetcherWorker
+from services.analysis_queue_worker import AnalysisQueueWorker
+from services.email_queue_worker import EmailQueueWorker
+from services.analysis_job_service import AnalysisJobService
+from services.recovery_service import RecoveryService
 from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
+from services.stock_activity_service import StockActivityService
+from services.stock_import_service import StockImportError, StockImportService
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize and start the background scheduler
-scheduler = SchedulerService(poll_interval_seconds=300)  # Poll every 5 minutes
-if getattr(sys, "frozen", False):
-    # Packaged app: always start the scheduler
-    scheduler.start()
-elif not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-    # Dev server: start only in the reloader child or non-debug mode
-    scheduler.start()
+# Queue-first runtime (single scheduler/worker model)
+queue_scheduler = QueueSchedulerService()
+fetcher_worker = TranscriptFetcherWorker()
+analysis_queue_worker = AnalysisQueueWorker()
+email_queue_worker = EmailQueueWorker()
+analysis_job_service = AnalysisJobService()
+recovery_service = RecoveryService()
 prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
+stock_activity_service = StockActivityService()
+_runtime_stop_lock = threading.Lock()
+_shutdown_started = threading.Event()
 
 DB_PATH = str(DATABASE_PATH)
+
+
+def _should_start_background_workers() -> bool:
+    if os.environ.get("PRODUCT_GEMINI_DISABLE_WORKERS") == "1":
+        return False
+    if getattr(sys, "frozen", False):
+        return True
+    return not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+
+
+def _run_startup_recovery():
+    stale_minutes = os.environ.get("ANALYSIS_STALE_MINUTES", "5")
+    stale_group_minutes = os.environ.get("GROUP_RESEARCH_STALE_MINUTES", "180")
+    summary = recovery_service.run_startup_recovery(
+        analysis_job_service=analysis_job_service,
+        stale_minutes=stale_minutes,
+        stale_group_minutes=stale_group_minutes,
+    )
+    if any(summary.values()):
+        print(f"[Recovery] Startup recovery summary: {summary}")
+    try:
+        pruned = StockImportService(DB_PATH).prune_stale_previews()
+        if pruned:
+            print(f"[Recovery] Pruned {pruned} stale stock import preview(s)")
+    except Exception as error:
+        print(f"[Recovery] Stock import preview cleanup failed: {error}")
+
+
+def _stop_background_runtime(timeout_seconds: float = 5.0):
+    """Stop queue threads together and checkpoint SQLite within one deadline."""
+    with _runtime_stop_lock:
+        services = (
+            queue_scheduler,
+            fetcher_worker,
+            analysis_queue_worker,
+            email_queue_worker,
+        )
+        for service in services:
+            service.running = False
+            queue = getattr(service, "queue", None)
+            if queue:
+                for queue_name in ("transcript_check", "analysis", "email"):
+                    queue.notify(queue_name)
+
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        for service in services:
+            thread = getattr(service, "thread", None)
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=max(0, deadline - time.monotonic()))
+
+        try:
+            conn = get_db_connection()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.close()
+        except Exception as error:
+            print(f"[Shutdown] WAL checkpoint failed: {error}")
+
+
+def _exit_after_graceful_shutdown():
+    time.sleep(0.1)
+    _stop_background_runtime(timeout_seconds=5)
+    os._exit(0)
+
+
+def _is_control_request_authorized() -> bool:
+    expected = os.environ.get("PRODUCT_GEMINI_CONTROL_TOKEN")
+    if not expected:
+        return True
+    provided = request.headers.get("X-Product-Gemini-Control", "")
+    return hmac.compare_digest(provided, expected)
+
+
+if _should_start_background_workers():
+    try:
+        _run_startup_recovery()
+        queue_scheduler.start()
+        fetcher_worker.start()
+        analysis_queue_worker.start()
+        email_queue_worker.start()
+    except Exception as e:
+        print(f"[Scheduler] Queue runtime initialization failed: {e}")
+
 
 def get_db_connection():
     return _get_db_connection(DB_PATH)
 
+
+def _to_utc_iso(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        normalized = raw.replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _is_db_locked_error(error: Exception) -> bool:
+    return isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower()
+
+
+def _trigger_stock_fetch_with_retry(
+    stock_id: int,
+    *,
+    quarter: str = None,
+    year: int = None,
+    max_attempts: int = 5,
+):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            queue_scheduler.trigger_for_stock(stock_id, quarter=quarter, year=year)
+            return
+        except Exception as e:
+            if _is_db_locked_error(e) and attempt < max_attempts:
+                time.sleep(0.15 * attempt)
+                continue
+            raise
+
+
+@app.route('/api/system/health', methods=['GET'])
+def get_system_health():
+    """Identify the packaged backend so Electron never reuses a stale process."""
+    control_token = os.environ.get('PRODUCT_GEMINI_CONTROL_TOKEN', '')
+    return jsonify({
+        'status': 'ok',
+        'service': 'product-gemini-backend',
+        'api_version': 2,
+        'app_version': os.environ.get('PRODUCT_GEMINI_APP_VERSION'),
+        'pid': os.getpid(),
+        'control_session_id': (
+            hashlib.sha256(control_token.encode('utf-8')).hexdigest()
+            if control_token
+            else None
+        ),
+    })
+
+
+@app.route('/api/system/shutdown', methods=['POST'])
+def shutdown_system():
+    """Allow Electron to stop workers before taskkill/SIGKILL fallback."""
+    if not _is_control_request_authorized():
+        return jsonify({'error': 'Unauthorized control request'}), 403
+    if not _shutdown_started.is_set():
+        _shutdown_started.set()
+        threading.Thread(
+            target=_exit_after_graceful_shutdown,
+            name="graceful-shutdown",
+            daemon=True,
+        ).start()
+    return jsonify({'status': 'shutting_down'}), 202
+
+
+@app.route('/api/system/resumed', methods=['POST'])
+def resume_system():
+    """Catch up promptly after laptop sleep without resetting in-flight jobs."""
+    if not _is_control_request_authorized():
+        return jsonify({'error': 'Unauthorized control request'}), 403
+    try:
+        result = queue_scheduler.trigger_now(fresh=False)
+        return jsonify({'status': 'resumed', **result}), 202
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+
+
 @app.route('/api/poll/status', methods=['GET'])
 def get_poll_status():
     try:
-        return jsonify(scheduler.get_poll_status())
+        status = queue_scheduler.get_status()
+        status["workers"].update({
+            "transcript": bool(fetcher_worker.thread and fetcher_worker.thread.is_alive()),
+            "analysis": bool(
+                analysis_queue_worker.thread and analysis_queue_worker.thread.is_alive()
+            ),
+            "email": bool(email_queue_worker.thread and email_queue_worker.thread.is_alive()),
+        })
+        return jsonify(status)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/queue/health', methods=['GET'])
+def get_queue_health():
+    return get_poll_status()
+
 
 @app.route('/api/poll/trigger', methods=['POST'])
 def trigger_poll():
     try:
-        started = scheduler.trigger_poll()
-        if started:
-            return jsonify({'message': 'Poll started', 'started': True}), 202
-        return jsonify({'message': 'Poll already running', 'started': False}), 200
+        result = queue_scheduler.trigger_now(fresh=False)
+        return jsonify({
+            'message': 'Due checks and queued work were started without resetting the queue',
+            'started': True,
+            **result
+        }), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/queue/reset', methods=['POST'])
+def reset_queue():
+    data = request.get_json(silent=True) or {}
+    if data.get("confirm") is not True:
+        return jsonify({
+            'error': 'Queue reset requires confirm=true',
+        }), 400
+    try:
+        result = queue_scheduler.trigger_now(fresh=True)
+        return jsonify({
+            'message': 'Queue engine reset completed',
+            **result,
+        }), 202
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+
+
+@app.route('/api/queue/retry-failed', methods=['POST'])
+def retry_failed_queue_jobs():
+    data = request.get_json(silent=True) or {}
+    queue_type = str(data.get("queue") or "all").strip().lower()
+    if queue_type not in {"all", "transcript", "analysis", "email"}:
+        return jsonify({'error': 'queue must be all, transcript, analysis, or email'}), 400
+
+    conn = get_db_connection()
+    summary = {"transcript": 0, "analysis": 0, "email": 0}
+    try:
+        if queue_type in {"all", "transcript"}:
+            summary["transcript"] = conn.execute(
+                """
+                UPDATE transcript_fetch_schedule
+                SET last_status = 'error',
+                    attempts = 0,
+                    next_check_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE last_status = 'failed'
+                """
+            ).rowcount
+        if queue_type in {"all", "analysis"}:
+            summary["analysis"] = conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'retrying',
+                    attempts = 0,
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('failed', 'error')
+                """
+            ).rowcount
+        if queue_type in {"all", "email"}:
+            summary["email"] = conn.execute(
+                """
+                UPDATE email_outbox
+                SET status = 'retrying',
+                    attempts = 0,
+                    retry_next_at = CURRENT_TIMESTAMP,
+                    locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'failed'
+                """
+            ).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    trigger_result = queue_scheduler.trigger_now(fresh=False)
+    return jsonify({
+        'message': 'Failed jobs queued for retry',
+        'retried': summary,
+        'quarter': trigger_result["quarter"],
+        'year': trigger_result["year"],
+    }), 202
+
+@app.route('/api/scheduler/status', methods=['GET'])
+def get_scheduler_status():
+    try:
+        return jsonify(queue_scheduler.get_status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/scheduler/trigger', methods=['POST'])
+def trigger_scheduler():
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
+    quarter = data.get('quarter')
+    year = data.get('year')
+    if stock_id is None:
+        return jsonify({'error': 'stock_id is required'}), 400
+    try:
+        queue_scheduler.trigger_for_stock(int(stock_id), quarter=quarter, year=year)
+        return jsonify({'message': 'Stock queued for transcript check'}), 202
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/activity', methods=['GET'])
+def get_stock_activity():
+    stock_id = request.args.get('stock_id', type=int)
+    level = request.args.get('level')
+    limit = request.args.get('limit', default=200, type=int)
+
+    try:
+        if stock_id is not None:
+            conn = get_db_connection()
+            try:
+                stock = conn.execute(
+                    """
+                    SELECT id,
+                           COALESCE(stock_symbol, bse_code, isin_number) AS symbol,
+                           stock_name AS name
+                    FROM stocks
+                    WHERE id = ?
+                    """,
+                    (stock_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if not stock:
+                return jsonify({'error': 'Stock not found'}), 404
+
+        events = stock_activity_service.get_activity(
+            stock_id=stock_id,
+            level=level,
+            limit=limit or 200,
+        )
+        return jsonify({
+            'events': events,
+            'count': len(events),
+            'stock_id': stock_id,
+        })
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
 
 def get_current_fy_quarter():
     """
@@ -128,25 +470,38 @@ def search_stocks():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Search by NSE symbol, BSE code, or name, limit to 10 results
-    # Use COALESCE to return NSE symbol if available, otherwise BSE code
+    # ISIN-only user stocks remain searchable and usable.
     search_term = f"%{query}%"
     cursor.execute("""
-        SELECT id, COALESCE(stock_symbol, bse_code) as symbol, stock_name as name 
-        FROM stocks 
-        WHERE stock_symbol LIKE ? OR bse_code LIKE ? OR stock_name LIKE ? 
+        SELECT id,
+               COALESCE(stock_symbol, bse_code, isin_number) as symbol,
+               isin_number AS isin,
+               stock_name as name,
+               source
+        FROM stocks
+        WHERE is_active = 1
+          AND (
+              stock_symbol LIKE ? OR bse_code LIKE ?
+              OR isin_number LIKE ? OR stock_name LIKE ?
+          )
         ORDER BY 
             CASE 
                 WHEN stock_symbol = ? THEN 1 
                 WHEN bse_code = ? THEN 2
-                WHEN stock_symbol LIKE ? THEN 3 
-                WHEN bse_code LIKE ? THEN 4
-                WHEN stock_name LIKE ? THEN 5 
-                ELSE 6 
+                WHEN isin_number = ? THEN 3
+                WHEN stock_symbol LIKE ? THEN 4
+                WHEN bse_code LIKE ? THEN 5
+                WHEN isin_number LIKE ? THEN 6
+                WHEN stock_name LIKE ? THEN 7
+                ELSE 8
             END,
-            COALESCE(stock_symbol, bse_code) ASC
+            COALESCE(stock_symbol, bse_code, isin_number) ASC
         LIMIT 10
-    """, (search_term, search_term, search_term, query, query, f"{query}%", f"{query}%", f"{query}%"))
+    """, (
+        search_term, search_term, search_term, search_term,
+        query, query, query,
+        f"{query}%", f"{query}%", f"{query}%", f"{query}%"
+    ))
     
     stocks = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -156,6 +511,240 @@ def search_stocks():
         stock['status'] = 'not-ready'
         
     return jsonify(stocks)
+
+
+def _stock_import_error_response(error: StockImportError):
+    payload = {"error": str(error)}
+    payload.update(error.details)
+    return jsonify(payload), error.status_code
+
+
+@app.route('/api/stocks/template.csv', methods=['GET'])
+def download_stock_template():
+    return Response(
+        "ISIN,CompanyName\r\nINE009A01021,Infosys Limited\r\n",
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="stock_import_template.csv"'
+        },
+    )
+
+
+@app.route('/api/stocks/import/preview', methods=['POST'])
+def preview_stock_import():
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify({"error": "Choose a CSV, TSV, or XLSX file."}), 400
+    if request.content_length and request.content_length > 5 * 1024 * 1024 + 64 * 1024:
+        return jsonify({"error": "The upload exceeds the 5 MB limit."}), 413
+    try:
+        content = upload.stream.read(5 * 1024 * 1024 + 1)
+        result = StockImportService(DB_PATH).preview(upload.filename, content)
+        return jsonify(result)
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except Exception as error:
+        return jsonify({"error": f"Could not preview stock import: {error}"}), 500
+
+
+@app.route('/api/stocks/import/commit', methods=['POST'])
+def commit_stock_import():
+    data = request.get_json(silent=True) or {}
+    batch_id = data.get("batch_id")
+    if batch_id is None:
+        return jsonify({"error": "batch_id is required."}), 400
+    try:
+        result = StockImportService(DB_PATH).commit_batch(int(batch_id))
+        return jsonify({"message": "Stock import completed.", **result})
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except (TypeError, ValueError):
+        return jsonify({"error": "batch_id must be an integer."}), 400
+    except Exception as error:
+        return jsonify({"error": f"Could not commit stock import: {error}"}), 500
+
+
+@app.route('/api/stocks/manual', methods=['POST'])
+def add_stock_manually():
+    data = request.get_json(silent=True) or {}
+    try:
+        stock = StockImportService(DB_PATH).create_manual(
+            data.get("isin") or data.get("ISIN"),
+            data.get("company_name") or data.get("CompanyName"),
+        )
+        return jsonify({"message": "Stock added.", "stock": stock}), 201
+    except StockImportError as error:
+        return _stock_import_error_response(error)
+    except Exception as error:
+        return jsonify({"error": f"Could not add stock: {error}"}), 500
+
+
+@app.route('/api/stocks/admin', methods=['GET'])
+def list_admin_stocks():
+    query = (request.args.get("q") or "").strip()
+    source = (request.args.get("source") or "user").strip().lower()
+    page = max(request.args.get("page", default=1, type=int) or 1, 1)
+    per_page = min(
+        max(request.args.get("per_page", default=50, type=int) or 50, 1),
+        100,
+    )
+    filters = []
+    params = []
+    if query:
+        filters.append(
+            "(isin_number LIKE ? OR stock_name LIKE ? "
+            "OR stock_symbol LIKE ? OR bse_code LIKE ?)"
+        )
+        search_term = f"%{query}%"
+        params.extend([search_term] * 4)
+    if source == "user":
+        filters.append("source IN ('import', 'manual')")
+    elif source in {"master", "import", "manual"}:
+        filters.append("source = ?")
+        params.append(source)
+
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    connection = get_db_connection()
+    try:
+        total = connection.execute(
+            f"SELECT COUNT(*) FROM stocks {where_clause}",
+            params,
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""
+            SELECT s.id,
+                   COALESCE(s.stock_symbol, s.bse_code, s.isin_number) AS symbol,
+                   s.stock_symbol,
+                   s.bse_code,
+                   s.isin_number AS isin,
+                   s.stock_name AS company_name,
+                   s.source,
+                   s.is_active,
+                   EXISTS(
+                       SELECT 1 FROM watchlist_items w WHERE w.stock_id = s.id
+                   ) AS in_watchlist,
+                   (
+                       SELECT COUNT(*) FROM group_stocks gs WHERE gs.stock_id = s.id
+                   ) AS group_count
+            FROM stocks s
+            {where_clause}
+            ORDER BY datetime(s.updated_at) DESC, s.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, per_page, (page - 1) * per_page),
+        ).fetchall()
+        return jsonify(
+            {
+                "stocks": [
+                    {
+                        **dict(row),
+                        "is_active": bool(row["is_active"]),
+                        "in_watchlist": bool(row["in_watchlist"]),
+                    }
+                    for row in rows
+                ],
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "pages": (total + per_page - 1) // per_page,
+            }
+        )
+    finally:
+        connection.close()
+
+
+@app.route('/api/stocks/<int:stock_id>', methods=['PUT'])
+def update_managed_stock(stock_id):
+    data = request.get_json(silent=True) or {}
+    if "isin" in data or "ISIN" in data:
+        return jsonify({"error": "A stock's ISIN cannot be changed."}), 400
+    updates = []
+    params = []
+    if "company_name" in data or "CompanyName" in data:
+        company_name = " ".join(
+            str(data.get("company_name") or data.get("CompanyName") or "").split()
+        )
+        if not company_name:
+            return jsonify({"error": "CompanyName is required."}), 400
+        updates.append("stock_name = ?")
+        params.append(company_name)
+    if "is_active" in data:
+        updates.append("is_active = ?")
+        params.append(1 if bool(data["is_active"]) else 0)
+    if not updates:
+        return jsonify({"error": "No editable fields were supplied."}), 400
+
+    connection = get_db_connection()
+    try:
+        stock = connection.execute(
+            "SELECT id FROM stocks WHERE id = ?",
+            (stock_id,),
+        ).fetchone()
+        if not stock:
+            return jsonify({"error": "Stock not found."}), 404
+        params.append(stock_id)
+        connection.execute(
+            f"""
+            UPDATE stocks
+            SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            params,
+        )
+        connection.commit()
+        return jsonify({"message": "Stock updated."})
+    finally:
+        connection.close()
+
+
+@app.route('/api/stocks/<int:stock_id>', methods=['DELETE'])
+def delete_managed_stock(stock_id):
+    connection = get_db_connection()
+    try:
+        stock = connection.execute(
+            """
+            SELECT id, source,
+                   (SELECT COUNT(*) FROM watchlist_items WHERE stock_id = stocks.id)
+                       AS watchlists,
+                   (SELECT COUNT(*) FROM group_stocks WHERE stock_id = stocks.id)
+                       AS groups,
+                   (
+                       (SELECT COUNT(*) FROM transcripts WHERE stock_id = stocks.id)
+                       + (SELECT COUNT(*) FROM transcript_fetch_schedule
+                          WHERE stock_id = stocks.id)
+                       + (SELECT COUNT(*) FROM stock_activity_logs
+                          WHERE stock_id = stocks.id
+                            AND stage != 'stock_import')
+                   ) AS history
+            FROM stocks
+            WHERE id = ?
+            """,
+            (stock_id,),
+        ).fetchone()
+        if not stock:
+            return jsonify({"error": "Stock not found."}), 404
+        if stock["watchlists"] or stock["groups"] or stock["history"]:
+            return jsonify(
+                {
+                    "error": "Stock is in use or has activity history. Deactivate it instead.",
+                    "reason": "in_use",
+                    "watchlists": stock["watchlists"],
+                    "groups": stock["groups"],
+                    "history": stock["history"],
+                }
+            ), 409
+        if stock["source"] == "master":
+            return jsonify(
+                {
+                    "error": "Bundled master stocks cannot be deleted. Deactivate it instead.",
+                    "reason": "master",
+                }
+            ), 409
+        connection.execute("DELETE FROM stocks WHERE id = ?", (stock_id,))
+        connection.commit()
+        return jsonify({"message": "Stock deleted."})
+    finally:
+        connection.close()
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():
@@ -172,7 +761,7 @@ def get_watchlist():
     cursor.execute("""
         SELECT 
             s.id,
-            COALESCE(s.stock_symbol, s.bse_code) as symbol, 
+            COALESCE(s.stock_symbol, s.bse_code, s.isin_number) as symbol,
             s.stock_name as name,
             w.added_at,
             tc.status as transcript_check_status
@@ -230,9 +819,76 @@ def get_watchlist():
             analysis = cursor.fetchone()
             if analysis:
                 analysis_info = {
+                    'id': analysis['id'],
                     'completed': True,
                     'date': analysis['created_at'],
                     'provider': analysis['model_provider']
+                }
+
+        retry_info = {
+            'retrying': False,
+            'retry_attempts': 0,
+            'retry_next_at': None,
+            'retry_scope': None
+        }
+        active_analysis_job = None
+
+        if transcript:
+            cursor.execute("""
+                SELECT status, attempts, retry_next_at
+                FROM analysis_jobs
+                WHERE transcript_id = ?
+                  AND status IN ('pending', 'queued', 'retrying', 'in_progress')
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+            """, (transcript['id'],))
+            active_analysis_job = cursor.fetchone()
+            if active_analysis_job and active_analysis_job['status'] == 'retrying':
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': active_analysis_job['attempts'],
+                    'retry_next_at': _to_utc_iso(active_analysis_job['retry_next_at']),
+                    'retry_scope': 'analysis'
+                }
+
+        if not retry_info['retrying'] and analysis_info:
+            cursor.execute("""
+                SELECT attempts, retry_next_at
+                FROM email_outbox
+                WHERE analysis_id = ? AND status = 'retrying'
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """, (analysis_info['id'],))
+            retry_row = cursor.fetchone()
+            if retry_row:
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': retry_row['attempts'],
+                    'retry_next_at': _to_utc_iso(retry_row['retry_next_at']),
+                    'retry_scope': 'email'
+                }
+
+        fetch_schedule = None
+        if not retry_info['retrying']:
+            cursor.execute("""
+                SELECT attempts, next_check_at, last_status, last_checked_at,
+                       CASE
+                           WHEN locked_until IS NOT NULL
+                            AND datetime(locked_until) > datetime('now')
+                           THEN 1
+                           ELSE 0
+                       END AS is_locked
+                FROM transcript_fetch_schedule
+                WHERE stock_id = ? AND quarter = ? AND year = ?
+                LIMIT 1
+            """, (stock_id, quarter, year))
+            fetch_schedule = cursor.fetchone()
+            if fetch_schedule and fetch_schedule['attempts'] > 0 and fetch_schedule['last_status'] == 'error':
+                retry_info = {
+                    'retrying': True,
+                    'retry_attempts': fetch_schedule['attempts'],
+                    'retry_next_at': _to_utc_iso(fetch_schedule['next_check_at']),
+                    'retry_scope': 'transcript_fetch'
                 }
         
         # Determine detailed status
@@ -246,7 +902,24 @@ def get_watchlist():
             analysis_state = transcript['analysis_status']
             analysis_error = transcript['analysis_error']
 
-            if analysis_state == 'in_progress':
+            if active_analysis_job:
+                analysis_job_status = active_analysis_job['status']
+                if analysis_job_status in ('pending', 'queued'):
+                    analysis_message = 'Analysis queued...'
+                elif analysis_job_status == 'retrying':
+                    analysis_message = 'Retrying analysis...'
+                else:
+                    analysis_message = 'Analyzing transcript...'
+
+                status_info = {
+                    'status': 'analyzing',
+                    'message': analysis_message,
+                    'details': {
+                        'quarter': transcript['quarter'],
+                        'year': transcript['year']
+                    }
+                }
+            elif analysis_state == 'in_progress':
                 status_info = {
                     'status': 'analyzing',
                     'message': 'Analyzing transcript...',
@@ -265,13 +938,14 @@ def get_watchlist():
                     }
                 }
             elif transcript['status'] == 'upcoming':
+                event_date_iso = _to_utc_iso(transcript['event_date'])
                 status_info = {
                     'status': 'upcoming',
-                    'message': f"Upcoming: {transcript['event_date']}",
+                    'message': f"Upcoming: {event_date_iso or transcript['event_date']}",
                     'details': {
                         'quarter': transcript['quarter'],
                         'year': transcript['year'],
-                        'event_date': transcript['event_date']
+                        'event_date': event_date_iso or transcript['event_date']
                     }
                 }
             elif transcript['status'] == 'available':
@@ -292,7 +966,7 @@ def get_watchlist():
                         'details': {
                             'quarter': transcript['quarter'],
                             'year': transcript['year'],
-                            'analyzed_at': analysis_info['date'],
+                            'analyzed_at': _to_utc_iso(analysis_info['date']) or analysis_info['date'],
                             'provider': analysis_info['provider']
                         }
                     }
@@ -303,10 +977,16 @@ def get_watchlist():
                         'details': {
                             'quarter': transcript['quarter'],
                             'year': transcript['year'],
-                            'transcript_date': transcript['created_at']
+                            'transcript_date': _to_utc_iso(transcript['created_at']) or transcript['created_at']
                         }
                     }
-        elif row['transcript_check_status'] == 'checking':
+        elif row['transcript_check_status'] == 'checking' or (
+            fetch_schedule
+            and (
+                fetch_schedule['last_checked_at'] is None
+                or fetch_schedule['is_locked']
+            )
+        ):
             status_info = {
                 'status': 'fetching',
                 'message': 'Fetching transcript...',
@@ -317,10 +997,14 @@ def get_watchlist():
             'id': stock_id,
             'symbol': row['symbol'],
             'name': row['name'],
-            'added_at': row['added_at'],
+            'added_at': _to_utc_iso(row['added_at']) or row['added_at'],
             'status': status_info['status'],
             'status_message': status_info['message'],
-            'status_details': status_info['details']
+            'status_details': status_info['details'],
+            'retrying': retry_info['retrying'],
+            'retry_attempts': retry_info['retry_attempts'],
+            'retry_next_at': retry_info['retry_next_at'],
+            'retry_scope': retry_info['retry_scope']
         })
     
     conn.close()
@@ -328,18 +1012,31 @@ def get_watchlist():
 
 @app.route('/api/watchlist', methods=['POST'])
 def add_to_watchlist():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
     symbol = data.get('symbol')
     
-    if not symbol:
-        return jsonify({'error': 'Symbol is required'}), 400
+    if stock_id is None and not symbol:
+        return jsonify({'error': 'stock_id or symbol is required'}), 400
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        if stock_id is not None:
+            cursor.execute(
+                "SELECT id FROM stocks WHERE id = ? AND is_active = 1",
+                (int(stock_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE is_active = 1
+                  AND (stock_symbol = ? OR bse_code = ? OR isin_number = ?)
+                """,
+                (symbol, symbol, symbol),
+            )
         stock = cursor.fetchone()
         
         if not stock:
@@ -350,7 +1047,7 @@ def add_to_watchlist():
         conn.commit()
 
         # Kick off immediate transcript check instead of waiting for the next poll
-        scheduler.trigger_check_for_stock(stock['id'])
+        _trigger_stock_fetch_with_retry(stock['id'])
         return jsonify({'message': 'Added to watchlist'}), 201
         
     except sqlite3.IntegrityError:
@@ -362,24 +1059,51 @@ def add_to_watchlist():
 
 @app.route('/api/watchlist/<symbol>', methods=['DELETE'])
 def remove_from_watchlist(symbol):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Get stock ID first - check both NSE symbol and BSE code
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE stock_symbol = ? OR bse_code = ? OR isin_number = ?
+                """,
+                (symbol, symbol, symbol),
+            )
+            stock = cursor.fetchone()
+
+            if stock:
+                cursor.execute("DELETE FROM watchlist_items WHERE stock_id = ?", (stock['id'],))
+                conn.commit()
+
+            return jsonify({'message': 'Removed from watchlist'}), 200
+        except Exception as e:
+            if _is_db_locked_error(e) and attempt < max_attempts:
+                time.sleep(0.15 * attempt)
+                continue
+            return jsonify({'error': str(e)}), 500
+        finally:
+            conn.close()
+
+    return jsonify({'error': 'Database is busy, please retry'}), 503
+
+
+@app.route('/api/watchlist/id/<int:stock_id>', methods=['DELETE'])
+def remove_from_watchlist_by_id(stock_id):
+    connection = get_db_connection()
     try:
-        # Get stock ID first - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
-        stock = cursor.fetchone()
-        
-        if stock:
-            cursor.execute("DELETE FROM watchlist_items WHERE stock_id = ?", (stock['id'],))
-            conn.commit()
-            
+        connection.execute(
+            "DELETE FROM watchlist_items WHERE stock_id = ?",
+            (stock_id,),
+        )
+        connection.commit()
         return jsonify({'message': 'Removed from watchlist'}), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
     finally:
-        conn.close()
+        connection.close()
 
 # Groups API Endpoints
 
@@ -535,7 +1259,7 @@ def get_group_details(group_id):
     cursor.execute("""
         SELECT 
             s.id,
-            COALESCE(s.stock_symbol, s.bse_code) as symbol, 
+            COALESCE(s.stock_symbol, s.bse_code, s.isin_number) as symbol,
             s.stock_name as name, 
             gs.added_at,
             t.quarter,
@@ -576,18 +1300,31 @@ def get_group_details(group_id):
 
 @app.route('/api/groups/<int:group_id>/stocks', methods=['POST'])
 def add_stock_to_group(group_id):
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    stock_id = data.get('stock_id')
     symbol = data.get('symbol')
     
-    if not symbol:
-        return jsonify({'error': 'Symbol is required'}), 400
+    if stock_id is None and not symbol:
+        return jsonify({'error': 'stock_id or symbol is required'}), 400
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        if stock_id is not None:
+            cursor.execute(
+                "SELECT id FROM stocks WHERE id = ? AND is_active = 1",
+                (int(stock_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id FROM stocks
+                WHERE is_active = 1
+                  AND (stock_symbol = ? OR bse_code = ? OR isin_number = ?)
+                """,
+                (symbol, symbol, symbol),
+            )
         stock = cursor.fetchone()
         
         if not stock:
@@ -601,7 +1338,7 @@ def add_stock_to_group(group_id):
         conn.commit()
 
         # Immediately check for transcripts for newly grouped stock
-        scheduler.trigger_check_for_stock(stock['id'])
+        queue_scheduler.trigger_for_stock(stock['id'])
         return jsonify({'message': 'Stock added to group'}), 201
         
     except sqlite3.IntegrityError:
@@ -611,6 +1348,22 @@ def add_stock_to_group(group_id):
     finally:
         conn.close()
 
+
+@app.route('/api/groups/<int:group_id>/stocks/id/<int:stock_id>', methods=['DELETE'])
+def remove_stock_from_group_by_id(group_id, stock_id):
+    connection = get_db_connection()
+    try:
+        connection.execute(
+            "DELETE FROM group_stocks WHERE group_id = ? AND stock_id = ?",
+            (group_id, stock_id),
+        )
+        connection.commit()
+        return jsonify({'message': 'Stock removed from group'}), 200
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+    finally:
+        connection.close()
+
 @app.route('/api/groups/<int:group_id>/stocks/<symbol>', methods=['DELETE'])
 def remove_stock_from_group(group_id, symbol):
     conn = get_db_connection()
@@ -618,7 +1371,13 @@ def remove_stock_from_group(group_id, symbol):
     
     try:
         # Get stock ID - check both NSE symbol and BSE code
-        cursor.execute("SELECT id FROM stocks WHERE stock_symbol = ? OR bse_code = ?", (symbol, symbol))
+        cursor.execute(
+            """
+            SELECT id FROM stocks
+            WHERE stock_symbol = ? OR bse_code = ? OR isin_number = ?
+            """,
+            (symbol, symbol, symbol),
+        )
         stock = cursor.fetchone()
         
         if stock:
@@ -639,7 +1398,18 @@ def remove_stock_from_group(group_id, symbol):
 def list_group_articles(group_id):
     """List deep-research group runs (one per quarter)."""
     try:
-        runs = group_research_service.list_runs(group_id)
+        quarter = request.args.get('quarter')
+        year = request.args.get('year', type=int)
+
+        if (quarter and year is None) or (year is not None and not quarter):
+            return jsonify({'error': 'Both quarter and year are required together'}), 400
+
+        if quarter:
+            quarter = quarter.upper()
+            if quarter not in ['Q1', 'Q2', 'Q3', 'Q4']:
+                return jsonify({'error': 'quarter must be one of Q1, Q2, Q3, Q4'}), 400
+
+        runs = group_research_service.list_runs(group_id, quarter=quarter, year=year)
         return jsonify(runs), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -866,13 +1636,16 @@ def add_smtp_setting():
             cursor.execute("UPDATE smtp_settings SET is_active = 0")
             
         cursor.execute("""
-            INSERT INTO smtp_settings (email, app_password, smtp_server, smtp_port, is_active)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO smtp_settings (
+                email, app_password, smtp_server, smtp_port, smtp_security, is_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             email, 
             app_password, 
             data.get('smtp_server', 'smtp.gmail.com'),
             data.get('smtp_port', 587),
+            data.get('smtp_security', 'auto'),
             data.get('is_active', True)
         ))
         conn.commit()
@@ -885,12 +1658,14 @@ def add_smtp_setting():
                 
             cursor.execute("""
                 UPDATE smtp_settings 
-                SET app_password = ?, smtp_server = ?, smtp_port = ?, is_active = ?
+                SET app_password = ?, smtp_server = ?, smtp_port = ?,
+                    smtp_security = ?, is_active = ?
                 WHERE email = ?
             """, (
                 app_password,
                 data.get('smtp_server', 'smtp.gmail.com'),
                 data.get('smtp_port', 587),
+                data.get('smtp_security', 'auto'),
                 data.get('is_active', True),
                 email
             ))
@@ -938,6 +1713,10 @@ def update_smtp_setting(setting_id):
         if 'smtp_port' in data:
             fields.append("smtp_port = ?")
             values.append(data['smtp_port'])
+
+        if 'smtp_security' in data:
+            fields.append("smtp_security = ?")
+            values.append(data['smtp_security'])
             
         if 'is_active' in data:
             fields.append("is_active = ?")
@@ -1000,7 +1779,8 @@ def test_smtp():
                 'email': data['email'],
                 'app_password': data['app_password'],
                 'smtp_server': data.get('smtp_server', 'smtp.gmail.com'),
-                'smtp_port': data.get('smtp_port', 587)
+                'smtp_port': data.get('smtp_port', 587),
+                'smtp_security': data.get('smtp_security', 'auto'),
             }
             result = email_service.test_connection(smtp_config)
         else:
@@ -1141,7 +1921,10 @@ def get_llm_providers():
     
     cursor.execute("""
         SELECT id, provider_name, display_name, is_active, 
-               (api_key_encrypted IS NOT NULL AND api_key_encrypted != '') as has_key
+               (
+                   COALESCE(NULLIF(api_key, ''), NULLIF(api_key_encrypted, ''))
+                   IS NOT NULL
+               ) as has_key
         FROM llm_providers
         ORDER BY display_name
     """)
@@ -1260,10 +2043,6 @@ def update_default_prompt():
 
 # Analysis API Endpoints
 
-from services.analysis_worker import AnalysisWorker
-
-analysis_worker = AnalysisWorker()
-
 @app.route('/api/analyze/<int:stock_id>', methods=['POST'])
 def trigger_analysis(stock_id):
     data = request.get_json(silent=True) or {}
@@ -1308,18 +2087,7 @@ def trigger_analysis(stock_id):
         conn.close()
         return jsonify({'error': 'Stock is not in watchlist; stock-level analysis is disabled'}), 409
 
-    # Skip stock-level analysis for stocks that belong to an active group
-    cursor.execute("""
-        SELECT 1
-        FROM group_stocks gs
-        JOIN groups g ON g.id = gs.group_id
-        WHERE gs.stock_id = ? AND g.is_active = 1
-        LIMIT 1
-    """, (stock_id,))
-    if cursor.fetchone():
-        conn.close()
-        return jsonify({'error': 'Stock belongs to an active group; use group research instead'}), 409
-
+    transcript_id = None
     # If targeting a specific quarter/year, verify transcript is available
     if quarter and year:
         cursor.execute("""
@@ -1328,21 +2096,77 @@ def trigger_analysis(stock_id):
             LIMIT 1
         """, (stock_id, quarter, year))
         transcript = cursor.fetchone()
-        if not transcript:
+        transcript_status = transcript['status'] if transcript else 'none'
+        transcript_source_url = transcript['source_url'] if transcript else None
+        needs_fetch = (
+            transcript is None
+            or transcript_status != 'available'
+            or not transcript_source_url
+        )
+        if needs_fetch:
             conn.close()
-            return jsonify({'error': f'Transcript for {quarter} {year} not found'}), 404
-        if transcript['status'] != 'available':
+            try:
+                _trigger_stock_fetch_with_retry(stock_id, quarter=quarter, year=year)
+            except Exception as e:
+                return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
+            return jsonify({
+                'message': f'Transcript check triggered for {quarter} {year}',
+                'status': 'fetching_transcript',
+                'quarter': quarter,
+                'year': year,
+                'transcript_status': transcript_status
+            }), 202
+        transcript_id = transcript['id']
+    else:
+        cursor.execute("""
+            SELECT id, quarter, year, status, source_url
+            FROM transcripts
+            WHERE stock_id = ? AND status = 'available'
+            ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+            LIMIT 1
+        """, (stock_id,))
+        transcript = cursor.fetchone()
+        if transcript and transcript['source_url']:
+            transcript_id = transcript['id']
+        else:
+            cursor.execute("""
+                SELECT quarter, year, status
+                FROM transcripts
+                WHERE stock_id = ?
+                ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+                LIMIT 1
+            """, (stock_id,))
+            latest = cursor.fetchone()
+            if latest:
+                target_quarter = latest['quarter']
+                target_year = latest['year']
+                transcript_status = latest['status'] or 'none'
+            else:
+                target_quarter, target_year = get_previous_fy_quarter()
+                transcript_status = 'none'
             conn.close()
-            return jsonify({'error': f'Transcript status is {transcript["status"]}, cannot analyze'}), 422
-        if not transcript['source_url']:
-            conn.close()
-            return jsonify({'error': f'Transcript for {quarter} {year} has no source_url to analyze'}), 422
+            try:
+                _trigger_stock_fetch_with_retry(stock_id, quarter=target_quarter, year=target_year)
+            except Exception as e:
+                return jsonify({'error': f'Failed to trigger transcript fetch: {e}'}), 500
+            return jsonify({
+                'message': f'Transcript check triggered for {target_quarter} {target_year}',
+                'status': 'fetching_transcript',
+                'quarter': target_quarter,
+                'year': target_year,
+                'transcript_status': transcript_status
+            }), 202
 
     conn.close()
     
     # Start background job
     try:
-        job_id = analysis_worker.start_analysis_job(stock_id, quarter=quarter, year=year, force=force)
+        job_id = analysis_job_service.enqueue_for_transcript(transcript_id, force=force)
+        if job_id is None:
+            return jsonify({
+                'message': 'Analysis already exists for this transcript',
+                'status': 'skipped'
+            }), 200
         return jsonify({
             'message': 'Analysis started',
             'job_id': job_id,
@@ -1364,11 +2188,13 @@ def get_analyses(stock_id):
                 ta.llm_output,
                 ta.created_at,
                 ta.model_provider,
+                COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                 t.quarter,
                 t.year,
                 t.source_url
             FROM transcript_analyses ta
             JOIN transcripts t ON ta.transcript_id = t.id
+            LEFT JOIN llm_models lm ON lm.id = ta.model_id
             WHERE t.stock_id = ?
             ORDER BY ta.created_at DESC
         """, (stock_id,))
@@ -1404,16 +2230,18 @@ def download_latest_analysis(stock_id):
                 ta.llm_output,
                 ta.created_at,
                 ta.model_provider,
-                ta.model_id,
+                COALESCE(ta.model_name, lm.model_id, CAST(ta.model_id AS TEXT)) AS model_name,
                 t.quarter,
                 t.year,
                 t.source_url,
                 s.stock_symbol,
                 s.bse_code,
+                s.isin_number,
                 s.stock_name
             FROM transcript_analyses ta
             JOIN transcripts t ON ta.transcript_id = t.id
             JOIN stocks s ON t.stock_id = s.id
+            LEFT JOIN llm_models lm ON lm.id = ta.model_id
             WHERE s.id = ?
         """
 
@@ -1460,12 +2288,17 @@ def download_latest_analysis(stock_id):
         except Exception:
             rendered_content = f"<pre>{html.escape(analysis['llm_output'] or '')}</pre>"
 
-        symbol = analysis['stock_symbol'] or analysis['bse_code'] or f"stock-{stock_id}"
+        symbol = (
+            analysis['stock_symbol']
+            or analysis['bse_code']
+            or analysis['isin_number']
+            or f"stock-{stock_id}"
+        )
         stock_name = analysis['stock_name'] or symbol
         quarter = analysis['quarter']
         year = analysis['year']
         provider = (analysis['model_provider'] or 'LLM').upper()
-        model_name_value = str(analysis['model_id']) if analysis['model_id'] is not None else provider
+        model_name_value = analysis['model_name'] or provider
         transcript_url = analysis['source_url'] or '#'
 
         generated_at = str(analysis['created_at'])
@@ -1776,6 +2609,23 @@ def download_research_pdf(run_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Disable debug mode in production (PyInstaller) to prevent reloader
     is_frozen = getattr(sys, 'frozen', False)
-    app.run(debug=not is_frozen, port=5001, use_reloader=not is_frozen)
+
+    def _handle_termination(_signum, _frame):
+        _stop_background_runtime(timeout_seconds=5)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_termination)
+    if hasattr(signal, "SIGINT"):
+        signal.signal(signal.SIGINT, _handle_termination)
+
+    if is_frozen:
+        from waitress import serve
+        serve(app, host='127.0.0.1', port=5001, threads=8)
+    else:
+        app.run(
+            debug=True,
+            host='127.0.0.1',
+            port=5001,
+            use_reloader=True,
+        )
