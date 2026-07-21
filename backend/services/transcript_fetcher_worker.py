@@ -12,6 +12,14 @@ from services.stock_activity_service import StockActivityService
 MAX_TRANSCRIPT_ERROR_ATTEMPTS = 8
 
 
+def _safe_print(message: str):
+    """Print that can never raise (Windows pipes may reject Unicode)."""
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
 class TranscriptFetcherWorker:
     def __init__(self):
         self.queue = QueueService()
@@ -42,7 +50,7 @@ class TranscriptFetcherWorker:
             try:
                 job = self.queue.dequeue("transcript_check", timeout=15, lease_seconds=180)
             except Exception as error:
-                print(f"[FetcherWorker] Queue claim failed: {error}")
+                _safe_print(f"[FetcherWorker] Queue claim failed: {error}")
                 time.sleep(5)
                 continue
             if not job:
@@ -51,8 +59,11 @@ class TranscriptFetcherWorker:
                 self._process_job(job)
                 self.queue.ack(job)
             except Exception as e:
-                self.queue.release(job, delay_seconds=60, error=str(e))
-                print(f"[FetcherWorker] Job failed: {e}")
+                try:
+                    self.queue.release(job, delay_seconds=60, error=str(e))
+                except Exception as release_error:
+                    _safe_print(f"[FetcherWorker] Job release failed: {release_error}")
+                _safe_print(f"[FetcherWorker] Job failed: {e}")
 
     def _mark_check_status(self, cursor, stock_id: int, status: str):
         cursor.execute(
@@ -123,7 +134,13 @@ class TranscriptFetcherWorker:
             )
             index = min(max(attempts, 1) - 1, len(retry_delays) - 1)
             return as_utc_naive(now + retry_delays[index])
-        return as_utc_naive(now + timedelta(hours=12))
+        # "none": nothing found yet. Transcripts often appear within hours of a
+        # concall, so a long backoff here makes the app look broken during
+        # earnings season. Watchlist stocks recheck fast; group-only stocks
+        # recheck moderately.
+        if is_watchlist_stock:
+            return as_utc_naive(now + timedelta(minutes=30))
+        return as_utc_naive(now + timedelta(hours=2))
 
     def _process_job(self, job: dict):
         stock_id = job.get("stock_id")
@@ -176,18 +193,28 @@ class TranscriptFetcherWorker:
             schedule_before = cursor.fetchone()
             previous_schedule_status = schedule_before["last_status"] if schedule_before else None
 
+            cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
+            in_watchlist = cursor.fetchone() is not None
+
             self._mark_check_status(cursor, stock_id, "checking")
             conn.commit()
 
-            available = self.transcript_service.fetch_available_transcripts(symbol)
+            available, pending = self.transcript_service.fetch_concall_states(symbol)
             available = [t for t in available if t.quarter == quarter and t.year == year]
+            pending = [t for t in pending if t.quarter == quarter and t.year == year]
 
             # An available transcript is authoritative. Avoid a second network
             # request that could fail and discard an already-successful result.
             upcoming = []
             if not available:
-                upcoming = self.transcript_service.get_upcoming_calls(symbol)
-                upcoming = [t for t in upcoming if t.quarter == quarter and t.year == year]
+                if pending:
+                    # The call already happened and Tijori has it recorded but the
+                    # transcript PDF is not uploaded yet. Treat it like an upcoming
+                    # event so polling stays on the fast post-event cadence.
+                    upcoming = pending
+                else:
+                    upcoming = self.transcript_service.get_upcoming_calls(symbol)
+                    upcoming = [t for t in upcoming if t.quarter == quarter and t.year == year]
 
             schedule_status = "none"
             event_date = None
@@ -240,8 +267,6 @@ class TranscriptFetcherWorker:
                 conn.commit()
 
                 # Auto-trigger analysis for watchlist stocks only.
-                cursor.execute("SELECT 1 FROM watchlist_items WHERE stock_id = ? LIMIT 1", (stock_id,))
-                in_watchlist = cursor.fetchone() is not None
                 if in_watchlist:
                     self.analysis_job_service.enqueue_for_transcript(transcript_id)
 
@@ -324,7 +349,12 @@ class TranscriptFetcherWorker:
             )
             sched = cursor.fetchone()
             attempts = sched["attempts"] if sched else 0
-            next_check_at = self._compute_next_check(schedule_status, event_date, attempts)
+            next_check_at = self._compute_next_check(
+                schedule_status,
+                event_date,
+                attempts,
+                is_watchlist_stock=in_watchlist,
+            )
 
             cursor.execute(
                 """
@@ -423,6 +453,6 @@ class TranscriptFetcherWorker:
                     "next_check_at": next_check_at,
                 },
             )
-            print(f"[FetcherWorker] Error processing stock {stock_id}: {e}")
+            _safe_print(f"[FetcherWorker] Error processing stock {stock_id}: {e}")
         finally:
             conn.close()

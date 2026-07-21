@@ -133,6 +133,71 @@ class SchedulerDedupeTests(TemporaryDatabaseTest):
         self.assertEqual(count, 1)
 
 
+class TranscriptPendingUploadTests(TemporaryDatabaseTest):
+    """A recorded concall without a transcript PDF must keep polling fast."""
+
+    def setUp(self):
+        super().setUp()
+        schema_path = Path(__file__).parents[2] / "database" / "schema.sql"
+        with self.connect() as connection:
+            connection.executescript(schema_path.read_text())
+            connection.execute(
+                """
+                INSERT INTO stocks (stock_symbol, isin_number, stock_name)
+                VALUES ('TEST', 'INE000000001', 'Test Limited')
+                """
+            )
+            connection.execute("INSERT INTO watchlist_items (stock_id) VALUES (1)")
+            connection.execute(
+                """
+                INSERT INTO transcript_fetch_schedule (stock_id, quarter, year, priority, next_check_at)
+                VALUES (1, 'Q1', 2027, 100, CURRENT_TIMESTAMP)
+                """
+            )
+            connection.commit()
+
+    def test_recorded_call_without_transcript_is_tracked_as_upcoming(self):
+        from services.transcript_service import TranscriptMetadata
+
+        worker = TranscriptFetcherWorker()
+        worker.db_path = str(self.db_path)
+        worker.activity_service.db_path = str(self.db_path)
+        worker.queue = QueueService(str(self.db_path))
+
+        event_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        pending = TranscriptMetadata(
+            stock_symbol="TEST",
+            quarter="Q1",
+            year=2027,
+            source_url=None,
+            title="Q1 FY2027 Earnings Call (Transcript pending)",
+            isin="INE000000001",
+            event_date=event_time,
+        )
+
+        with patch.object(
+            worker.transcript_service, "fetch_concall_states", return_value=([], [pending])
+        ), patch.object(
+            worker.transcript_service, "get_upcoming_calls", return_value=[]
+        ):
+            worker._process_job({"stock_id": 1, "quarter": "Q1", "year": 2027})
+
+        with self.connect() as connection:
+            transcript = connection.execute(
+                "SELECT status, event_date FROM transcripts WHERE stock_id = 1"
+            ).fetchone()
+            schedule = connection.execute(
+                "SELECT last_status, next_check_at FROM transcript_fetch_schedule WHERE stock_id = 1"
+            ).fetchone()
+
+        self.assertEqual(transcript["status"], "upcoming")
+        self.assertEqual(schedule["last_status"], "upcoming")
+        next_check = datetime.fromisoformat(schedule["next_check_at"])
+        delay = (next_check - datetime.utcnow()).total_seconds()
+        # Post-event cadence: 15 minutes, not the slow "none" backoff.
+        self.assertLessEqual(delay, 16 * 60)
+
+
 class TranscriptCadenceTests(unittest.TestCase):
     def setUp(self):
         self.worker = TranscriptFetcherWorker()
@@ -166,6 +231,18 @@ class TranscriptCadenceTests(unittest.TestCase):
         self.assert_delay_close(
             self.worker._compute_next_check("error", None, 4),
             6 * 60 * 60,
+        )
+
+    def test_none_status_rechecks_fast_for_watchlist_stocks(self):
+        # Transcripts often appear within hours of a concall; the previous 12h
+        # backoff made the app look broken during earnings season.
+        self.assert_delay_close(
+            self.worker._compute_next_check("none", None, 0, is_watchlist_stock=True),
+            30 * 60,
+        )
+        self.assert_delay_close(
+            self.worker._compute_next_check("none", None, 0, is_watchlist_stock=False),
+            2 * 60 * 60,
         )
 
 

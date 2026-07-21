@@ -33,6 +33,14 @@ def _get_latest_quarter():
     return "Q3", current_fy
 
 
+def _safe_print(message: str):
+    """Print that can never raise (Windows pipes may reject Unicode)."""
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
 class QueueSchedulerService:
     def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 300, group_check_seconds: int = 300):
         self.queue = QueueService()
@@ -464,13 +472,14 @@ class QueueSchedulerService:
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
+            # Note: last_status is intentionally preserved so the next check only
+            # logs an activity event on a real status transition (resetting it to
+            # NULL made every manual refresh re-log "no transcript found").
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
                 SET next_check_at = CURRENT_TIMESTAMP,
                     attempts = 0,
-                    last_status = NULL,
-                    last_checked_at = NULL,
                     locked_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE stock_id = ? AND quarter = ? AND year = ?
@@ -489,8 +498,6 @@ class QueueSchedulerService:
                         priority = excluded.priority,
                         next_check_at = CURRENT_TIMESTAMP,
                         attempts = 0,
-                        last_status = NULL,
-                        last_checked_at = NULL,
                         locked_until = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     """,
@@ -755,7 +762,7 @@ class QueueSchedulerService:
             if row:
                 current_analysis = f"{row['symbol']} {row['quarter']} FY{row['year']}"
         except Exception as error:
-            print(f"[QueueScheduler] Status query failed: {error}")
+            _safe_print(f"[QueueScheduler] Status query failed: {error}")
         finally:
             conn.close()
 
@@ -846,7 +853,7 @@ class QueueSchedulerService:
                     self.last_group_check = now_utc
                     next_group_check = now_monotonic + self.group_check_seconds
             except Exception as e:
-                print(f"[QueueScheduler] Error in loop: {e}")
+                _safe_print(f"[QueueScheduler] Error in loop: {e}")
 
             time.sleep(1)
 

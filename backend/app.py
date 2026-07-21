@@ -1,8 +1,19 @@
+import sys
+
+# Windows consoles/pipes default to cp1252; a print() containing any
+# non-ANSI character (zero-width spaces from Tijori data, rupee signs, etc.)
+# raises UnicodeEncodeError and kills the worker that printed it.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import sqlite3
 import os
-import sys
 import time
 import signal
 import threading

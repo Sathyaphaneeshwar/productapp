@@ -404,7 +404,11 @@ async function startBackendOnce() {
       ...process.env,
       PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
       PRODUCT_GEMINI_APP_VERSION: app.getVersion(),
-      PRODUCT_GEMINI_CONTROL_TOKEN: backendControlToken
+      PRODUCT_GEMINI_CONTROL_TOKEN: backendControlToken,
+      // Windows pipes default Python stdio to cp1252; Unicode in any print()
+      // would raise UnicodeEncodeError inside backend workers.
+      PYTHONUTF8: '1',
+      PYTHONIOENCODING: 'utf-8'
     };
 
     log(`Starting spawn with env PATH: ${spawnEnv.PATH?.substring(0, 100)}...`);

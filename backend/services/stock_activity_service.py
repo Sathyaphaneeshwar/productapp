@@ -196,8 +196,10 @@ class StockActivityService:
             if level and item["level"] != level:
                 continue
 
-            # Legacy transcript polling can contain the same observation every
-            # five minutes. Keep the newest identical state to make the page useful.
+            # Repeated polling can produce the same observation many times, and
+            # the same state change can surface from both stock_activity_logs and
+            # transcript_events with identical text. Keep only the newest
+            # identical state to make the page useful.
             dedupe_key = (
                 item["stock_id"],
                 item["stage"],
@@ -206,7 +208,7 @@ class StockActivityService:
                 item["quarter"],
                 item["year"],
             )
-            if item["source"] != "activity" and dedupe_key in seen:
+            if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
 

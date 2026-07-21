@@ -12,6 +12,14 @@ from services.stock_activity_service import StockActivityService
 MAX_EMAIL_ATTEMPTS = 6
 
 
+def _safe_print(message: str):
+    """Print that can never raise (Windows pipes may reject Unicode)."""
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
 class EmailQueueWorker:
     def __init__(self):
         self.db_path = str(DATABASE_PATH)
@@ -41,7 +49,7 @@ class EmailQueueWorker:
             try:
                 job = self.queue.dequeue("email", timeout=15, lease_seconds=180)
             except Exception as error:
-                print(f"[EmailWorker] Queue claim failed: {error}")
+                _safe_print(f"[EmailWorker] Queue claim failed: {error}")
                 time.sleep(5)
                 continue
             if not job:
@@ -54,8 +62,11 @@ class EmailQueueWorker:
                 self._process_job(outbox_id)
                 self.queue.ack(job)
             except Exception as e:
-                self.queue.release(job, delay_seconds=60, error=str(e))
-                print(f"[EmailWorker] Job {outbox_id} failed: {e}")
+                try:
+                    self.queue.release(job, delay_seconds=60, error=str(e))
+                except Exception as release_error:
+                    _safe_print(f"[EmailWorker] Job release failed: {release_error}")
+                _safe_print(f"[EmailWorker] Job {outbox_id} failed: {e}")
 
     def _process_job(self, outbox_id: int):
         conn = self.get_db_connection()
@@ -184,6 +195,6 @@ class EmailQueueWorker:
                         "retry_next_at": retry_next_at,
                     },
                 )
-            print(f"[EmailWorker] Job {outbox_id} error: {e}")
+            _safe_print(f"[EmailWorker] Job {outbox_id} error: {e}")
         finally:
             conn.close()

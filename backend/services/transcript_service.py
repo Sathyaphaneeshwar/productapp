@@ -137,10 +137,22 @@ class TranscriptService:
         """
         Fetches the latest transcript for a given stock using Tijori API.
         """
+        available, _pending = self.fetch_concall_states(stock_symbol)
+        return available
+
+    def fetch_concall_states(
+        self, stock_symbol: str
+    ) -> tuple[List[TranscriptMetadata], List[TranscriptMetadata]]:
+        """
+        Fetches recent concalls for a stock in one API call and splits them into
+        (available, pending). "Pending" means the call already happened (Tijori
+        lists it as recorded) but the transcript PDF has not been uploaded yet —
+        callers should keep polling those at the fast post-event cadence.
+        """
         isin = self._get_isin_from_symbol(stock_symbol)
         if not isin:
             print(f"ISIN not found for {stock_symbol}")
-            return []
+            return [], []
 
         url = f"{self.base_url}/concalls/list"
         params = {
@@ -160,13 +172,10 @@ class TranscriptService:
             )
             response.raise_for_status()
             data = response.json()
-            
-            results = []
-            for item in data.get('data', []):
-                transcript_url = item.get('transcript')
-                if not transcript_url:
-                    continue
 
+            available = []
+            pending = []
+            for item in data.get('data', []):
                 event_time = item.get('concall_event_time') or item.get('event_time') or item.get('event_date')
                 parsed_time = self._parse_event_time(event_time)
                 if not parsed_time:
@@ -179,21 +188,37 @@ class TranscriptService:
                     print(f"[TranscriptService] Failed to calculate quarter for {stock_symbol}: {event_time} ({e})")
                     continue
 
-                results.append((
-                    parsed_time,
-                    TranscriptMetadata(
-                        stock_symbol=stock_symbol,
-                        quarter=quarter,
-                        year=fy,
-                        source_url=transcript_url,
-                        title=f"{quarter} FY{fy} Earnings Call",
-                        isin=isin
-                    )
-                ))
+                transcript_url = item.get('transcript')
+                if transcript_url:
+                    available.append((
+                        parsed_time,
+                        TranscriptMetadata(
+                            stock_symbol=stock_symbol,
+                            quarter=quarter,
+                            year=fy,
+                            source_url=transcript_url,
+                            title=f"{quarter} FY{fy} Earnings Call",
+                            isin=isin
+                        )
+                    ))
+                else:
+                    pending.append((
+                        parsed_time,
+                        TranscriptMetadata(
+                            stock_symbol=stock_symbol,
+                            quarter=quarter,
+                            year=fy,
+                            source_url=None,
+                            title=f"{quarter} FY{fy} Earnings Call (Transcript pending)",
+                            isin=isin,
+                            event_date=str(event_time)
+                        )
+                    ))
 
-            # Ensure newest transcripts come first
-            results.sort(key=lambda item: item[0], reverse=True)
-            return [item[1] for item in results]
+            # Ensure newest entries come first
+            available.sort(key=lambda entry: entry[0], reverse=True)
+            pending.sort(key=lambda entry: entry[0], reverse=True)
+            return [entry[1] for entry in available], [entry[1] for entry in pending]
 
         except Exception as e:
             raise RuntimeError(f"Tijori available-transcript request failed: {e}") from e
