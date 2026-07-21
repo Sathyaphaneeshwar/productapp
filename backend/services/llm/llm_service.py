@@ -66,7 +66,7 @@ class LLMService:
         prompt: str,
         system_prompt: str,
         model_id: Optional[int] = None,
-        thinking_mode: bool = False,
+        thinking_mode: Optional[bool] = None,
         thinking_budget: int = 0,
         max_tokens: int = 12000,
         task_type: Optional[str] = None  # 'watchlist' or 'group_research'
@@ -139,16 +139,17 @@ class LLMService:
             raise Exception(f"Provider {model_row['provider_name']} not configured")
         
         # Use user config if available, otherwise defaults
-        # Logic: If thinking_mode is explicitly True in call, use it.
-        # Otherwise, use user preference from DB.
-        # If DB value is None, fallback to False.
+        # None uses the model preference. Explicit True/False lets task-level
+        # profiles reliably enable or disable thinking.
         db_thinking_enabled = model_row['user_thinking_enabled'] == 1
-        effective_thinking_mode = thinking_mode or db_thinking_enabled
+        effective_thinking_mode = (
+            db_thinking_enabled if thinking_mode is None else bool(thinking_mode)
+        )
         
         effective_thinking_budget = model_row['user_thinking_budget'] if model_row['user_thinking_budget'] is not None else 0
         # If user provided an override, honor it. Otherwise, cap at the lesser of requested max_tokens and model's max_output_tokens.
         if model_row['user_max_tokens'] is not None:
-            effective_max_tokens = model_row['user_max_tokens']
+            effective_max_tokens = min(model_row['user_max_tokens'], max_tokens)
         else:
             model_cap = model_row['max_output_tokens'] if model_row['max_output_tokens'] is not None else max_tokens
             effective_max_tokens = min(model_cap, max_tokens)

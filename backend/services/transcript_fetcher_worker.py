@@ -115,9 +115,13 @@ class TranscriptFetcherWorker:
             elif until_event > timedelta(days=1):
                 delay = timedelta(hours=6)
             elif until_event.total_seconds() > 0:
-                delay = timedelta(minutes=30)
-            elif until_event >= -timedelta(hours=48):
-                delay = timedelta(minutes=15)
+                delay = timedelta(minutes=15 if is_watchlist_stock else 30)
+            elif until_event >= -timedelta(hours=2):
+                delay = timedelta(minutes=5 if is_watchlist_stock else 15)
+            elif until_event >= -timedelta(hours=24):
+                delay = timedelta(minutes=10 if is_watchlist_stock else 15)
+            elif until_event >= -timedelta(hours=72):
+                delay = timedelta(minutes=30 if is_watchlist_stock else 60)
             elif until_event >= -timedelta(days=7):
                 delay = timedelta(hours=1)
             else:

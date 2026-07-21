@@ -20,7 +20,7 @@ type Stock = {
     symbol: string
     name: string
     added_at: string
-    status: 'no_transcript' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'fetching' | 'analyzing' | 'analysis_failed'
+    status: 'no_transcript' | 'waiting' | 'upcoming' | 'transcript_ready' | 'analyzed' | 'fetching' | 'analyzing' | 'analysis_failed'
     status_message: string
     status_details: {
         quarter?: string
@@ -30,6 +30,9 @@ type Stock = {
         analyzed_at?: string
         provider?: string
         analysis_error?: string
+        next_check_at?: string
+        last_checked_at?: string
+        fetch_attempts?: number
     } | null
     retrying?: boolean
     retry_attempts?: number
@@ -56,6 +59,7 @@ const ALL_STATUSES: StockStatus[] = [
     'analyzed',
     'transcript_ready',
     'upcoming',
+    'waiting',
     'fetching',
     'analyzing',
     'no_transcript',
@@ -66,6 +70,7 @@ const STATUS_LABELS: Record<StockStatus, string> = {
     analyzed: 'Analyzed',
     transcript_ready: 'Transcript Ready',
     upcoming: 'Upcoming',
+    waiting: 'Waiting',
     fetching: 'Fetching',
     analyzing: 'Analyzing',
     no_transcript: 'No Transcript',
@@ -76,6 +81,7 @@ const STATUS_RANK_ASC: StockStatus[] = [
     'analyzed',
     'transcript_ready',
     'upcoming',
+    'waiting',
     'fetching',
     'analyzing',
     'no_transcript',
@@ -609,6 +615,24 @@ export default function Watchlist() {
                         ⏳ No Transcript
                     </Badge>
                 )
+            case 'waiting': {
+                const nextCheck = parseApiTimestamp(status_details?.next_check_at)
+                return (
+                    <div className="flex flex-col gap-1">
+                        <Badge className="bg-slate-500/20 text-slate-300 border-slate-500/50 hover:bg-slate-500/40 transition-all duration-200 cursor-pointer">
+                            ⏱ Waiting for Transcript
+                        </Badge>
+                        {nextCheck && (
+                            <span className="text-xs text-muted-foreground">
+                                Next check {nextCheck.toLocaleTimeString('en-IN', {
+                                    hour: '2-digit',
+                                    minute: '2-digit'
+                                })}
+                            </span>
+                        )}
+                    </div>
+                )
+            }
             case 'fetching':
                 return (
                     <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/50 hover:bg-blue-500/40 hover:text-white hover:shadow-[0_0_15px_rgba(59,130,246,0.5)] transition-all duration-200 cursor-pointer">

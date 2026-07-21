@@ -42,13 +42,21 @@ def _safe_print(message: str):
 
 
 class QueueSchedulerService:
-    def __init__(self, *, schedule_sync_seconds: int = 60, enqueue_seconds: int = 300, group_check_seconds: int = 300):
+    def __init__(
+        self,
+        *,
+        schedule_sync_seconds: int = 60,
+        enqueue_seconds: int = 300,
+        watchlist_enqueue_seconds: int = 30,
+        group_check_seconds: int = 300,
+    ):
         self.queue = QueueService()
         self.group_research_service = GroupResearchService()
         self.running = False
         self.thread = None
         self.schedule_sync_seconds = schedule_sync_seconds
         self.enqueue_seconds = enqueue_seconds
+        self.watchlist_enqueue_seconds = watchlist_enqueue_seconds
         self.group_check_seconds = group_check_seconds
         self.last_schedule_sync = None
         self.last_group_check = None
@@ -111,9 +119,9 @@ class QueueSchedulerService:
                     (stock_id, quarter, year, priority),
                 )
 
-            # Self-heal stale watchlist rows that were previously scheduled with
-            # long "none" cadence even though an upcoming event is near/past.
-            # This ensures automatic refresh kicks back in without manual trigger.
+            # Self-heal watchlist rows left on the old long cadence. Watchlist
+            # stocks should never wait more than 30 minutes when nothing has
+            # been found, and near/past calls must re-enter the fast lane.
             cursor.execute(
                 """
                 UPDATE transcript_fetch_schedule
@@ -125,7 +133,9 @@ class QueueSchedulerService:
                   AND stock_id IN (SELECT stock_id FROM watchlist_items)
                   AND next_check_at IS NOT NULL
                   AND datetime(next_check_at) > datetime('now', '+30 minutes')
-                  AND EXISTS (
+                  AND (
+                      COALESCE(last_status, 'none') = 'none'
+                      OR EXISTS (
                         SELECT 1
                         FROM transcripts t
                         WHERE t.stock_id = transcript_fetch_schedule.stock_id
@@ -134,6 +144,7 @@ class QueueSchedulerService:
                           AND t.status = 'upcoming'
                           AND t.event_date IS NOT NULL
                           AND datetime(t.event_date) <= datetime('now', '+24 hours')
+                      )
                   )
                 """,
                 (quarter, year),
@@ -235,23 +246,43 @@ class QueueSchedulerService:
                 queued_stock_ids.add(stock_id)
         return queued_stock_ids
 
-    def _enqueue_due_transcript_checks(self, quarter: str, year: int):
+    def _enqueue_due_transcript_checks(
+        self,
+        quarter: str,
+        year: int,
+        *,
+        watchlist_only: bool = False,
+        group_only: bool = False,
+        stock_id: Optional[int] = None,
+        reason: str = "scheduled",
+    ):
         conn = self.get_db_connection()
         cursor = conn.cursor()
         try:
             now = datetime.utcnow()
             queued_stock_ids = self._get_queued_transcript_check_stock_ids(cursor, quarter, year)
+            scope_clause = ""
+            params = [quarter, year, now, now]
+            if watchlist_only:
+                scope_clause = "AND stock_id IN (SELECT stock_id FROM watchlist_items)"
+            elif group_only:
+                scope_clause = "AND stock_id NOT IN (SELECT stock_id FROM watchlist_items)"
+            if stock_id is not None:
+                scope_clause += " AND stock_id = ?"
+                params.append(stock_id)
+
             cursor.execute(
-                """
+                f"""
                 SELECT id, stock_id, priority
                 FROM transcript_fetch_schedule
                 WHERE quarter = ? AND year = ?
                   AND (next_check_at IS NULL OR next_check_at <= ?)
                   AND (locked_until IS NULL OR locked_until < ?)
+                  {scope_clause}
                 ORDER BY priority DESC, next_check_at ASC
                 LIMIT 1000
                 """,
-                (quarter, year, now, now),
+                params,
             )
             rows = cursor.fetchall()
             lock_until = now + timedelta(seconds=120)
@@ -285,7 +316,7 @@ class QueueSchedulerService:
                                 "priority": row["priority"],
                                 "quarter": quarter,
                                 "year": year,
-                                "reason": "scheduled",
+                                "reason": reason,
                             }
                         ),
                         f"transcript:{row['stock_id']}:{quarter}:{year}",
@@ -507,6 +538,15 @@ class QueueSchedulerService:
         finally:
             conn.close()
 
+        # Immediate means a durable queue message now, not merely a due
+        # schedule row that waits for the next scheduler tick.
+        self._enqueue_due_transcript_checks(
+            target_quarter,
+            target_year,
+            stock_id=stock_id,
+            reason="watchlist_trigger",
+        )
+
     def _reset_queue_state_for_fresh_run(self, quarter: str, year: int) -> dict:
         conn = self.get_db_connection()
         cursor = conn.cursor()
@@ -600,6 +640,7 @@ class QueueSchedulerService:
                 conn.commit()
             finally:
                 conn.close()
+
         self._enqueue_due_transcript_checks(quarter, year)
         self._enqueue_due_analysis_jobs()
         self._enqueue_due_email_jobs()
@@ -788,6 +829,7 @@ class QueueSchedulerService:
             "scheduler_running": self.running,
             "is_polling": is_polling,
             "poll_interval_seconds": self.enqueue_seconds,
+            "watchlist_poll_interval_seconds": self.watchlist_enqueue_seconds,
             "server_now_ms": int(now_utc.timestamp() * 1000),
             "next_check_at_ms": next_check_ms,
             "next_tick_at_ms": next_tick_ms,
@@ -826,6 +868,7 @@ class QueueSchedulerService:
 
     def _run(self):
         next_schedule_sync = time.monotonic()
+        next_watchlist_enqueue = time.monotonic()
         next_enqueue = time.monotonic()
         next_group_check = time.monotonic() + self.group_check_seconds
 
@@ -840,8 +883,16 @@ class QueueSchedulerService:
                     self.last_schedule_sync = now_utc
                     next_schedule_sync = now_monotonic + self.schedule_sync_seconds
 
+                if now_monotonic >= next_watchlist_enqueue:
+                    self._enqueue_due_transcript_checks(
+                        quarter,
+                        year,
+                        watchlist_only=True,
+                    )
+                    next_watchlist_enqueue = now_monotonic + self.watchlist_enqueue_seconds
+
                 if now_monotonic >= next_enqueue:
-                    self._enqueue_due_transcript_checks(quarter, year)
+                    self._enqueue_due_transcript_checks(quarter, year, group_only=True)
                     self._enqueue_due_analysis_jobs()
                     self._enqueue_due_email_jobs()
                     self.last_enqueue = now_utc

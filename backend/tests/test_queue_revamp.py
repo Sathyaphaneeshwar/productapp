@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import time
@@ -10,6 +11,7 @@ from unittest.mock import patch
 os.environ["PRODUCT_GEMINI_DISABLE_WORKERS"] = "1"
 
 from services.email_queue_worker import EmailQueueWorker
+from services.analysis_queue_worker import AnalysisQueueWorker
 from services.email_service import EmailAuthenticationError, EmailService
 from services.queue_scheduler_service import QueueSchedulerService
 from services.queue_service import QueueService
@@ -132,6 +134,64 @@ class SchedulerDedupeTests(TemporaryDatabaseTest):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_stock_trigger_enqueues_immediately_and_dedupes(self):
+        scheduler = self.Scheduler(self.db_path)
+        scheduler.trigger_for_stock(1, "Q1", 2027)
+        scheduler.trigger_for_stock(1, "Q1", 2027)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM queue_messages
+                WHERE queue_name = 'transcript_check'
+                  AND status IN ('pending', 'claimed')
+                """
+            ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            json.loads(rows[0]["payload_json"])["reason"],
+            "watchlist_trigger",
+        )
+
+    def test_schedule_sync_repairs_only_stale_watchlist_none_cadence(self):
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO stocks (stock_symbol, isin_number, stock_name)
+                VALUES ('GROUP', 'INE000000002', 'Group Limited')
+                """
+            )
+            connection.execute("INSERT INTO groups (name, is_active) VALUES ('Test Group', 1)")
+            connection.execute("INSERT INTO group_stocks (group_id, stock_id) VALUES (1, 2)")
+            connection.execute(
+                """
+                INSERT INTO transcript_fetch_schedule
+                    (stock_id, quarter, year, priority, next_check_at, last_status)
+                VALUES
+                    (1, 'Q1', 2027, 100, datetime('now', '+12 hours'), 'none'),
+                    (2, 'Q1', 2027, 50, datetime('now', '+12 hours'), 'none')
+                """
+            )
+
+        scheduler = self.Scheduler(self.db_path)
+        scheduler._sync_schedule("Q1", 2027)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stock_id, next_check_at
+                FROM transcript_fetch_schedule
+                ORDER BY stock_id
+                """
+            ).fetchall()
+
+        watchlist_delay = (datetime.fromisoformat(rows[0]["next_check_at"]) - datetime.utcnow()).total_seconds()
+        group_delay = (datetime.fromisoformat(rows[1]["next_check_at"]) - datetime.utcnow()).total_seconds()
+        self.assertLessEqual(watchlist_delay, 5)
+        self.assertGreater(group_delay, 11 * 60 * 60)
+
 
 class TranscriptPendingUploadTests(TemporaryDatabaseTest):
     """A recorded concall without a transcript PDF must keep polling fast."""
@@ -233,6 +293,29 @@ class TranscriptCadenceTests(unittest.TestCase):
             6 * 60 * 60,
         )
 
+    def test_watchlist_event_window_uses_fast_cadence(self):
+        before_event = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        just_finished = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        same_day = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+        recent = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+
+        self.assert_delay_close(
+            self.worker._compute_next_check("upcoming", before_event, 0, is_watchlist_stock=True),
+            15 * 60,
+        )
+        self.assert_delay_close(
+            self.worker._compute_next_check("upcoming", just_finished, 0, is_watchlist_stock=True),
+            5 * 60,
+        )
+        self.assert_delay_close(
+            self.worker._compute_next_check("upcoming", same_day, 0, is_watchlist_stock=True),
+            10 * 60,
+        )
+        self.assert_delay_close(
+            self.worker._compute_next_check("upcoming", recent, 0, is_watchlist_stock=True),
+            30 * 60,
+        )
+
     def test_none_status_rechecks_fast_for_watchlist_stocks(self):
         # Transcripts often appear within hours of a concall; the previous 12h
         # backoff made the app look broken during earnings season.
@@ -243,6 +326,20 @@ class TranscriptCadenceTests(unittest.TestCase):
         self.assert_delay_close(
             self.worker._compute_next_check("none", None, 0, is_watchlist_stock=False),
             2 * 60 * 60,
+        )
+
+
+class AnalysisFailureClassificationTests(unittest.TestCase):
+    def test_invalid_provider_credentials_are_terminal(self):
+        self.assertTrue(
+            AnalysisQueueWorker._is_terminal_error(
+                Exception("400 API_KEY_INVALID: API key not valid")
+            )
+        )
+        self.assertFalse(
+            AnalysisQueueWorker._is_terminal_error(
+                Exception("429 resource exhausted; retry later")
+            )
         )
 
 

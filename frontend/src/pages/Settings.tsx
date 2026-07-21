@@ -16,6 +16,7 @@ type LlmProvider = {
 type LlmModel = {
     id: number
     provider_name: string
+    provider_display_name?: string
     model_id: string
     display_name: string
     supports_thinking: boolean
@@ -542,6 +543,26 @@ export default function Settings() {
         }
     }
 
+    const handleSaveAnalysisSetting = async (settingKey: string, value: string | number, successMessage: string) => {
+        setSaveResult(null)
+        try {
+            const response = await fetch(`${API_URL}/llm/settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ [settingKey]: value })
+            })
+            const data = await response.json()
+            if (!response.ok) {
+                setSaveResult({ status: 'error', message: data.error || 'Failed to update analysis settings' })
+                return
+            }
+            setLlmSettings(prev => ({ ...prev, [settingKey]: value }))
+            setSaveResult({ status: 'success', message: successMessage })
+        } catch {
+            setSaveResult({ status: 'error', message: 'Failed to connect to server' })
+        }
+    }
+
     const handleOpenConfig = (model: LlmModel) => {
         setConfiguringModelId(model.id)
         setConfigMaxTokens(model.user_max_tokens || model.max_output_tokens || 4096)
@@ -879,6 +900,59 @@ export default function Settings() {
                                     : 'Used for group research articles'}
                             </span>
                         </div>
+
+                        {activeTab === 'analysis' && (
+                            <div className="p-5 bg-card border border-border rounded-lg space-y-4">
+                                <div>
+                                    <h4 className="font-medium">Watchlist fast lane</h4>
+                                    <p className="text-sm text-muted-foreground">
+                                        Prioritizes speed by disabling optional thinking and capping output. Configure a fallback model for provider outages or invalid credentials.
+                                    </p>
+                                </div>
+                                <div className="grid gap-4 md:grid-cols-3">
+                                    <div>
+                                        <label className="text-sm font-medium mb-2 block">Fast analysis</label>
+                                        <button
+                                            onClick={() => {
+                                                const enabled = String(llmSettings.watchlist_fast_mode ?? '1') !== '0'
+                                                handleSaveAnalysisSetting('watchlist_fast_mode', enabled ? '0' : '1', `Fast analysis ${enabled ? 'disabled' : 'enabled'}`)
+                                            }}
+                                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${String(llmSettings.watchlist_fast_mode ?? '1') !== '0' ? 'bg-green-500' : 'bg-input'}`}
+                                        >
+                                            <span className={`${String(llmSettings.watchlist_fast_mode ?? '1') !== '0' ? 'translate-x-6' : 'translate-x-1'} inline-block h-4 w-4 transform rounded-full bg-white transition-transform`} />
+                                        </button>
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium mb-2 block">Output token cap</label>
+                                        <Input
+                                            type="number"
+                                            min={2000}
+                                            max={12000}
+                                            value={llmSettings.watchlist_max_tokens ?? 8000}
+                                            onChange={(event) => setLlmSettings(prev => ({ ...prev, watchlist_max_tokens: event.target.value }))}
+                                            onBlur={(event) => handleSaveAnalysisSetting('watchlist_max_tokens', Number(event.target.value), 'Analysis token cap updated')}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium mb-2 block">Fallback model</label>
+                                        <select
+                                            className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm"
+                                            value={llmSettings.watchlist_fallback_model_id ?? '0'}
+                                            onChange={(event) => handleSaveAnalysisSetting('watchlist_fallback_model_id', event.target.value, 'Fallback model updated')}
+                                        >
+                                            <option value="0">No fallback</option>
+                                            {llmModels
+                                                .filter(model => model.id !== Number(llmSettings.watchlist_model_id || llmSettings.default_model_id))
+                                                .map(model => (
+                                                    <option key={model.id} value={model.id}>
+                                                        {model.provider_display_name}: {model.display_name}
+                                                    </option>
+                                                ))}
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
 
                         <div className="grid gap-6">
                             {llmProviders.filter(p => p.provider_name !== 'anthropic').map((provider) => {

@@ -44,10 +44,12 @@ from services.stock_import_service import StockImportError, StockImportService
 app = Flask(__name__)
 CORS(app)
 
-# Queue-first runtime (single scheduler/worker model)
+# Queue-first runtime. Transcript provider calls stay single-file; analysis has
+# two consumers so one long model response cannot block every other watchlist stock.
 queue_scheduler = QueueSchedulerService()
 fetcher_worker = TranscriptFetcherWorker()
-analysis_queue_worker = AnalysisQueueWorker()
+analysis_queue_workers = [AnalysisQueueWorker(), AnalysisQueueWorker()]
+analysis_queue_worker = analysis_queue_workers[0]
 email_queue_worker = EmailQueueWorker()
 analysis_job_service = AnalysisJobService()
 recovery_service = RecoveryService()
@@ -93,7 +95,7 @@ def _stop_background_runtime(timeout_seconds: float = 5.0):
         services = (
             queue_scheduler,
             fetcher_worker,
-            analysis_queue_worker,
+            *analysis_queue_workers,
             email_queue_worker,
         )
         for service in services:
@@ -138,7 +140,8 @@ if _should_start_background_workers():
         _run_startup_recovery()
         queue_scheduler.start()
         fetcher_worker.start()
-        analysis_queue_worker.start()
+        for worker in analysis_queue_workers:
+            worker.start()
         email_queue_worker.start()
     except Exception as e:
         print(f"[Scheduler] Queue runtime initialization failed: {e}")
@@ -919,6 +922,10 @@ def get_watchlist():
                     analysis_message = 'Analysis queued...'
                 elif analysis_job_status == 'retrying':
                     analysis_message = 'Retrying analysis...'
+                elif analysis_state == 'preparing':
+                    analysis_message = 'Preparing transcript text...'
+                elif analysis_state == 'generating':
+                    analysis_message = 'Generating analysis...'
                 else:
                     analysis_message = 'Analyzing transcript...'
 
@@ -930,10 +937,14 @@ def get_watchlist():
                         'year': transcript['year']
                     }
                 }
-            elif analysis_state == 'in_progress':
+            elif analysis_state in ('in_progress', 'preparing', 'generating'):
+                analysis_message = {
+                    'preparing': 'Preparing transcript text...',
+                    'generating': 'Generating analysis...',
+                }.get(analysis_state, 'Analyzing transcript...')
                 status_info = {
                     'status': 'analyzing',
-                    'message': 'Analyzing transcript...',
+                    'message': analysis_message,
                     'details': {
                         'quarter': transcript['quarter'],
                         'year': transcript['year']
@@ -992,16 +1003,33 @@ def get_watchlist():
                         }
                     }
         elif row['transcript_check_status'] == 'checking' or (
-            fetch_schedule
-            and (
-                fetch_schedule['last_checked_at'] is None
-                or fetch_schedule['is_locked']
-            )
+            fetch_schedule and fetch_schedule['is_locked']
         ):
             status_info = {
                 'status': 'fetching',
                 'message': 'Fetching transcript...',
                 'details': None
+            }
+        elif fetch_schedule:
+            next_check_at = _to_utc_iso(fetch_schedule['next_check_at'])
+            status_info = {
+                'status': 'waiting',
+                'message': 'Waiting for transcript',
+                'details': {
+                    'next_check_at': next_check_at,
+                    'last_checked_at': _to_utc_iso(fetch_schedule['last_checked_at']),
+                }
+            }
+
+        if fetch_schedule:
+            schedule_details = {
+                'next_check_at': _to_utc_iso(fetch_schedule['next_check_at']),
+                'last_checked_at': _to_utc_iso(fetch_schedule['last_checked_at']),
+                'fetch_attempts': fetch_schedule['attempts'],
+            }
+            status_info['details'] = {
+                **(status_info['details'] or {}),
+                **schedule_details,
             }
         
         stocks.append({
@@ -1986,7 +2014,12 @@ def get_llm_settings():
     cursor = conn.cursor()
     
     cursor.execute("SELECT setting_key, setting_value FROM llm_settings")
-    settings = {row['setting_key']: row['setting_value'] for row in cursor.fetchall()}
+    settings = {
+        'watchlist_fast_mode': '1',
+        'watchlist_max_tokens': '8000',
+        'watchlist_fallback_model_id': '0',
+        **{row['setting_key']: row['setting_value'] for row in cursor.fetchall()},
+    }
     conn.close()
     
     return jsonify(settings)
@@ -2000,6 +2033,27 @@ def update_llm_settings():
     
     try:
         for key, value in data.items():
+            if key in {'default_model_id', 'watchlist_model_id', 'group_research_model_id', 'watchlist_fallback_model_id'}:
+                try:
+                    model_id = int(value)
+                except (TypeError, ValueError):
+                    return jsonify({'error': f'Invalid model ID for {key}'}), 400
+                if model_id != 0:
+                    cursor.execute(
+                        "SELECT 1 FROM llm_models WHERE id = ? AND is_active = 1",
+                        (model_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        return jsonify({'error': f'Model {model_id} is not available'}), 400
+            if key == 'watchlist_max_tokens':
+                try:
+                    token_limit = int(value)
+                except (TypeError, ValueError):
+                    return jsonify({'error': 'Watchlist max tokens must be a number'}), 400
+                if token_limit < 2000 or token_limit > 12000:
+                    return jsonify({'error': 'Watchlist max tokens must be between 2000 and 12000'}), 400
+            if key == 'watchlist_fast_mode':
+                value = '1' if str(value).lower() not in {'0', 'false', 'off', 'no'} else '0'
             cursor.execute("""
                 INSERT OR REPLACE INTO llm_settings (setting_key, setting_value, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
