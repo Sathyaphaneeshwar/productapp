@@ -40,6 +40,11 @@ type Stock = {
     retry_scope?: 'transcript_fetch' | 'analysis' | 'email'
 }
 
+type WatchlistProps = {
+    onOpenActivity: (stock: { id: number; symbol: string; name: string }, level?: 'all' | 'info' | 'success' | 'error') => void
+    onOpenStock: (stock: { id: number; symbol: string; name: string }) => void
+}
+
 type Quarter = {
     quarter: string
     year: number
@@ -132,7 +137,7 @@ const getFallbackQuarter = (): Quarter => {
     }
 }
 
-export default function Watchlist() {
+export default function Watchlist({ onOpenActivity, onOpenStock }: WatchlistProps) {
     const [stocks, setStocks] = useState<Stock[]>([])
     const [searchQuery, setSearchQuery] = useState('')
     const [searchResults, setSearchResults] = useState<Stock[]>([])
@@ -671,6 +676,21 @@ export default function Watchlist() {
         }
     }
 
+    const openStockActivity = (stock: Stock) => {
+        if (!stock.id) return
+        const level = stock.status === 'analysis_failed' || stock.retrying
+            ? 'error'
+            : stock.status === 'analyzed'
+                ? 'success'
+                : 'all'
+        onOpenActivity({ id: stock.id, symbol: stock.symbol, name: stock.name }, level)
+    }
+
+    const openStockDetail = (stock: Stock) => {
+        if (!stock.id) return
+        onOpenStock({ id: stock.id, symbol: stock.symbol, name: stock.name })
+    }
+
     const displayStocks = useMemo(() => {
         if (stocks.length === 0) return []
         if (statusFilters.size === 0) return []
@@ -890,17 +910,39 @@ export default function Watchlist() {
                                             key={stock.symbol}
                                             className="border-border hover:bg-accent/50 transition-colors"
                                         >
-                                            <TableCell className="font-medium text-foreground">{stock.symbol}</TableCell>
-                                            <TableCell className="text-foreground">{stock.name}</TableCell>
+                                            <TableCell className="font-medium text-foreground">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => openStockDetail(stock)}
+                                                    className="text-left font-semibold text-foreground hover:text-primary hover:underline"
+                                                >
+                                                    {stock.symbol}
+                                                </button>
+                                            </TableCell>
+                                            <TableCell className="text-foreground">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => openStockDetail(stock)}
+                                                    className="text-left hover:text-primary hover:underline"
+                                                >
+                                                    {stock.name}
+                                                </button>
+                                            </TableCell>
                                             <TableCell>
-                                                <div className="flex flex-col gap-1">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => openStockActivity(stock)}
+                                                    disabled={!stock.id}
+                                                    className="flex flex-col items-start gap-1 text-left disabled:cursor-default"
+                                                    title="Open this stock's activity details"
+                                                >
                                                     {getStatusBadge(stock)}
                                                     {stock.retrying && (
                                                         <span className="text-xs text-amber-400">
                                                             {getRetryLabel(stock)}
                                                         </span>
                                                     )}
-                                                </div>
+                                                </button>
                                             </TableCell>
                                             <TableCell className="text-right">
                                                 <div className="flex items-center justify-end gap-2">

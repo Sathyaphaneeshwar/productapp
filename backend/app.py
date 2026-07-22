@@ -39,6 +39,7 @@ from services.prompt_service import PromptService
 from services.group_research_service import GroupResearchService
 from services.document_research_service import DocumentResearchService
 from services.stock_activity_service import StockActivityService
+from services.stock_overview_service import StockOverviewService
 from services.stock_import_service import StockImportError, StockImportService
 
 app = Flask(__name__)
@@ -57,6 +58,7 @@ prompt_service = PromptService()
 group_research_service = GroupResearchService()
 document_research_service = DocumentResearchService()
 stock_activity_service = StockActivityService()
+stock_overview_service = StockOverviewService()
 _runtime_stop_lock = threading.Lock()
 _shutdown_started = threading.Event()
 
@@ -407,6 +409,17 @@ def get_stock_activity():
         })
     except ValueError as error:
         return jsonify({'error': str(error)}), 400
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
+
+
+@app.route('/api/stocks/<int:stock_id>/overview', methods=['GET'])
+def get_stock_overview(stock_id):
+    try:
+        overview = stock_overview_service.get_overview(stock_id)
+        if overview is None:
+            return jsonify({'error': 'Stock not found'}), 404
+        return jsonify(overview)
     except Exception as error:
         return jsonify({'error': str(error)}), 500
 

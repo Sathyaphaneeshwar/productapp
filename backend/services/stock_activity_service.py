@@ -120,15 +120,15 @@ class StockActivityService:
                         'analysis',
                         CASE
                             WHEN aj.status = 'done' THEN 'success'
-                            WHEN aj.status IN ('error', 'retrying') THEN 'error'
+                            WHEN aj.status IN ('error', 'failed', 'retrying') THEN 'error'
                             ELSE 'info'
                         END,
                         CASE
                             WHEN aj.status = 'done' THEN 'Stock analysis completed'
-                            WHEN aj.status = 'error' THEN
+                            WHEN aj.status IN ('error', 'failed') THEN
                                 'Stock analysis failed: ' || COALESCE(t.analysis_error, 'unknown error')
                             WHEN aj.status = 'retrying' THEN
-                                'Stock analysis failed and will retry'
+                                'Stock analysis failed and will retry: ' || COALESCE(t.analysis_error, 'unknown error')
                             WHEN aj.status = 'in_progress' THEN 'Stock analysis started'
                             ELSE 'Stock analysis queued'
                         END,
@@ -137,7 +137,9 @@ class StockActivityService:
                         json_object(
                             'status', aj.status,
                             'attempts', aj.attempts,
-                            'retry_next_at', aj.retry_next_at
+                            'retry_next_at', aj.retry_next_at,
+                            'locked_until', aj.locked_until,
+                            'error', t.analysis_error
                         ),
                         aj.updated_at,
                         'analysis_jobs'
@@ -152,13 +154,13 @@ class StockActivityService:
                         'email',
                         CASE
                             WHEN eo.status = 'done' THEN 'success'
-                            WHEN eo.status IN ('error', 'retrying') THEN 'error'
+                            WHEN eo.status IN ('error', 'failed', 'retrying') THEN 'error'
                             ELSE 'info'
                         END,
                         CASE
                             WHEN eo.status = 'done' THEN 'Analysis email sent successfully'
                             WHEN eo.status = 'retrying' THEN 'Email delivery failed and will retry'
-                            WHEN eo.status = 'error' THEN 'Email delivery failed'
+                            WHEN eo.status IN ('error', 'failed') THEN 'Email delivery failed'
                             ELSE 'Analysis email queued'
                         END,
                         t.quarter,
@@ -166,7 +168,9 @@ class StockActivityService:
                         json_object(
                             'status', eo.status,
                             'attempts', eo.attempts,
-                            'retry_next_at', eo.retry_next_at
+                            'retry_next_at', eo.retry_next_at,
+                            'locked_until', eo.locked_until,
+                            'scheduled_at', eo.scheduled_at
                         ),
                         eo.updated_at,
                         'email_outbox'
@@ -218,6 +222,16 @@ class StockActivityService:
                     details = json.loads(item["details_json"])
                 except (TypeError, json.JSONDecodeError):
                     details = {"raw": item["details_json"]}
+            if isinstance(details, dict):
+                for timestamp_key in (
+                    "retry_next_at",
+                    "locked_until",
+                    "scheduled_at",
+                    "next_check_at",
+                    "event_date",
+                ):
+                    if details.get(timestamp_key):
+                        details[timestamp_key] = self._to_utc_iso(details[timestamp_key])
 
             events.append(
                 {

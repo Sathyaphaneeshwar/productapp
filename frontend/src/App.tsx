@@ -6,15 +6,30 @@ import Groups from './pages/Groups'
 import Research from './pages/Research'
 import Settings from './pages/Settings'
 import Activity from './pages/Activity'
+import StockDetail from './pages/StockDetail'
 import UpdateButton from './components/UpdateButton'
 import PollStatusButton from './components/PollStatusButton'
 
 type Theme = 'light' | 'dark' | 'system'
-type Page = 'watchlist' | 'groups' | 'research' | 'activity' | 'settings'
+type Page = 'watchlist' | 'groups' | 'research' | 'activity' | 'settings' | 'stock'
+type StockRef = { id: number; symbol: string; name: string }
+type ActivityLevel = 'all' | 'info' | 'success' | 'error'
 
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>('watchlist')
   const [theme, setTheme] = useState<Theme>('dark')
+  const [activityTarget, setActivityTarget] = useState<{ stock: StockRef; level: ActivityLevel } | null>(null)
+  const [stockTarget, setStockTarget] = useState<StockRef | null>(null)
+
+  const openActivity = (stock?: StockRef, level: ActivityLevel = 'all') => {
+    setActivityTarget(stock ? { stock, level } : null)
+    setCurrentPage('activity')
+  }
+
+  const openStock = (stock: StockRef) => {
+    setStockTarget(stock)
+    setCurrentPage('stock')
+  }
 
   // Initialize dark mode on mount
   useEffect(() => {
@@ -106,7 +121,7 @@ function App() {
             <h1 className="text-4xl font-bold text-foreground text-center">BLOOMira</h1>
             <div className="flex-1 flex justify-end gap-2">
               <UpdateButton />
-              <PollStatusButton onOpenActivity={() => setCurrentPage('activity')} />
+              <PollStatusButton onOpenActivity={() => openActivity()} />
               <Button
                 variant="ghost"
                 size="icon"
@@ -148,7 +163,7 @@ function App() {
               Research
             </button>
             <button
-              onClick={() => setCurrentPage('activity')}
+              onClick={() => openActivity()}
               className={`text-xl font-semibold pb-2 border-b-2 transition-colors ${currentPage === 'activity'
                 ? 'border-primary text-foreground'
                 : 'border-transparent text-muted-foreground hover:text-foreground'
@@ -170,11 +185,26 @@ function App() {
       </div>
 
       {/* Page Content */}
-      {currentPage === 'watchlist' && <Watchlist />}
+      {currentPage === 'watchlist' && (
+        <Watchlist onOpenActivity={openActivity} onOpenStock={openStock} />
+      )}
       {currentPage === 'groups' && <Groups />}
       {currentPage === 'research' && <Research />}
-      {currentPage === 'activity' && <Activity />}
+      {currentPage === 'activity' && (
+        <Activity
+          initialStock={activityTarget?.stock ?? null}
+          initialLevel={activityTarget?.level ?? 'all'}
+          onOpenStock={openStock}
+        />
+      )}
       {currentPage === 'settings' && <Settings />}
+      {currentPage === 'stock' && stockTarget && (
+        <StockDetail
+          stockId={stockTarget.id}
+          onBack={() => setCurrentPage('watchlist')}
+          onOpenActivity={(level = 'all') => openActivity(stockTarget, level)}
+        />
+      )}
     </div>
   )
 }
